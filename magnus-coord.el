@@ -25,6 +25,7 @@
 (declare-function vterm-send-return "vterm")
 
 (defvar magnus-claude-executable)
+(declare-function magnus--headless-command "magnus")
 
 ;;; Customization
 
@@ -533,59 +534,98 @@ cache_read_input_tokens."
 
 ;;; @mention watching
 
-(defvar magnus-coord--watchers nil
-  "Alist of (directory . watch-descriptor) for coordination file watchers.")
+(defvar magnus-coord--watched-dirs nil
+  "List of directories being polled for coordination file changes.")
+
+(defvar magnus-coord--file-mtimes nil
+  "Alist of (directory . modification-time) for polling dedup.")
+
+(defvar magnus-coord--processed-mentions nil
+  "Alist of (directory . list-of-processed-mention-hashes) to avoid duplicates.")
+
+(defvar magnus-coord--processed-dms nil
+  "Alist of (directory . list-of-processed-dm-hashes) to avoid duplicates.")
+
+(defvar magnus-coord--processed-summons nil
+  "Alist of (directory . list-of-processed-summon-hashes) to avoid duplicates.")
+
+(defvar magnus-coord--poll-timer nil
+  "Timer for polling coordination files for mentions, DMs, and summons.")
 
 (defun magnus-coord-ensure-watchers ()
-  "Start file watchers for all directories with active instances.
-Call this on startup to ensure @mention detection works for
+  "Start polling for all directories with active instances.
+Call this on startup to ensure @mention and DM detection works for
 instances restored from persistence."
   (let ((dirs (delete-dups
                (mapcar #'magnus-instance-directory (magnus-instances-list)))))
     (dolist (dir dirs)
       (when (file-exists-p (magnus-coord-file-path dir))
-        (unless (assoc dir magnus-coord--watchers)
-          (magnus-coord-start-watching dir))))))
-
-(defvar magnus-coord--processed-mentions nil
-  "Alist of (directory . list-of-processed-mention-hashes) to avoid duplicates.")
-
-(defvar magnus-coord--processed-summons nil
-  "Alist of (directory . list-of-processed-summon-hashes) to avoid duplicates.")
+        (unless (member dir magnus-coord--watched-dirs)
+          (magnus-coord-start-watching dir)))))
+  (magnus-coord--start-poll-timer))
 
 (defun magnus-coord-start-watching (directory)
-  "Start watching the coordination file in DIRECTORY for @mentions."
+  "Start polling the coordination file in DIRECTORY for mentions and DMs."
   (let ((file (magnus-coord-file-path directory)))
-    ;; Remove existing watcher if any
-    (magnus-coord-stop-watching directory)
-    ;; Only watch if file exists
     (when (file-exists-p file)
-      (let ((descriptor (file-notify-add-watch
-                         file
-                         '(change)
-                         (lambda (event)
-                           (magnus-coord--handle-file-change directory event)))))
-        (push (cons directory descriptor) magnus-coord--watchers)
-        ;; Initialize processed mentions and summons from current content
-        (magnus-coord--init-processed-mentions directory)
-        (magnus-coord--init-processed-summons directory)))))
+      (cl-pushnew directory magnus-coord--watched-dirs :test #'equal)
+      ;; Seed mtime so first poll doesn't re-process everything
+      (setf (alist-get directory magnus-coord--file-mtimes nil nil #'equal)
+            (file-attribute-modification-time (file-attributes file)))
+      ;; Initialize processed state from current content
+      (magnus-coord--init-processed-mentions directory)
+      (magnus-coord--init-processed-dms directory)
+      (magnus-coord--init-processed-summons directory))))
 
 (defun magnus-coord-stop-watching (directory)
-  "Stop watching the coordination file in DIRECTORY."
-  (when-let ((entry (assoc directory magnus-coord--watchers)))
-    (file-notify-rm-watch (cdr entry))
-    (setq magnus-coord--watchers (assoc-delete-all directory magnus-coord--watchers))
-    (setq magnus-coord--processed-mentions
-          (assoc-delete-all directory magnus-coord--processed-mentions))
-    (setq magnus-coord--processed-summons
-          (assoc-delete-all directory magnus-coord--processed-summons))))
+  "Stop polling the coordination file in DIRECTORY."
+  (setq magnus-coord--watched-dirs (delete directory magnus-coord--watched-dirs))
+  (setq magnus-coord--file-mtimes
+        (assoc-delete-all directory magnus-coord--file-mtimes))
+  (setq magnus-coord--processed-mentions
+        (assoc-delete-all directory magnus-coord--processed-mentions))
+  (setq magnus-coord--processed-dms
+        (assoc-delete-all directory magnus-coord--processed-dms))
+  (setq magnus-coord--processed-summons
+        (assoc-delete-all directory magnus-coord--processed-summons)))
+
+(defun magnus-coord--start-poll-timer ()
+  "Start the coordination file poll timer."
+  (unless magnus-coord--poll-timer
+    (setq magnus-coord--poll-timer
+          (run-with-timer 3 3 #'magnus-coord--poll-all))))
+
+(defun magnus-coord--poll-all ()
+  "Poll all watched coordination files for new mentions, DMs, and summons."
+  (dolist (directory magnus-coord--watched-dirs)
+    (let* ((file (magnus-coord-file-path directory))
+           (mtime (and (file-exists-p file)
+                       (file-attribute-modification-time
+                        (file-attributes file))))
+           (last-mtime (alist-get directory magnus-coord--file-mtimes
+                                  nil nil #'equal)))
+      (when (and mtime (not (equal mtime last-mtime)))
+        (setf (alist-get directory magnus-coord--file-mtimes nil nil #'equal)
+              mtime)
+        (condition-case err
+            (progn
+              (when magnus-coord-mention-notify
+                (magnus-coord--check-new-mentions directory))
+              (magnus-coord--check-new-dms directory)
+              (magnus-coord--check-new-summons directory))
+          (error
+           (message "Magnus: coord poll error for %s: %s"
+                    directory (error-message-string err))))))))
 
 (defun magnus-coord-stop-all-watchers ()
-  "Stop all coordination file watchers."
-  (dolist (entry magnus-coord--watchers)
-    (ignore-errors (file-notify-rm-watch (cdr entry))))
-  (setq magnus-coord--watchers nil)
+  "Stop all coordination file polling."
+  (when magnus-coord--poll-timer
+    (cancel-timer magnus-coord--poll-timer)
+    (setq magnus-coord--poll-timer nil))
+  (setq magnus-coord--watched-dirs nil)
+  (setq magnus-coord--file-mtimes nil)
   (setq magnus-coord--processed-mentions nil)
+  (setq magnus-coord--processed-dms nil)
   (setq magnus-coord--processed-summons nil))
 
 (defun magnus-coord--init-processed-mentions (directory)
@@ -598,18 +638,6 @@ instances restored from persistence."
                          (buffer-string)))))
         (setf (alist-get directory magnus-coord--processed-mentions nil nil #'equal)
               (mapcar #'magnus-coord--mention-hash mentions))))))
-
-(defun magnus-coord--handle-file-change (directory event)
-  "Handle a file change EVENT for DIRECTORY's coordination file."
-  (when (eq (nth 1 event) 'changed)
-    (condition-case err
-        (progn
-          (when magnus-coord-mention-notify
-            (magnus-coord--check-new-mentions directory))
-          (magnus-coord--check-new-summons directory))
-      (error
-       (message "Magnus: coord file change handler error: %s"
-                (error-message-string err))))))
 
 (defun magnus-coord--check-new-mentions (directory)
   "Check for new @mentions in DIRECTORY's coordination file."
@@ -684,6 +712,72 @@ Formats the message as a direct user instruction so Claude acts on it."
                 (format "Another agent mentioned you in .magnus-coord.md: \"%s\" — Read the file, do what's asked, and log your progress there."
                         context-line))))
     (magnus-coord-nudge-agent instance msg)))
+
+;;; Agent-to-agent direct messages
+
+(defun magnus-coord--init-processed-dms (directory)
+  "Initialize processed DMs for DIRECTORY from current file content."
+  (let ((file (magnus-coord-file-path directory)))
+    (when (file-exists-p file)
+      (let ((dms (magnus-coord--extract-dms
+                  (with-temp-buffer
+                    (insert-file-contents file)
+                    (buffer-string)))))
+        (setf (alist-get directory magnus-coord--processed-dms nil nil #'equal)
+              (mapcar #'magnus-coord--dm-hash dms))))))
+
+(defun magnus-coord--extract-dms (content)
+  "Extract all [DM @name] patterns from CONTENT.
+Returns list of (target sender message) tuples."
+  (let (dms)
+    (with-temp-buffer
+      (insert content)
+      (goto-char (point-min))
+      (while (re-search-forward
+              "\\[DM @\\([a-zA-Z][-a-zA-Z0-9_]*\\)\\][[:space:]]*\\(.*\\)"
+              nil t)
+        (let* ((target (match-string 1))
+               (message (string-trim (match-string 2)))
+               (line (buffer-substring-no-properties
+                      (line-beginning-position)
+                      (line-end-position)))
+               (sender (when (string-match "\\] \\([^:]+\\):" line)
+                         (match-string 1 line))))
+          (push (list target (or sender "unknown") message) dms))))
+    (nreverse dms)))
+
+(defun magnus-coord--dm-hash (dm)
+  "Create a hash for DM to track duplicates."
+  (secure-hash 'md5 (format "%s:%s:%s" (nth 0 dm) (nth 1 dm) (nth 2 dm))))
+
+(defun magnus-coord--check-new-dms (directory)
+  "Check for new [DM @name] patterns in DIRECTORY's coordination file."
+  (let* ((file (magnus-coord-file-path directory))
+         (content (when (file-exists-p file)
+                    (with-temp-buffer
+                      (insert-file-contents file)
+                      (buffer-string))))
+         (dms (when content (magnus-coord--extract-dms content)))
+         (processed (alist-get directory magnus-coord--processed-dms nil nil #'equal)))
+    (dolist (dm dms)
+      (let ((hash (magnus-coord--dm-hash dm)))
+        (unless (member hash processed)
+          (magnus-coord--deliver-dm directory dm)
+          (push hash processed))))
+    (setf (alist-get directory magnus-coord--processed-dms nil nil #'equal)
+          processed)))
+
+(defun magnus-coord--deliver-dm (directory dm)
+  "Deliver DM to the target agent in DIRECTORY.
+DM is (target sender message)."
+  (let* ((target (nth 0 dm))
+         (sender (nth 1 dm))
+         (message (nth 2 dm))
+         (instance (magnus-coord--find-instance-by-name target directory)))
+    (when instance
+      (magnus-coord-nudge-agent
+       instance
+       (format "[DM from %s]: %s" sender message)))))
 
 ;;; Agent-initiated summoning
 
@@ -896,8 +990,7 @@ Keep it under 250 words. No filler."
                   process-environment)))
             (let ((proc (make-process
                          :name "magnus-retro-gen"
-                         :command (list magnus-claude-executable
-                                       "--print" "--model" "haiku"
+                         :command (magnus--headless-command
                                        (magnus-coord--retro-prompt data))
                          :connection-type 'pipe
                          :filter (lambda (_proc output)
@@ -1361,8 +1454,8 @@ with stale statuses like done, died, finished, completed, stopped."
     (magnus-coord-ensure-instructions directory)
     (magnus-coord-ensure-skill directory)
     (magnus-coord-add-log directory name "Joined the session")
-    ;; Start watching for @mentions if not already
-    (unless (assoc directory magnus-coord--watchers)
+    ;; Start polling for @mentions and DMs if not already
+    (unless (member directory magnus-coord--watched-dirs)
       (magnus-coord-start-watching directory))
     ;; Track session start time for retrospectives
     (unless (gethash directory magnus-coord--session-start-times)

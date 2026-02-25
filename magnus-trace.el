@@ -94,6 +94,7 @@
         (delete-window win)))
     (display-buffer trace-buf '(display-buffer-in-side-window
                                 (side . bottom)
+                                (slot . 1)
                                 (window-height . 0.35)))
     trace-buf))
 
@@ -227,7 +228,7 @@
   "Ensure the trace auto-refresh timer is running."
   (unless magnus-trace--timer
     (setq magnus-trace--timer
-          (run-with-timer 10 10 #'magnus-trace--sync-all))))
+          (run-with-timer 2 5 #'magnus-trace--sync-all))))
 
 (defun magnus-trace--sync-all ()
   "Auto-refresh all open trace buffers.

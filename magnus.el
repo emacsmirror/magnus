@@ -93,6 +93,15 @@
   :type 'string
   :group 'magnus)
 
+(defcustom magnus-headless-model nil
+  "Model to use for lightweight headless Claude calls.
+These include fortune generation, session retrospectives, expertise
+indexing, and smart resurrection matching.  When nil, no --model flag
+is passed and Claude uses its default model."
+  :type '(choice (const :tag "Default (no --model flag)" nil)
+                 (string :tag "Model name"))
+  :group 'magnus)
+
 (defcustom magnus-default-directory nil
   "Default directory for new Claude Code instances.
 If nil, uses the current project root or `default-directory'."
@@ -289,6 +298,13 @@ Reply with ONLY: agent-name|brief-reason (5 words max)\n\
 Or reply: none|no match"
             memories task)))
 
+(defun magnus--headless-command (prompt)
+  "Build a command list for a headless Claude call with PROMPT.
+Includes --model flag only when `magnus-headless-model' is set."
+  (if magnus-headless-model
+      (list magnus-claude-executable "--print" "--model" magnus-headless-model prompt)
+    (list magnus-claude-executable "--print" prompt)))
+
 (defun magnus--run-match-sync (prompt)
   "Run `claude --print' synchronously with PROMPT.
 Returns the trimmed output string, or nil on error."
@@ -300,8 +316,8 @@ Returns the trimmed output string, or nil on error."
                 (lambda (e) (string-prefix-p "CLAUDECODE=" e))
                 process-environment)))
           (with-temp-buffer
-            (call-process magnus-claude-executable nil t nil
-                          "--print" "--model" "haiku" prompt)
+            (let ((cmd (magnus--headless-command prompt)))
+              (apply #'call-process (car cmd) nil t nil (cdr cmd)))
             (string-trim (buffer-string)))))
     (error nil)))
 
@@ -382,8 +398,7 @@ lowercase keywords, nothing else.\n\nMemory:\n%s" memory))
         (condition-case nil
             (let ((proc (make-process
                          :name (format "magnus-index-%s" name)
-                         :command (list magnus-claude-executable
-                                       "--print" "--model" "haiku" prompt)
+                         :command (magnus--headless-command prompt)
                          :connection-type 'pipe
                          :filter (lambda (proc output)
                                    (process-put

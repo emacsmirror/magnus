@@ -20,6 +20,7 @@
 (declare-function magnus-process-running-p "magnus-process")
 
 (defvar magnus-claude-executable)
+(declare-function magnus--headless-command "magnus")
 
 ;;; Customization
 
@@ -331,8 +332,7 @@ Falls back silently to the static list if generation fails."
                 process-environment)))
           (let ((proc (make-process
                        :name "magnus-health-bloomberg-gen"
-                       :command (list magnus-claude-executable
-                                     "--print" "--model" "haiku"
+                       :command (magnus--headless-command
                                      magnus-health-dashboard--gen-prompt)
                        :connection-type 'pipe
                        :filter (lambda (_proc output)
@@ -540,6 +540,7 @@ the side window from flickering or resizing."
     (display-buffer buf
                     '(display-buffer-in-side-window
                       (side . bottom)
+                      (slot . 0)
                       (window-height . 4)
                       (dedicated . t)
                       (preserve-size . (nil . t))))
