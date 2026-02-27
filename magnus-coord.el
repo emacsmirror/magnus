@@ -475,7 +475,7 @@ Warns agents approaching the context window limit."
                instance
                (format "Heads up: you're at %d%% context. Compaction is coming — write everything important to your memory file at %s NOW, while you still have full context. Key decisions, unfinished work, what you've learned, relationships with other agents. After compaction you'll lose detail."
                        pct memory-rel)
-               "Magnus")))))))
+               "Magnus"))))))))
 
 (defun magnus-coord--read-context-usage (instance)
   "Read the latest context token count from INSTANCE's session trace.
@@ -861,7 +861,7 @@ SUMMON is (target-name sender reason)."
          requester
          (format "%s is already online — @mention them in .magnus-coord.md instead."
                  target)
-         "Magnus")))))))
+         "Magnus"))))))
 
 (defun magnus-coord--execute-summon (directory target sender reason)
   "Execute a summon of TARGET in DIRECTORY, requested by SENDER for REASON."
