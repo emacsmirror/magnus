@@ -31,4 +31,4 @@ jobs:
               (package-install (quote vterm)))'
 
       - name: Lint
-        run: make lint VTERM_FILES=""
+        run: make lint-compile
