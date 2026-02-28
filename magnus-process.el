@@ -71,7 +71,11 @@ NAME is the instance name.  If nil, auto-generates one."
       ;; Send the claude command
       (with-current-buffer buffer
         (vterm-send-string magnus-claude-executable)
-        (vterm-send-return))
+        (run-with-timer 0.1 nil
+                        (lambda ()
+                          (when (buffer-live-p buffer)
+                            (with-current-buffer buffer
+                              (vterm-send-return))))))
       ;; Set up process sentinel
       (magnus-process--setup-sentinel instance buffer)
       ;; Send onboarding message after Claude starts
@@ -505,7 +509,11 @@ Replaces slashes, spaces, and tildes with hyphens."
             (vterm-send-string (format "%s --resume %s"
                                        magnus-claude-executable session-id))
           (vterm-send-string magnus-claude-executable))
-        (vterm-send-return))
+        (run-with-timer 0.1 nil
+                        (lambda ()
+                          (when (buffer-live-p buffer)
+                            (with-current-buffer buffer
+                              (vterm-send-return))))))
       ;; Set up process sentinel
       (magnus-process--setup-sentinel instance buffer)
       buffer)))

@@ -148,7 +148,12 @@ system messages from user-typed input."
                     message)))
         (with-current-buffer buffer
           (vterm-send-string text)
-          (vterm-send-return))))))
+          (run-with-timer 0.1 nil
+                          (lambda ()
+                            (when (buffer-live-p buffer)
+                              (with-current-buffer buffer
+                                (vterm-send-return))))))))))
+
 
 ;;; Periodic reminders
 
