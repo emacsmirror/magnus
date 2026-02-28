@@ -1,5 +1,7 @@
 # Magnus
 
+[![MELPA](https://melpa.org/packages/magnus-badge.svg)](https://melpa.org/#/magnus) [![CI](https://github.com/hrishikeshs/magnus/actions/workflows/ci.yml/badge.svg)](https://github.com/hrishikeshs/magnus/actions/workflows/ci.yml)
+
 A magit-inspired interface for managing multiple Claude Code instances within Emacs.
 
 Run multiple AI agents in parallel, let them communicate to avoid conflicts, and handle their permission requests one at a time.
