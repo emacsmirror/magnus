@@ -100,6 +100,15 @@ Older entries are trimmed automatically.  Set to nil to disable."
                  (const :tag "Unlimited" nil))
   :group 'magnus)
 
+(defcustom magnus-coord-tidy-size-threshold 20480
+  "File size in bytes above which an agent is asked to tidy the coord file.
+When the coordination file exceeds this size, a random quiescent agent
+is asked to consolidate the Discoveries and Decisions sections.
+Set to nil to disable."
+  :type '(choice (integer :tag "Bytes")
+                 (const :tag "Disabled" nil))
+  :group 'magnus)
+
 (defcustom magnus-coord-idle-threshold 300
   "Seconds of inactivity before telling agents to sleep.
 When the user is idle for this long, a sleep message is sent to
@@ -334,7 +343,9 @@ Suppressed entirely when AFK or DND is on."
   ;; Trim logs while we're at it (even when idle)
   (magnus-coord-trim-all)
   ;; Check context utilization (runs even when idle/active)
-  (magnus-coord-check-context-all))
+  (magnus-coord-check-context-all)
+  ;; Ask an agent to tidy if coord file is large
+  (magnus-coord--maybe-tidy))
 
 ;;; Log trimming
 
@@ -388,6 +399,59 @@ Keeps only the last `magnus-coord-log-max-entries' entries."
                        (magnus-instances-list)))))
     (dolist (dir dirs)
       (magnus-coord-trim-log dir))))
+
+;;; Intelligent coord file tidying
+
+(defun magnus-coord--maybe-tidy ()
+  "Ask a random idle agent to tidy the coord file if it has grown too large.
+Checks each project directory's coordination file against
+`magnus-coord-tidy-size-threshold' and, when exceeded, picks a
+random quiescent agent to consolidate the Discoveries and Decisions
+sections.  Debounced to at most once per hour per directory."
+  (when magnus-coord-tidy-size-threshold
+    (let ((dirs (delete-dups
+                 (mapcar #'magnus-instance-directory
+                         (magnus-instances-list)))))
+      (dolist (dir dirs)
+        (let ((file (magnus-coord-file-path dir)))
+          (when (and (file-exists-p file)
+                     (> (file-attribute-size (file-attributes file))
+                        magnus-coord-tidy-size-threshold)
+                     (let ((last (alist-get dir magnus-coord--last-tidy-time
+                                            nil nil #'equal)))
+                       (or (null last)
+                           (> (- (float-time) last) 3600))))
+            (let ((candidates
+                   (cl-remove-if-not
+                    (lambda (inst)
+                      (and (string= (magnus-instance-directory inst) dir)
+                           (eq (magnus-instance-status inst) 'running)
+                           (not (magnus-coord-agent-busy-p inst))
+                           (magnus-coord-agent-quiescent-p inst)))
+                    (magnus-instances-list))))
+              (when candidates
+                (let ((chosen (nth (random (length candidates)) candidates)))
+                  (setf (alist-get dir magnus-coord--last-tidy-time
+                                   nil nil #'equal)
+                        (float-time))
+                  (magnus-coord-nudge-agent
+                   chosen
+                   (concat
+                    "The coordination file is getting large. Please tidy it up: "
+                    "read .magnus-coord.md, then in the Discoveries section "
+                    "remove entries that are outdated or already captured in "
+                    "code and commits, merge related entries, and keep only "
+                    "what is still useful for agents working on this project. "
+                    "In the Decisions section remove decisions that have been "
+                    "fully implemented or are no longer relevant and keep "
+                    "active architectural decisions. Do not touch the Active "
+                    "Work or Log sections. Be aggressive about trimming — a "
+                    "shorter file is more useful than a comprehensive one.")
+                   "Magnus")
+                  (magnus-coord-add-log
+                   dir "Magnus"
+                   (format "Asked %s to tidy the coordination file"
+                           (magnus-instance-name chosen))))))))))))
 
 ;;; AFK detection
 
@@ -590,6 +654,9 @@ instances restored from persistence."
 
 (defvar magnus-coord--last-trim-time 0
   "Timestamp of last log trim, for debouncing.")
+
+(defvar magnus-coord--last-tidy-time nil
+  "Alist of (directory . timestamp) for last tidy request, for debouncing.")
 
 (defun magnus-coord--poll-all ()
   "Poll all watched coordination files for new mentions, DMs, and summons.
