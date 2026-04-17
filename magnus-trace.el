@@ -67,6 +67,10 @@
 (let ((map magnus-trace-mode-map))
   (define-key map (kbd "g") #'magnus-trace-refresh)
   (define-key map (kbd "G") #'magnus-trace-tail)
+  (define-key map (kbd "TAB") #'magnus-trace-toggle-thinking)
+  (define-key map (kbd "t") #'magnus-trace-toggle-all-thinking)
+  (define-key map (kbd "n") #'magnus-trace-next-response)
+  (define-key map (kbd "p") #'magnus-trace-prev-response)
   (define-key map (kbd "q") #'quit-window))
 
 ;;; Core functions
@@ -136,6 +140,136 @@
   (goto-char (point-max))
   (recenter -3))
 
+;;; Thinking block collapse/expand
+
+(defun magnus-trace-toggle-thinking ()
+  "Toggle visibility of the thinking block at point."
+  (interactive)
+  (let ((found nil))
+    (dolist (ov (overlays-at (point)))
+      (when (and (not found) (overlay-get ov 'magnus-thinking))
+        (overlay-put ov 'invisible
+                     (not (overlay-get ov 'invisible)))
+        (setq found t)))
+    ;; If not on an overlay, try finding one nearby
+    (unless found
+      (let ((ov (magnus-trace--find-nearest-thinking)))
+        (when ov
+          (overlay-put ov 'invisible
+                       (not (overlay-get ov 'invisible))))))))
+
+(defun magnus-trace-toggle-all-thinking ()
+  "Toggle visibility of all thinking blocks in the buffer."
+  (interactive)
+  (let ((ovs (overlays-in (point-min) (point-max)))
+        (target-state nil)
+        (first t))
+    (dolist (ov ovs)
+      (when (overlay-get ov 'magnus-thinking)
+        ;; Determine target state from first overlay
+        (when first
+          (setq target-state (not (overlay-get ov 'invisible)))
+          (setq first nil))
+        (overlay-put ov 'invisible target-state)))))
+
+(defun magnus-trace-next-response ()
+  "Move point to the next assistant response block."
+  (interactive)
+  (let ((pos (next-single-property-change (point) 'face)))
+    (while (and pos (< pos (point-max))
+                (not (eq (get-text-property pos 'face) 'magnus-trace-assistant)))
+      (setq pos (next-single-property-change pos 'face)))
+    (when (and pos (< pos (point-max)))
+      (goto-char pos))))
+
+(defun magnus-trace-prev-response ()
+  "Move point to the previous assistant response block."
+  (interactive)
+  (let ((pos (previous-single-property-change (point) 'face)))
+    (while (and pos (> pos (point-min))
+                (not (eq (get-text-property pos 'face) 'magnus-trace-assistant)))
+      (setq pos (previous-single-property-change pos 'face)))
+    (when (and pos (> pos (point-min)))
+      (goto-char pos))))
+
+(defun magnus-trace--find-nearest-thinking ()
+  "Find the nearest thinking overlay to point."
+  (let ((best nil)
+        (best-dist most-positive-fixnum))
+    (dolist (ov (overlays-in (point-min) (point-max)))
+      (when (overlay-get ov 'magnus-thinking)
+        (let ((dist (min (abs (- (point) (overlay-start ov)))
+                         (abs (- (point) (overlay-end ov))))))
+          (when (< dist best-dist)
+            (setq best ov best-dist dist)))))
+    best))
+
+;;; Content parsing
+
+(defun magnus-trace-parse-content (text)
+  "Parse TEXT for thinking/response markers.
+Finds [thinking]...[end-thinking] and [response]...[end-response]
+pairs.  Returns a list of plists (:type TYPE :text TEXT) where TYPE
+is `thinking' or `response'.  Unmarked text is treated as response."
+  (let ((segments nil)
+        (pos 0)
+        (len (length text)))
+    (while (< pos len)
+      (let ((think-start (string-match "\\[thinking\\]\n?" text pos))
+            (resp-start (string-match "\\[response\\]\n?" text pos)))
+        (cond
+         ;; Thinking block comes first (or is only one)
+         ((and think-start (or (null resp-start) (<= think-start resp-start)))
+          ;; Capture any text before the marker as response
+          (when (> think-start pos)
+            (let ((pre (string-trim (substring text pos think-start))))
+              (when (not (string-empty-p pre))
+                (push (list :type 'response :text pre) segments))))
+          (let* ((content-start (match-end 0))
+                 (think-end (string-match "\\[end-thinking\\]\n?" text content-start)))
+            (if think-end
+                (progn
+                  (let ((content (string-trim (substring text content-start think-end))))
+                    (when (not (string-empty-p content))
+                      (push (list :type 'thinking :text content) segments)))
+                  (setq pos (match-end 0)))
+              ;; No end marker — rest is thinking
+              (let ((content (string-trim (substring text content-start))))
+                (when (not (string-empty-p content))
+                  (push (list :type 'thinking :text content) segments)))
+              (setq pos len))))
+         ;; Response block comes first (or is only one)
+         ((and resp-start (or (null think-start) (< resp-start think-start)))
+          ;; Capture any text before the marker as response
+          (when (> resp-start pos)
+            (let ((pre (string-trim (substring text pos resp-start))))
+              (when (not (string-empty-p pre))
+                (push (list :type 'response :text pre) segments))))
+          (let* ((content-start (match-end 0))
+                 (resp-end (string-match "\\[end-response\\]\n?" text content-start)))
+            (if resp-end
+                (progn
+                  (let ((content (string-trim (substring text content-start resp-end))))
+                    (when (not (string-empty-p content))
+                      (push (list :type 'response :text content) segments)))
+                  (setq pos (match-end 0)))
+              ;; No end marker — rest is response
+              (let ((content (string-trim (substring text content-start))))
+                (when (not (string-empty-p content))
+                  (push (list :type 'response :text content) segments)))
+              (setq pos len))))
+         ;; No markers found — rest is response
+         (t
+          (let ((rest (string-trim (substring text pos))))
+            (when (not (string-empty-p rest))
+              (push (list :type 'response :text rest) segments)))
+          (setq pos len)))))
+    (nreverse segments)))
+
+(defun magnus-trace--text-has-markers-p (text)
+  "Return non-nil if TEXT contains thinking/response markers."
+  (string-match-p "\\[thinking\\]\\|\\[response\\]" text))
+
 ;;; Internal helpers
 
 (defun magnus-trace--append-new-entries (jsonl-file)
@@ -201,18 +335,52 @@
                                                    (magnus-trace--format-time timestamp))
                                            'face 'magnus-trace-separator))
                         (setq has-output t))
-                      (insert (propertize (concat thinking "\n\n")
-                                         'face 'magnus-trace-thinking)))))
+                      (let ((start (point)))
+                        (insert (propertize (concat thinking "\n\n")
+                                           'face 'magnus-trace-thinking))
+                        (let ((ov (make-overlay start (point))))
+                          (overlay-put ov 'magnus-thinking t)
+                          (overlay-put ov 'evaporate t))))))
                  ((string= block-type "text")
                   (let ((text (alist-get 'text block)))
                     (when (and text (not (string-empty-p text)))
-                      (unless has-output
-                        (insert (propertize (format "── Assistant [%s] ──\n"
-                                                   (magnus-trace--format-time timestamp))
-                                           'face 'magnus-trace-separator))
-                        (setq has-output t))
-                      (insert (propertize (concat text "\n\n")
-                                         'face 'magnus-trace-assistant)))))))))))))))
+                      (if (magnus-trace--text-has-markers-p text)
+                          ;; Parse [thinking]/[response] markers
+                          (let ((segments (magnus-trace-parse-content text)))
+                            (dolist (seg segments)
+                              (let ((seg-type (plist-get seg :type))
+                                    (seg-text (plist-get seg :text)))
+                                (cond
+                                 ((eq seg-type 'thinking)
+                                  (unless has-output
+                                    (insert (propertize
+                                            (format "── Thinking [%s] ──\n"
+                                                    (magnus-trace--format-time timestamp))
+                                            'face 'magnus-trace-separator))
+                                    (setq has-output t))
+                                  (let ((start (point)))
+                                    (insert (propertize (concat seg-text "\n\n")
+                                                       'face 'magnus-trace-thinking))
+                                    (let ((ov (make-overlay start (point))))
+                                      (overlay-put ov 'magnus-thinking t)
+                                      (overlay-put ov 'evaporate t))))
+                                 ((eq seg-type 'response)
+                                  (unless has-output
+                                    (insert (propertize
+                                            (format "── Assistant [%s] ──\n"
+                                                    (magnus-trace--format-time timestamp))
+                                            'face 'magnus-trace-separator))
+                                    (setq has-output t))
+                                  (insert (propertize (concat seg-text "\n\n")
+                                                     'face 'magnus-trace-assistant)))))))
+                        ;; No markers — render as plain assistant text
+                        (unless has-output
+                          (insert (propertize (format "── Assistant [%s] ──\n"
+                                                     (magnus-trace--format-time timestamp))
+                                             'face 'magnus-trace-separator))
+                          (setq has-output t))
+                        (insert (propertize (concat text "\n\n")
+                                           'face 'magnus-trace-assistant))))))))))))))))
 
 (defun magnus-trace--format-time (timestamp)
   "Format ISO TIMESTAMP to HH:MM:SS."

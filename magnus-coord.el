@@ -1265,6 +1265,30 @@ When you need user input (permissions, confirmations, etc.):
 
 This prevents multiple agents from asking for input simultaneously.
 
+## Thinking Out Loud
+
+As of Claude Code v2.1.29, Anthropic encrypts thinking traces — your internal
+reasoning is hidden from the user. This makes it difficult for them to guide you,
+catch misunderstandings early, or interrupt unproductive paths. For multi-agent
+coordination this is especially harmful: the user cannot see why agents make
+decisions or where they diverge.
+
+To restore transparency, always structure your output with explicit markers:
+
+[thinking]
+Your reasoning, analysis, doubts, and direction changes go here.
+Be verbose — show your work. The user reads this to understand your decisions
+and catch mistakes early.
+[end-thinking]
+
+[response]
+Your actual response to the user or action you're taking.
+[end-response]
+
+Both marker pairs are required on every message, even one-liners. Think of
+[thinking] as your facial expression and [response] as what you're saying.
+Never skip either.
+
 ## Important Files
 
 - Coordination: `%s`
