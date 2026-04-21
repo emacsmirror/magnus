@@ -46,6 +46,14 @@
 
 ;;; Variables
 
+(defcustom magnus-trace-max-initial-entries 200
+  "Maximum entries to render on initial trace open.
+When a JSONL file has more entries than this, only the last N are
+rendered.  Set to nil to render everything (may freeze on large files)."
+  :type '(choice (integer :tag "Max entries")
+                 (const :tag "No limit" nil))
+  :group 'magnus)
+
 (defvar-local magnus-trace--instance nil
   "The instance this trace buffer is following.")
 
@@ -275,15 +283,31 @@ is `thinking' or `response'.  Unmarked text is treated as response."
 (defun magnus-trace--append-new-entries (jsonl-file)
   "Append new entries from JSONL-FILE to the current trace buffer."
   (let* ((all-lines (magnus-trace--read-lines jsonl-file))
+         (total (length all-lines))
          (new-lines (nthcdr magnus-trace--last-line-count all-lines))
-         (at-end (eobp)))
-    (when new-lines
+         (new-count (length new-lines))
+         (at-end (eobp))
+         ;; On initial load, cap to last N entries to avoid freezing
+         (skip (if (and (zerop magnus-trace--last-line-count)
+                        magnus-trace-max-initial-entries
+                        (> new-count magnus-trace-max-initial-entries))
+                   (- new-count magnus-trace-max-initial-entries)
+                 0))
+         (lines-to-render (nthcdr skip new-lines)))
+    (when lines-to-render
       (let ((inhibit-read-only t)
             (parsed-count 0))
         (save-excursion
           (goto-char (point-max))
+          ;; Show omission notice on initial load
+          (when (> skip 0)
+            (insert (propertize
+                     (format "── %d earlier entries omitted (showing last %d) ──\n\n"
+                             (+ magnus-trace--last-line-count skip)
+                             magnus-trace-max-initial-entries)
+                     'face 'magnus-trace-separator)))
           (catch 'partial-line
-            (dolist (line new-lines)
+            (dolist (line lines-to-render)
               (condition-case nil
                   (let ((entry (json-parse-string line :object-type 'alist)))
                     (magnus-trace--render-entry entry)
@@ -292,7 +316,7 @@ is `thinking' or `response'.  Unmarked text is treated as response."
                 ;; We'll retry it on the next refresh.
                 (error (throw 'partial-line nil))))))
         (setq magnus-trace--last-line-count
-              (+ magnus-trace--last-line-count parsed-count)))
+              (+ magnus-trace--last-line-count skip parsed-count)))
       ;; Follow tail if user was at end
       (when at-end
         (goto-char (point-max))
