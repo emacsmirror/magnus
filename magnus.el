@@ -299,10 +299,11 @@ Or reply: none|no match"
 
 (defun magnus--headless-command (prompt)
   "Build a command list for a headless Claude call with PROMPT.
+Uses --bare to skip CLAUDE.md, hooks, and plugins.
 Includes --model flag only when `magnus-headless-model' is set."
   (if magnus-headless-model
-      (list magnus-claude-executable "--print" "--model" magnus-headless-model prompt)
-    (list magnus-claude-executable "--print" prompt)))
+      (list magnus-claude-executable "--bare" "--print" "--model" magnus-headless-model prompt)
+    (list magnus-claude-executable "--bare" "--print" prompt)))
 
 (defun magnus--run-match-sync (prompt)
   "Run `claude --print' synchronously with PROMPT.
