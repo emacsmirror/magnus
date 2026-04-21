@@ -63,6 +63,9 @@ rendered.  Set to nil to render everything (may freeze on large files)."
 (defvar-local magnus-trace--rendered-count 0
   "Number of entries currently rendered in the buffer.")
 
+(defvar-local magnus-trace--file-offset 0
+  "Byte offset into the JSONL file up to which we have read.")
+
 (defvar magnus-trace--timer nil
   "Timer for auto-refreshing trace buffers.")
 
@@ -97,6 +100,7 @@ rendered.  Set to nil to render everything (may freeze on large files)."
       (setq magnus-trace--instance instance)
       (setq magnus-trace--last-line-count 0)
       (setq magnus-trace--rendered-count 0)
+      (setq magnus-trace--file-offset 0)
       (let ((inhibit-read-only t))
         (erase-buffer))
       (magnus-trace-refresh))
@@ -285,87 +289,98 @@ is `thinking' or `response'.  Unmarked text is treated as response."
 ;;; Internal helpers
 
 (defun magnus-trace--append-new-entries (jsonl-file)
-  "Append new entries from JSONL-FILE to the current trace buffer."
-  (let* ((all-lines (magnus-trace--read-lines jsonl-file))
-         (total (length all-lines))
-         (new-lines (nthcdr magnus-trace--last-line-count all-lines))
-         (new-count (length new-lines))
-         (at-end (eobp))
-         ;; On initial load, cap to last N entries to avoid freezing
-         (skip (if (and (zerop magnus-trace--last-line-count)
-                        magnus-trace-max-initial-entries
-                        (> new-count magnus-trace-max-initial-entries))
-                   (- new-count magnus-trace-max-initial-entries)
-                 0))
-         (lines-to-render (nthcdr skip new-lines)))
-    (when lines-to-render
-      (let ((inhibit-read-only t)
-            (parsed-count 0))
-        (save-excursion
-          (goto-char (point-max))
-          ;; Show omission notice on initial load
-          (when (> skip 0)
-            (insert (propertize
-                     (format "── %d earlier entries omitted (showing last %d) ──\n\n"
-                             (+ magnus-trace--last-line-count skip)
-                             magnus-trace-max-initial-entries)
-                     'face 'magnus-trace-separator)))
-          (catch 'partial-line
-            (dolist (line lines-to-render)
-              (condition-case nil
-                  (let ((entry (json-parse-string line :object-type 'alist)))
-                    (magnus-trace--render-entry entry)
-                    (setq parsed-count (1+ parsed-count)))
-                ;; Stop at first unparseable line (likely half-written).
-                ;; We'll retry it on the next refresh.
-                (error (throw 'partial-line nil))))))
-        (setq magnus-trace--last-line-count
-              (+ magnus-trace--last-line-count skip parsed-count))
-        (setq magnus-trace--rendered-count
-              (+ magnus-trace--rendered-count parsed-count)))
-      ;; Trim buffer if it has grown too large (2x cap)
-      (magnus-trace--maybe-trim jsonl-file)
-      ;; Follow tail if user was at end
-      (when at-end
-        (goto-char (point-max))
-        (let ((win (get-buffer-window (current-buffer))))
-          (when win
-            (set-window-point win (point-max))))))))
+  "Append new entries from JSONL-FILE to the current trace buffer.
+On initial load, reads the full file but only renders the last
+`magnus-trace-max-initial-entries' entries.  On subsequent refreshes,
+reads only new bytes from the file offset."
+  (let* ((file-size (file-attribute-size (file-attributes jsonl-file)))
+         (at-end (eobp)))
+    (cond
+     ;; Initial load: read full file, cap to last N entries
+     ((zerop magnus-trace--file-offset)
+      (let* ((all-lines (magnus-trace--read-lines jsonl-file 0))
+             (total (length all-lines))
+             (skip (if (and magnus-trace-max-initial-entries
+                            (> total magnus-trace-max-initial-entries))
+                       (- total magnus-trace-max-initial-entries)
+                     0))
+             (lines-to-render (nthcdr skip all-lines)))
+        (when lines-to-render
+          (magnus-trace--render-lines lines-to-render skip))
+        (setq magnus-trace--file-offset file-size
+              magnus-trace--last-line-count total)))
+     ;; Incremental: read only new bytes
+     ((> file-size magnus-trace--file-offset)
+      (let* ((new-text (magnus-trace--read-tail jsonl-file
+                                                magnus-trace--file-offset))
+             (new-lines (split-string new-text "\n" t)))
+        (when new-lines
+          (magnus-trace--render-lines new-lines 0))
+        (setq magnus-trace--file-offset file-size
+              magnus-trace--last-line-count
+              (+ magnus-trace--last-line-count (length new-lines))))))
+    ;; Trim buffer if it has grown too large (2x cap)
+    (when (and magnus-trace-max-initial-entries
+               (> magnus-trace--rendered-count
+                  (* 2 magnus-trace-max-initial-entries)))
+      (magnus-trace--trim jsonl-file))
+    ;; Follow tail if user was at end
+    (when at-end
+      (goto-char (point-max))
+      (let ((win (get-buffer-window (current-buffer))))
+        (when win
+          (set-window-point win (point-max)))))))
 
-(defun magnus-trace--maybe-trim (jsonl-file)
-  "Trim the current trace buffer if it exceeds 2x the entry cap.
-Re-renders the last `magnus-trace-max-initial-entries' from JSONL-FILE."
-  (when (and magnus-trace-max-initial-entries
-             (> magnus-trace--rendered-count
-                (* 2 magnus-trace-max-initial-entries)))
-    (let* ((all-lines (magnus-trace--read-lines jsonl-file))
-           (total (length all-lines))
-           (keep magnus-trace-max-initial-entries)
-           (skip (max 0 (- total keep)))
-           (lines-to-render (nthcdr skip all-lines))
-           (inhibit-read-only t))
-      (erase-buffer)
-      (remove-overlays)
+(defun magnus-trace--render-lines (lines skip)
+  "Render LINES into the current trace buffer.
+SKIP is the number of earlier entries omitted (for the header)."
+  (let ((inhibit-read-only t)
+        (parsed-count 0))
+    (save-excursion
+      (goto-char (point-max))
       (when (> skip 0)
         (insert (propertize
                  (format "── %d earlier entries omitted (showing last %d) ──\n\n"
-                         skip keep)
+                         skip magnus-trace-max-initial-entries)
                  'face 'magnus-trace-separator)))
-      (let ((parsed-count 0))
-        (dolist (line lines-to-render)
+      (catch 'partial-line
+        (dolist (line lines)
           (condition-case nil
               (let ((entry (json-parse-string line :object-type 'alist)))
                 (magnus-trace--render-entry entry)
                 (setq parsed-count (1+ parsed-count)))
-            (error (ignore))))
-        (setq magnus-trace--last-line-count (+ skip parsed-count)
-              magnus-trace--rendered-count parsed-count)))))
+            (error (throw 'partial-line nil))))))
+    (setq magnus-trace--rendered-count
+          (+ magnus-trace--rendered-count parsed-count))))
 
-(defun magnus-trace--read-lines (file)
-  "Read all lines from FILE."
+(defun magnus-trace--trim (jsonl-file)
+  "Trim the current trace buffer to last N entries from JSONL-FILE."
+  (let* ((all-lines (magnus-trace--read-lines jsonl-file 0))
+         (total (length all-lines))
+         (keep magnus-trace-max-initial-entries)
+         (skip (max 0 (- total keep)))
+         (lines-to-render (nthcdr skip all-lines))
+         (inhibit-read-only t))
+    (erase-buffer)
+    (remove-overlays)
+    (setq magnus-trace--rendered-count 0)
+    (when lines-to-render
+      (magnus-trace--render-lines lines-to-render skip))
+    (setq magnus-trace--last-line-count total
+          magnus-trace--file-offset
+          (file-attribute-size (file-attributes jsonl-file)))))
+
+(defun magnus-trace--read-lines (file offset)
+  "Read all lines from FILE starting at byte OFFSET."
   (with-temp-buffer
-    (insert-file-contents file)
+    (insert-file-contents file nil offset)
     (split-string (buffer-string) "\n" t)))
+
+(defun magnus-trace--read-tail (file offset)
+  "Read new bytes from FILE starting at byte OFFSET."
+  (with-temp-buffer
+    (insert-file-contents file nil offset)
+    (buffer-string)))
 
 (defun magnus-trace--render-entry (entry)
   "Render a JSONL ENTRY into the trace buffer."
