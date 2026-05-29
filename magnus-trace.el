@@ -54,6 +54,12 @@ rendered.  Set to nil to render everything (may freeze on large files)."
                  (const :tag "No limit" nil))
   :group 'magnus)
 
+(defcustom magnus-trace-max-buffer-lines 4000
+  "Maximum buffer lines before refusing to load earlier entries.
+Beyond this limit, users should use grep or less on the raw JSONL file."
+  :type 'integer
+  :group 'magnus)
+
 (defvar-local magnus-trace--instance nil
   "The instance this trace buffer is following.")
 
@@ -65,6 +71,12 @@ rendered.  Set to nil to render everything (may freeze on large files)."
 
 (defvar-local magnus-trace--file-offset 0
   "Byte offset into the JSONL file up to which we have read.")
+
+(defvar-local magnus-trace--skip-count 0
+  "Number of JSONL entries currently skipped (not rendered) at the top.")
+
+(defvar-local magnus-trace--jsonl-file nil
+  "Path to the JSONL file for this trace buffer.")
 
 (defvar magnus-trace--timer nil
   "Timer for auto-refreshing trace buffers.")
@@ -85,6 +97,7 @@ rendered.  Set to nil to render everything (may freeze on large files)."
   (define-key map (kbd "t") #'magnus-trace-toggle-all-thinking)
   (define-key map (kbd "n") #'magnus-trace-next-response)
   (define-key map (kbd "p") #'magnus-trace-prev-response)
+  (define-key map (kbd "[") #'magnus-trace-load-earlier)
   (define-key map (kbd "q") #'quit-window))
 
 ;;; Core functions
@@ -101,6 +114,8 @@ rendered.  Set to nil to render everything (may freeze on large files)."
       (setq magnus-trace--last-line-count 0)
       (setq magnus-trace--rendered-count 0)
       (setq magnus-trace--file-offset 0)
+      (setq magnus-trace--skip-count 0)
+      (setq magnus-trace--jsonl-file nil)
       (let ((inhibit-read-only t))
         (erase-buffer))
       (magnus-trace-refresh))
@@ -155,6 +170,65 @@ rendered.  Set to nil to render everything (may freeze on large files)."
   (magnus-trace-refresh)
   (goto-char (point-max))
   (recenter -3))
+
+;;; Backward pagination
+
+(defun magnus-trace-load-earlier ()
+  "Load the previous batch of earlier entries into the trace buffer.
+Each press loads up to `magnus-trace-max-initial-entries' more entries
+at the top.  Stops when all entries are loaded or the buffer exceeds
+`magnus-trace-max-buffer-lines' lines."
+  (interactive)
+  (unless magnus-trace--jsonl-file
+    (user-error "No JSONL file associated with this trace buffer"))
+  (cond
+   ((zerop magnus-trace--skip-count)
+    (message "All entries already loaded"))
+   ((and magnus-trace-max-buffer-lines
+         (>= (count-lines (point-min) (point-max))
+              magnus-trace-max-buffer-lines))
+    (message "Buffer at %d lines — use grep/less on %s"
+             magnus-trace-max-buffer-lines
+             (abbreviate-file-name magnus-trace--jsonl-file)))
+   (t
+    (let* ((all-lines (magnus-trace--read-lines magnus-trace--jsonl-file 0))
+           (batch-size (or magnus-trace-max-initial-entries 200))
+           (new-skip (max 0 (- magnus-trace--skip-count batch-size)))
+           (batch (seq-subseq all-lines new-skip magnus-trace--skip-count))
+           (inhibit-read-only t)
+           (parsed-count 0))
+      (save-excursion
+        (goto-char (point-min))
+        ;; Remove old header
+        (when (get-text-property (point) 'magnus-trace-header)
+          (delete-region (point)
+                         (or (next-single-property-change
+                              (point) 'magnus-trace-header)
+                             (point))))
+        ;; Insert new header if still skipping
+        (when (> new-skip 0)
+          (insert (propertize
+                   (format "── %d earlier entries (press [ to load more) ──\n\n"
+                           new-skip)
+                   'face 'magnus-trace-separator
+                   'magnus-trace-header t)))
+        ;; Render batch entries at point (before existing content)
+        (catch 'partial-line
+          (dolist (line batch)
+            (condition-case nil
+                (let ((entry (json-parse-string line :object-type 'alist)))
+                  (magnus-trace--render-entry entry)
+                  (setq parsed-count (1+ parsed-count)))
+              (error (throw 'partial-line nil))))))
+      (setq magnus-trace--skip-count new-skip
+            magnus-trace--rendered-count
+            (+ magnus-trace--rendered-count parsed-count))
+      (goto-char (point-min))
+      (message "Loaded %d entries (%s)"
+               parsed-count
+               (if (zerop new-skip)
+                   "all entries now visible"
+                 (format "%d earlier remaining" new-skip)))))))
 
 ;;; Thinking block collapse/expand
 
@@ -293,6 +367,7 @@ is `thinking' or `response'.  Unmarked text is treated as response."
 On initial load, reads the full file but only renders the last
 `magnus-trace-max-initial-entries' entries.  On subsequent refreshes,
 reads only new bytes from the file offset."
+  (setq magnus-trace--jsonl-file jsonl-file)
   (let* ((file-size (file-attribute-size (file-attributes jsonl-file)))
          (at-end (eobp)))
     (cond
@@ -308,7 +383,8 @@ reads only new bytes from the file offset."
         (when lines-to-render
           (magnus-trace--render-lines lines-to-render skip))
         (setq magnus-trace--file-offset file-size
-              magnus-trace--last-line-count total)))
+              magnus-trace--last-line-count total
+              magnus-trace--skip-count skip)))
      ;; Incremental: read only new bytes
      ((> file-size magnus-trace--file-offset)
       (let* ((new-text (magnus-trace--read-tail jsonl-file
@@ -340,9 +416,10 @@ SKIP is the number of earlier entries omitted (for the header)."
       (goto-char (point-max))
       (when (> skip 0)
         (insert (propertize
-                 (format "── %d earlier entries omitted (showing last %d) ──\n\n"
-                         skip magnus-trace-max-initial-entries)
-                 'face 'magnus-trace-separator)))
+                 (format "── %d earlier entries (press [ to load more) ──\n\n"
+                         skip)
+                 'face 'magnus-trace-separator
+                 'magnus-trace-header t)))
       (catch 'partial-line
         (dolist (line lines)
           (condition-case nil
@@ -367,6 +444,7 @@ SKIP is the number of earlier entries omitted (for the header)."
     (when lines-to-render
       (magnus-trace--render-lines lines-to-render skip))
     (setq magnus-trace--last-line-count total
+          magnus-trace--skip-count skip
           magnus-trace--file-offset
           (file-attribute-size (file-attributes jsonl-file)))))
 
