@@ -507,7 +507,8 @@ Sends a wake-up message to running agents and re-arms the idle timer."
   (remove-hook 'pre-command-hook #'magnus-coord--on-user-return)
   (setq magnus-coord--user-idle-p nil)
   (dolist (instance (magnus-instances-list))
-    (when (eq (magnus-instance-status instance) 'running)
+    (when (and (eq (magnus-instance-status instance) 'running)
+               (not (magnus-coord-agent-busy-p instance)))
       (magnus-coord-nudge-agent
        instance
        "The user is back! Resume normal operation — check .magnus-coord.md for any updates."
