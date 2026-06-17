@@ -490,7 +490,8 @@ sections.  Debounced to at most once per hour per directory."
 Tells agents to consolidate their memory and go to sleep."
   (setq magnus-coord--user-idle-p t)
   (dolist (instance (magnus-instances-list))
-    (when (eq (magnus-instance-status instance) 'running)
+    (when (and (eq (magnus-instance-status instance) 'running)
+               (not (magnus-coord-agent-busy-p instance)))
       (let* ((name (magnus-instance-name instance))
              (memory-rel (format ".claude/agents/%s/memory.md" name)))
         (magnus-process--ensure-agent-dir instance)
