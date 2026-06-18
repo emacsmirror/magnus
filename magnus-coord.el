@@ -98,6 +98,14 @@ Set to nil to disable.  Default is 600 (10 minutes)."
                  (const :tag "Disabled" nil))
   :group 'magnus)
 
+(defcustom magnus-coord-nudge-debounce 300
+  "Minimum seconds between system nudges to the same agent.
+Prevents rapid-fire reminders when multiple nudge paths fire
+close together.  Only applies to Magnus system messages, not
+agent-to-agent DMs or @mentions."
+  :type 'integer
+  :group 'magnus)
+
 (defcustom magnus-coord-log-max-entries 25
   "Maximum number of log entries to keep in the coordination file.
 Older entries are trimmed automatically.  Set to nil to disable."
@@ -151,22 +159,34 @@ This prevents partial reads when agents write concurrently."
 
 ;;; Sending messages to agents
 
+(defvar magnus-coord--last-nudge (make-hash-table :test 'equal)
+  "Hash of instance-id → timestamp of last Magnus system nudge.")
+
 (defun magnus-coord-nudge-agent (instance message &optional source)
   "Nudge INSTANCE by sending MESSAGE to its vterm buffer.
 When SOURCE is non-nil, prepend \"[From SOURCE]:\" to distinguish
-system messages from user-typed input."
-  (when-let ((buffer (magnus-instance-buffer instance)))
-    (when (buffer-live-p buffer)
-      (let ((text (if source
-                      (format "[From %s]: %s" source message)
-                    message)))
-        (with-current-buffer buffer
-          (vterm-send-string text)
-          (run-with-timer 0.1 nil
-                          (lambda ()
-                            (when (buffer-live-p buffer)
-                              (with-current-buffer buffer
-                                (vterm-send-return))))))))))
+system messages from user-typed input.  System messages from Magnus
+are debounced per `magnus-coord-nudge-debounce'."
+  (let ((id (magnus-instance-id instance)))
+    (when (and (string= source "Magnus")
+               magnus-coord-nudge-debounce)
+      (let ((last (gethash id magnus-coord--last-nudge 0)))
+        (when (< (- (float-time) last) magnus-coord-nudge-debounce)
+          (cl-return-from magnus-coord-nudge-agent))))
+    (when-let ((buffer (magnus-instance-buffer instance)))
+      (when (buffer-live-p buffer)
+        (let ((text (if source
+                        (format "[From %s]: %s" source message)
+                      message)))
+          (when (string= source "Magnus")
+            (puthash id (float-time) magnus-coord--last-nudge))
+          (with-current-buffer buffer
+            (vterm-send-string text)
+            (run-with-timer 0.1 nil
+                            (lambda ()
+                              (when (buffer-live-p buffer)
+                                (with-current-buffer buffer
+                                  (vterm-send-return)))))))))))
 
 
 ;;; Periodic reminders
