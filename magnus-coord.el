@@ -122,6 +122,21 @@ Set to nil to disable."
                  (const :tag "Disabled" nil))
   :group 'magnus)
 
+(put 'magnus-coord-log-max-entries 'safe-local-variable
+     (lambda (v) (or (null v) (integerp v))))
+(put 'magnus-coord-tidy-size-threshold 'safe-local-variable
+     (lambda (v) (or (null v) (integerp v))))
+
+(defun magnus-coord--dir-local-value (var dir)
+  "Return VAR's dir-local value in DIR, falling back to its global value.
+Timers run outside any buffer visiting DIR, so dir-local settings in
+DIR's .dir-locals.el are invisible to them unless resolved explicitly."
+  (with-temp-buffer
+    (setq default-directory (file-name-as-directory (expand-file-name dir)))
+    (let ((enable-local-variables :safe))
+      (hack-dir-local-variables-non-file-buffer))
+    (symbol-value var)))
+
 (defcustom magnus-coord-idle-threshold 300
   "Seconds of inactivity before telling agents to sleep.
 When the user is idle for this long, a sleep message is sent to
@@ -377,8 +392,10 @@ Suppressed entirely when AFK or DND is on."
 (defun magnus-coord-trim-log (directory)
   "Trim the Log section in DIRECTORY's coordination file.
 Keeps only the last `magnus-coord-log-max-entries' entries."
-  (when magnus-coord-log-max-entries
-    (let ((file (magnus-coord-file-path directory)))
+  (let ((max-entries (magnus-coord--dir-local-value
+                      'magnus-coord-log-max-entries directory)))
+    (when max-entries
+      (let ((file (magnus-coord-file-path directory)))
       (when (file-exists-p file)
         (with-temp-buffer
           (insert-file-contents file)
@@ -393,13 +410,13 @@ Keeps only the last `magnus-coord-log-max-entries' entries."
               ;; Collect log entries (timestamp lines)
               (goto-char log-start)
               (while (re-search-forward
-                      "^\\[\\([0-9:]+\\)\\] .+$" section-end t)
+                      "^\\[\\([^]]+\\)\\] .+$" section-end t)
                 (push (match-beginning 0) entries))
               (setq entries (nreverse entries))
               ;; If over limit, delete everything before the Nth-from-last
-              (when (> (length entries) magnus-coord-log-max-entries)
+              (when (> (length entries) max-entries)
                 (let ((cut-point (nth (- (length entries)
-                                         magnus-coord-log-max-entries)
+                                         max-entries)
                                       entries)))
                   ;; Delete from after the Log header to the cut point
                   (goto-char log-start)
@@ -415,7 +432,7 @@ Keeps only the last `magnus-coord-log-max-entries' entries."
                       (forward-line 1)))
                   (when (< (point) cut-point)
                     (delete-region (point) cut-point))
-                  (magnus-coord--write-file-atomic file))))))))))
+                  (magnus-coord--write-file-atomic file)))))))))))
 
 (defun magnus-coord-trim-all ()
   "Trim coordination file logs for all active project directories."
@@ -427,21 +444,26 @@ Keeps only the last `magnus-coord-log-max-entries' entries."
 
 ;;; Intelligent coord file tidying
 
+(defvar magnus-coord--last-tidy-time nil
+  "Alist of (directory . timestamp) for last tidy request, for debouncing.")
+
 (defun magnus-coord--maybe-tidy ()
   "Ask a random idle agent to tidy the coord file if it has grown too large.
 Checks each project directory's coordination file against
 `magnus-coord-tidy-size-threshold' and, when exceeded, picks a
 random quiescent agent to consolidate the Discoveries and Decisions
 sections.  Debounced to at most once per hour per directory."
-  (when magnus-coord-tidy-size-threshold
-    (let ((dirs (delete-dups
-                 (mapcar #'magnus-instance-directory
-                         (magnus-instances-list)))))
-      (dolist (dir dirs)
-        (let ((file (magnus-coord-file-path dir)))
-          (when (and (file-exists-p file)
-                     (> (file-attribute-size (file-attributes file))
-                        magnus-coord-tidy-size-threshold)
+  (let ((dirs (delete-dups
+               (mapcar #'magnus-instance-directory
+                       (magnus-instances-list)))))
+    (dolist (dir dirs)
+      (let ((file (magnus-coord-file-path dir))
+            (threshold (magnus-coord--dir-local-value
+                        'magnus-coord-tidy-size-threshold dir)))
+        (when (and threshold
+                   (file-exists-p file)
+                   (> (file-attribute-size (file-attributes file))
+                      threshold)
                      (let ((last (alist-get dir magnus-coord--last-tidy-time
                                             nil nil #'equal)))
                        (or (null last)
@@ -476,7 +498,7 @@ sections.  Debounced to at most once per hour per directory."
                   (magnus-coord-add-log
                    dir "Magnus"
                    (format "Asked %s to tidy the coordination file"
-                           (magnus-instance-name chosen))))))))))))
+                           (magnus-instance-name chosen)))))))))))
 
 ;;; AFK detection
 
@@ -681,9 +703,6 @@ instances restored from persistence."
 
 (defvar magnus-coord--last-trim-time 0
   "Timestamp of last log trim, for debouncing.")
-
-(defvar magnus-coord--last-tidy-time nil
-  "Alist of (directory . timestamp) for last tidy request, for debouncing.")
 
 (defun magnus-coord--poll-all ()
   "Poll all watched coordination files for new mentions, DMs, and summons.
