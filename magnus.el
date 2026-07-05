@@ -297,13 +297,18 @@ Reply with ONLY: agent-name|brief-reason (5 words max)\n\
 Or reply: none|no match"
             memories task)))
 
-(defun magnus--headless-command (prompt)
+(defun magnus--headless-command (prompt &optional no-bare)
   "Build a command list for a headless Claude call with PROMPT.
-Uses --bare to skip CLAUDE.md, hooks, and plugins.
+Uses --bare to skip CLAUDE.md, hooks, and plugins — UNLESS NO-BARE is
+non-nil.  (In current Claude CLI builds `--bare' fails auth with
+\"Not logged in\"; callers that need a real reply pass NO-BARE and
+sanitize the CLAUDE.md-flavored output themselves.)
 Includes --model flag only when `magnus-headless-model' is set."
-  (if magnus-headless-model
-      (list magnus-claude-executable "--bare" "--print" "--model" magnus-headless-model prompt)
-    (list magnus-claude-executable "--bare" "--print" prompt)))
+  (append (list magnus-claude-executable)
+          (unless no-bare (list "--bare"))
+          (list "--print")
+          (when magnus-headless-model (list "--model" magnus-headless-model))
+          (list prompt)))
 
 (defun magnus--run-match-sync (prompt)
   "Run `claude --print' synchronously with PROMPT.
@@ -399,7 +404,7 @@ lowercase keywords, nothing else.\n\nMemory:\n%s" memory))
         (condition-case err
             (let ((proc (make-process
                          :name (format "magnus-index-%s" name)
-                         :command (magnus--headless-command prompt)
+                         :command (magnus--headless-command prompt t)
                          :connection-type 'pipe
                          :filter (lambda (proc output)
                                    (process-put
