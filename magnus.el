@@ -418,11 +418,43 @@ lowercase keywords, nothing else.\n\nMemory:\n%s" memory))
   (lambda (proc event)
     (let ((status (string-trim event)))
       (if (string-prefix-p "finished" status)
-          (let ((tags (string-trim (or (process-get proc :output) ""))))
+          (let ((tags (magnus--sanitize-expertise
+                       (or (process-get proc :output) ""))))
             (unless (string-empty-p tags)
               (magnus--agents-index-set directory name tags)
               (message "Magnus: indexed %s → %s" name tags)))
         (message "Magnus: indexing %s failed: %s" name status)))))
+
+(defun magnus--sanitize-expertise (raw)
+  "Reduce RAW model output to a clean comma-separated keyword line.
+Agents emit [thinking]/[response] markers (per CLAUDE.md), so strip those,
+then keep the last non-empty line — the keywords come last."
+  (let* ((s (replace-regexp-in-string
+             "\\[thinking\\]\\(?:.\\|\n\\)*?\\[end-thinking\\]" "" raw))
+         (s (replace-regexp-in-string "\\[/?\\(?:end-\\)?response\\]" "" s))
+         (lines (seq-filter (lambda (l) (not (string-empty-p (string-trim l))))
+                            (split-string s "\n")))
+         (last (string-trim (or (car (last lines)) ""))))
+    ;; Only accept a keyword-ish line: no sentences, must contain a comma or be short.
+    (if (and (not (string-empty-p last))
+             (< (length last) 120)
+             (not (string-match-p "[.!?]$" last)))
+        last
+      "")))
+
+(defun magnus-reindex-agents ()
+  "Re-extract expertise tags for every running agent with a memory file.
+The index was previously only refreshed when an agent was ARCHIVED, so
+never-archived agents showed no expertise label.  Run this to populate
+them now; new agents populate once their memory file exists."
+  (interactive)
+  (let ((n 0))
+    (dolist (instance (magnus-instances-list))
+      (let ((memory-path (magnus-process--agent-memory-path instance)))
+        (when (and memory-path (file-exists-p memory-path))
+          (magnus--agents-index-update instance)
+          (setq n (1+ n)))))
+    (message "Magnus: reindexing expertise for %d agent(s)…" n)))
 
 ;;; Core functionality
 
