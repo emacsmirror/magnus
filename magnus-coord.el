@@ -182,12 +182,13 @@ This prevents partial reads when agents write concurrently."
 When SOURCE is non-nil, prepend \"[From SOURCE]:\" to distinguish
 system messages from user-typed input.  System messages from Magnus
 are debounced per `magnus-coord-nudge-debounce'."
+  (catch 'magnus-debounced
   (let ((id (magnus-instance-id instance)))
     (when (and (string= source "Magnus")
                magnus-coord-nudge-debounce)
       (let ((last (gethash id magnus-coord--last-nudge 0)))
         (when (< (- (float-time) last) magnus-coord-nudge-debounce)
-          (cl-return-from magnus-coord-nudge-agent))))
+          (throw 'magnus-debounced nil))))
     (when-let ((buffer (magnus-instance-buffer instance)))
       (when (buffer-live-p buffer)
         (let ((text (if source
@@ -201,7 +202,7 @@ are debounced per `magnus-coord-nudge-debounce'."
                             (lambda ()
                               (when (buffer-live-p buffer)
                                 (with-current-buffer buffer
-                                  (vterm-send-return)))))))))))
+                                  (vterm-send-return))))))))))))
 
 
 ;;; Periodic reminders
