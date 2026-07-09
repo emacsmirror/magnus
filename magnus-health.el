@@ -21,6 +21,7 @@
 
 (defvar magnus-claude-executable)
 (declare-function magnus--headless-command "magnus")
+(declare-function magnus--strip-thinking-markers "magnus")
 
 ;;; Customization
 
@@ -333,7 +334,7 @@ Falls back silently to the static list if generation fails."
           (let ((proc (make-process
                        :name "magnus-health-bloomberg-gen"
                        :command (magnus--headless-command
-                                     magnus-health-dashboard--gen-prompt)
+                                     magnus-health-dashboard--gen-prompt t)
                        :connection-type 'pipe
                        :filter (lambda (_proc output)
                                  (setq magnus-health-dashboard--gen-output
@@ -353,7 +354,9 @@ Falls back silently to the static list if generation fails."
 
 (defun magnus-health-dashboard--parse-gen-output ()
   "Parse generator output into individual messages and add to queue."
-  (let* ((lines (split-string magnus-health-dashboard--gen-output "\n" t))
+  (let* ((clean (magnus--strip-thinking-markers
+                 magnus-health-dashboard--gen-output))
+         (lines (split-string clean "\n" t))
          (msgs (cl-remove-if
                 (lambda (line)
                   (let ((trimmed (string-trim line)))

@@ -321,9 +321,18 @@ Returns the trimmed output string, or nil on error."
                 (lambda (e) (string-prefix-p "CLAUDECODE=" e))
                 process-environment)))
           (with-temp-buffer
-            (let ((cmd (magnus--headless-command prompt)))
+            (let ((cmd (magnus--headless-command prompt t)))
               (apply #'call-process (car cmd) nil t nil (cdr cmd)))
-            (string-trim (buffer-string)))))
+            ;; no-bare output may carry CLAUDE.md thinking markers; the
+            ;; answer line ("name|reason") is the last line that has a pipe.
+            (let* ((clean (magnus--strip-thinking-markers (buffer-string)))
+                   (lines (seq-filter
+                           (lambda (l) (not (string-empty-p (string-trim l))))
+                           (split-string clean "\n")))
+                   (answer (or (seq-find (lambda (l) (string-match-p "|" l))
+                                         (reverse lines))
+                               (car lines))))
+              (string-trim (or answer ""))))))
     (error (message "Magnus: match sync error: %s" (error-message-string err))
            nil)))
 
@@ -430,13 +439,20 @@ lowercase keywords, nothing else.\n\nMemory:\n%s" memory))
               (message "Magnus: indexed %s → %s" name tags)))
         (message "Magnus: indexing %s failed: %s" name status)))))
 
+(defun magnus--strip-thinking-markers (raw)
+  "Strip [thinking]...[end-thinking] blocks and marker lines from RAW.
+Agents emit these per project CLAUDE.md conventions; any caller that
+passes NO-BARE to `magnus--headless-command' gets them in the output."
+  (let ((s (replace-regexp-in-string
+            "\\[thinking\\]\\(?:.\\|\n\\)*?\\[end-thinking\\]" "" raw)))
+    (replace-regexp-in-string
+     "\\[/?\\(?:end-\\)?\\(?:thinking\\|response\\)\\]" "" s)))
+
 (defun magnus--sanitize-expertise (raw)
   "Reduce RAW model output to a clean comma-separated keyword line.
 Agents emit [thinking]/[response] markers (per CLAUDE.md), so strip those,
 then keep the last non-empty line — the keywords come last."
-  (let* ((s (replace-regexp-in-string
-             "\\[thinking\\]\\(?:.\\|\n\\)*?\\[end-thinking\\]" "" raw))
-         (s (replace-regexp-in-string "\\[/?\\(?:end-\\)?response\\]" "" s))
+  (let* ((s (magnus--strip-thinking-markers raw))
          (lines (seq-filter (lambda (l) (not (string-empty-p (string-trim l))))
                             (split-string s "\n")))
          (last (string-trim (or (car (last lines)) ""))))
