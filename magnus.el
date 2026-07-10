@@ -57,6 +57,7 @@
 (declare-function magnus-coord-ensure-watchers "magnus-coord")
 (declare-function magnus-status "magnus-status")
 (declare-function magnus-process-create "magnus-process")
+(declare-function magnus-process-create-codex "magnus-process")
 (declare-function magnus-instances-list "magnus-instances")
 (declare-function magnus-instance-name "magnus-instances")
 (declare-function magnus-instance-directory "magnus-instances")
@@ -557,6 +558,18 @@ NAME is the instance name.  If nil, auto-generates one."
   (interactive)
   (magnus--ensure-initialized)
   (magnus-process-create directory name))
+
+;;;###autoload
+(defun magnus-create-codex (&optional directory name initial-message)
+  "Create an opt-in Codex instance managed through App Server.
+DIRECTORY and NAME have the same meaning as in `magnus-create-instance'.
+When INITIAL-MESSAGE is non-nil, start the first turn after connecting."
+  (interactive
+   (list nil nil
+         (let ((message (read-string "Initial Codex task (RET to skip): ")))
+           (unless (string-empty-p message) message))))
+  (magnus--ensure-initialized)
+  (magnus-process-create-codex directory name initial-message))
 
 ;;;###autoload
 (defun magnus-create-headless (prompt &optional directory name)

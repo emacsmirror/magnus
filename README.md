@@ -36,6 +36,26 @@ Magnus solves all of this.
 ### Instance Management
 Spawn, kill, suspend/resume, rename, and switch between Claude Code instances running in vterm buffers. Each instance gets a randomly generated name (like `swift-fox` or `keen-owl`) and runs in its own terminal. Change an instance's working directory with session resume — Claude keeps its full conversation history.
 
+### Optional Codex Instances
+
+Run `M-x magnus-create-codex` to create a Codex instance through Codex App
+Server. Codex is strictly opt-in: existing commands, saved state, vterm
+behavior, and Claude storage paths remain unchanged. Codex instances support
+thread resume, streamed messages and plans, same-turn steering, interruption,
+and semantic approval callbacks. They are labeled `[codex]` in the status
+buffer.
+
+This requires a `codex` executable with `codex app-server` support. Customize
+its path with `magnus-codex-executable`. App Server connections use stdio and
+are restarted transparently when a saved Codex thread is revisited.
+
+Inside a Codex buffer, press `m` to send or steer, `a` to answer a pending
+command/file approval, and `C-c C-k` to interrupt the active turn. Magnus also
+adapts its full onboarding philosophy for Codex: named identity, first-person
+memory, coordination claims and discoveries, attention etiquette, debriefing,
+and candid `[thinking]`/`[response]` engineering journals. Claude's established
+prompt remains unchanged.
+
 ### Agent Coordination
 Agents communicate through a shared `.magnus-coord.md` file:
 
@@ -138,6 +158,7 @@ Everything persists across Emacs sessions:
 - Emacs 28.1+
 - [vterm](https://github.com/akermu/emacs-libvterm)
 - [transient](https://github.com/magit/transient) (built into Emacs 28+)
+- Codex CLI with App Server support (only for opt-in Codex instances)
 
 ## Installation
 
@@ -330,6 +351,9 @@ Magnus avoids triggering interactive Helm/Projectile prompts when creating insta
 ;; Path to claude executable (default: "claude")
 (setq magnus-claude-executable "/path/to/claude")
 
+;; Path to codex executable for optional App Server instances
+(setq magnus-codex-executable "/path/to/codex")
+
 ;; Default directory for new instances
 (setq magnus-default-directory "~/projects")
 
@@ -379,6 +403,8 @@ magnus/
 ├── magnus-instances.el    # Instance data structure and registry
 ├── magnus-persistence.el  # Save/restore state across sessions
 ├── magnus-process.el      # Process management (vterm + headless)
+├── magnus-provider.el     # Additive provider dispatch
+├── magnus-provider-codex.el # Optional Codex App Server provider
 ├── magnus-trace.el        # Thinking trace JSONL viewer
 ├── magnus-status.el       # Status buffer UI
 ├── magnus-transient.el    # Transient popup menus

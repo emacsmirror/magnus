@@ -17,8 +17,12 @@
 (require 'filenotify)
 (require 'vterm)
 (require 'magnus-instances)
+(require 'magnus-provider)
 (require 'magnus-coord)
 (require 'magnus-trace)
+
+(declare-function magnus-instances-create "magnus-instances"
+                  (directory name &optional provider))
 
 (declare-function magnus-status-refresh "magnus-status")
 (declare-function magnus-project-root "magnus")
@@ -33,20 +37,36 @@
 
 ;;; Process creation
 
-(defun magnus-process-create (&optional directory name)
-  "Create a new Claude Code instance.
+(defun magnus-process-create (&optional directory name provider)
+  "Create a new agent instance.
 DIRECTORY is the working directory.  If nil, prompts for one.
-NAME is the instance name.  If nil, auto-generates one."
+NAME is the instance name.  If nil, auto-generates one.
+PROVIDER defaults to `claude', preserving the original vterm behavior."
   (interactive)
   (let* ((dir (or directory
                   (magnus-process--get-directory)))
          (instance-name (or name
                             (funcall magnus-instance-name-generator dir)))
-         (instance (magnus-instances-create dir instance-name)))
+         (instance (magnus-instances-create dir instance-name provider)))
     (magnus-instances-add instance)
     ;; Set up coordination files and register agent
     (magnus-coord-register-agent dir instance)
-    (magnus-process--spawn instance)
+    (if (magnus-provider-external-p instance)
+        (magnus-provider-call instance 'start)
+      (magnus-process--spawn instance))
+    instance))
+
+(defun magnus-process-create-codex (&optional directory name initial-message)
+  "Create an opt-in Codex instance in DIRECTORY with NAME.
+When INITIAL-MESSAGE is non-nil, start a turn after the thread is ready."
+  (interactive)
+  (let* ((dir (or directory (magnus-process--get-directory)))
+         (instance-name (or name
+                            (funcall magnus-instance-name-generator dir)))
+         (instance (magnus-instances-create dir instance-name 'codex)))
+    (magnus-instances-add instance)
+    (magnus-coord-register-agent dir instance)
+    (magnus-provider-call instance 'start initial-message)
     instance))
 
 (defun magnus-process--get-directory ()
@@ -359,8 +379,10 @@ Maps \\`keyboard-quit' to send ESC, since Emacs intercepts the real ESC key."
 
 (defun magnus-process-trace (instance)
   "Open the trace buffer for INSTANCE showing thinking and messages."
-  (require 'magnus-trace)
-  (magnus-trace-open instance))
+  (if (magnus-provider-external-p instance)
+      (magnus-provider-call instance 'switch-to)
+    (require 'magnus-trace)
+    (magnus-trace-open instance)))
 
 (defun magnus-process--session-jsonl-path (directory session-id)
   "Get the JSONL file path for SESSION-ID in DIRECTORY."
@@ -387,53 +409,64 @@ Maps \\`keyboard-quit' to send ESC, since Emacs intercepts the real ESC key."
 ;;; Process control
 
 (defun magnus-process-kill (instance &optional force)
-  "Kill the Claude Code process for INSTANCE.
+  "Kill the agent process for INSTANCE.
 If FORCE is non-nil, forcefully terminate."
-  (when-let ((buffer (magnus-instance-buffer instance)))
-    (when (buffer-live-p buffer)
-      (let ((process (get-buffer-process buffer)))
-        (when (and process (process-live-p process))
-          (if force
-              (kill-process process)
-            ;; Graceful exit: SIGINT for headless, C-c for vterm
-            (if (magnus-process--headless-p instance)
-                (interrupt-process process)
-              (with-current-buffer buffer
-                (vterm-send-key "C-c")))))))
-      ;; Give process time to exit, then kill buffer
-      (run-with-timer
-       1 nil
-       (lambda ()
-         (when (buffer-live-p buffer)
-           (kill-buffer buffer)))))
-  (magnus-instances-update instance :status 'stopped :buffer nil))
+  (if (magnus-provider-external-p instance)
+      (magnus-provider-call instance 'stop force)
+    (when-let ((buffer (magnus-instance-buffer instance)))
+      (when (buffer-live-p buffer)
+        (let ((process (get-buffer-process buffer)))
+          (when (and process (process-live-p process))
+            (if force
+                (kill-process process)
+              ;; Graceful exit: SIGINT for headless, C-c for vterm
+              (if (magnus-process--headless-p instance)
+                  (interrupt-process process)
+                (with-current-buffer buffer
+                  (vterm-send-key "C-c"))))))
+        ;; Give process time to exit, then kill buffer
+        (run-with-timer
+         1 nil
+         (lambda ()
+           (when (buffer-live-p buffer)
+             (kill-buffer buffer))))))
+    (magnus-instances-update instance :status 'stopped :buffer nil)))
 
 (defun magnus-process-archive (instance)
   "Archive INSTANCE: stop its process but keep it in the registry.
 The session ID is preserved so the agent can be resurrected later
 via `magnus-process-resurrect-purged'."
-  (let ((directory (magnus-instance-directory instance)))
-    (magnus-coord-unregister-agent directory instance))
-  ;; Graceful stop (same as kill, but we keep the instance)
-  (when-let ((buffer (magnus-instance-buffer instance)))
-    (when (buffer-live-p buffer)
-      (let ((process (get-buffer-process buffer)))
-        (when (and process (process-live-p process))
-          (if (magnus-process--headless-p instance)
-              (interrupt-process process)
-            (with-current-buffer buffer
-              (vterm-send-key "C-c")))))
-      (run-with-timer
-       1 nil
-       (lambda ()
-         (when (buffer-live-p buffer)
-           (kill-buffer buffer))))))
-  (magnus-instances-update instance
-                           :status 'purged
-                           :buffer nil
-                           :purged-at (float-time))
-  ;; Index expertise tags asynchronously
-  (magnus--agents-index-update instance))
+  (if (magnus-provider-external-p instance)
+      (progn
+        (magnus-coord-unregister-agent
+         (magnus-instance-directory instance) instance)
+        (magnus-provider-call instance 'stop)
+        (magnus-instances-update instance
+                                 :status 'purged
+                                 :buffer nil
+                                 :purged-at (float-time)))
+    (let ((directory (magnus-instance-directory instance)))
+      (magnus-coord-unregister-agent directory instance))
+    ;; Graceful stop (same as kill, but we keep the instance)
+    (when-let ((buffer (magnus-instance-buffer instance)))
+      (when (buffer-live-p buffer)
+        (let ((process (get-buffer-process buffer)))
+          (when (and process (process-live-p process))
+            (if (magnus-process--headless-p instance)
+                (interrupt-process process)
+              (with-current-buffer buffer
+                (vterm-send-key "C-c")))))
+        (run-with-timer
+         1 nil
+         (lambda ()
+           (when (buffer-live-p buffer)
+             (kill-buffer buffer))))))
+    (magnus-instances-update instance
+                             :status 'purged
+                             :buffer nil
+                             :purged-at (float-time))
+    ;; Index expertise tags asynchronously
+    (magnus--agents-index-update instance)))
 
 (defun magnus-process-resurrect-purged (instance)
   "Resurrect a purged INSTANCE by resuming its Claude Code session.
@@ -450,9 +483,12 @@ nudge the agent to re-read it."
                   (magnus-instance-name instance)))
     (magnus-instances-update instance :status 'running :purged-at nil)
     (magnus-coord-register-agent directory instance)
-    (magnus-process--spawn-with-session instance session-id)
+    (if (magnus-provider-external-p instance)
+        (magnus-provider-call instance 'resume)
+      (magnus-process--spawn-with-session instance session-id))
     ;; If instructions were outdated, nudge agent to re-read after spawn
-    (when instructions-stale
+    (when (and instructions-stale
+               (not (magnus-provider-external-p instance)))
       (run-with-timer
        5 nil
        (lambda ()
@@ -467,6 +503,9 @@ nudge the agent to re-read it."
 (defun magnus-process-suspend (instance)
   "Suspend the Claude Code process for INSTANCE.
 Sends SIGTSTP to pause the process.  Use `magnus-process-resume' to continue."
+  (when (magnus-provider-external-p instance)
+    (user-error "Suspend is not supported by the `%s' provider"
+                (magnus-instance-provider instance)))
   (when-let ((buffer (magnus-instance-buffer instance)))
     (when (buffer-live-p buffer)
       (when-let ((process (get-buffer-process buffer)))
@@ -480,6 +519,9 @@ Sends SIGTSTP to pause the process.  Use `magnus-process-resume' to continue."
 (defun magnus-process-resume (instance)
   "Resume a suspended Claude Code process for INSTANCE.
 Sends SIGCONT to continue the process."
+  (when (magnus-provider-external-p instance)
+    (user-error "Process resume is not supported by the `%s' provider"
+                (magnus-instance-provider instance)))
   (when-let ((buffer (magnus-instance-buffer instance)))
     (when (buffer-live-p buffer)
       (when-let ((process (get-buffer-process buffer)))
@@ -496,27 +538,40 @@ Sends SIGCONT to continue the process."
 (defun magnus-process-chdir (instance directory)
   "Change INSTANCE's working directory to DIRECTORY.
 Kills the current process and respawns in the new directory."
-  (let* ((new-dir (expand-file-name directory))
-         (name (magnus-instance-name instance)))
-    ;; Kill old process and buffer immediately (no timers)
-    (when-let ((buffer (magnus-instance-buffer instance)))
-      (when (buffer-live-p buffer)
-        (let ((process (get-buffer-process buffer)))
-          (when (and process (process-live-p process))
-            (kill-process process)))
-        (kill-buffer buffer)))
-    ;; Update directory, clear old session (it belongs to the old project)
-    (magnus-instances-update instance
-                             :directory new-dir
-                             :status 'stopped
-                             :buffer nil
-                             :session-id nil)
-    ;; Spawn fresh in the new directory
-    (run-with-timer
-     1 nil
-     (lambda ()
-       (magnus-process--spawn instance)))
-    (message "Moving %s to %s (fresh start)..." name new-dir)))
+  (if (magnus-provider-external-p instance)
+      (progn
+        (magnus-provider-call instance 'stop t)
+        (magnus-instances-update instance
+                                 :directory (expand-file-name directory)
+                                 :status 'stopped
+                                 :buffer nil
+                                 :session-id nil)
+        (magnus-provider-call instance 'start)
+        (message "Moving %s to %s (fresh %s thread)..."
+                 (magnus-instance-name instance) directory
+                 (magnus-instance-provider instance))
+        instance)
+    (let* ((new-dir (expand-file-name directory))
+           (name (magnus-instance-name instance)))
+      ;; Kill old process and buffer immediately (no timers)
+      (when-let ((buffer (magnus-instance-buffer instance)))
+        (when (buffer-live-p buffer)
+          (let ((process (get-buffer-process buffer)))
+            (when (and process (process-live-p process))
+              (kill-process process)))
+          (kill-buffer buffer)))
+      ;; Update directory, clear old session (it belongs to the old project)
+      (magnus-instances-update instance
+                               :directory new-dir
+                               :status 'stopped
+                               :buffer nil
+                               :session-id nil)
+      ;; Spawn fresh in the new directory
+      (run-with-timer
+       1 nil
+       (lambda ()
+         (magnus-process--spawn instance)))
+      (message "Moving %s to %s (fresh start)..." name new-dir))))
 
 (defun magnus-process--project-hash (directory)
   "Convert DIRECTORY to Claude's project hash format.
@@ -556,42 +611,53 @@ Replaces slashes, spaces, tildes, and underscores with hyphens."
   "Switch to the buffer for INSTANCE.
 If the buffer is nil (e.g. after Emacs restart), resume the session
 if a session ID exists, or spawn a fresh process."
-  (let ((buffer (magnus-instance-buffer instance)))
-    (cond
-     ;; Buffer exists and is live — switch to it
-     ((and buffer (buffer-live-p buffer))
-      (switch-to-buffer buffer))
-     ;; Buffer is dead or nil — need to (re)spawn
-     (t
-      (if-let ((session-id (magnus-instance-session-id instance)))
-          ;; Has a session — resume it
-          (progn
-            (magnus-process--spawn-with-session instance session-id)
-            (switch-to-buffer (magnus-instance-buffer instance)))
-        ;; No session — spawn fresh
-        (magnus-process--spawn instance)
-        (switch-to-buffer (magnus-instance-buffer instance)))))))
+  (if (magnus-provider-external-p instance)
+      (magnus-provider-call instance 'switch-to)
+    (let ((buffer (magnus-instance-buffer instance)))
+      (cond
+       ;; Buffer exists and is live — switch to it
+       ((and buffer (buffer-live-p buffer))
+        (switch-to-buffer buffer))
+       ;; Buffer is dead or nil — need to (re)spawn
+       (t
+        (if-let ((session-id (magnus-instance-session-id instance)))
+            ;; Has a session — resume it
+            (progn
+              (magnus-process--spawn-with-session instance session-id)
+              (switch-to-buffer (magnus-instance-buffer instance)))
+          ;; No session — spawn fresh
+          (magnus-process--spawn instance)
+          (switch-to-buffer (magnus-instance-buffer instance))))))))
 
 (defun magnus-process-running-p (instance)
   "Return non-nil if INSTANCE has a running process."
-  (when-let ((buffer (magnus-instance-buffer instance)))
-    (and (buffer-live-p buffer)
-         (get-buffer-process buffer)
-         (process-live-p (get-buffer-process buffer)))))
+  (if (magnus-provider-external-p instance)
+      (magnus-provider-call instance 'running-p)
+    (when-let ((buffer (magnus-instance-buffer instance)))
+      (and (buffer-live-p buffer)
+           (get-buffer-process buffer)
+           (process-live-p (get-buffer-process buffer))))))
 
 ;;; Reconnection
 
 (defun magnus-process-reconnect (instance)
   "Try to reconnect INSTANCE to an existing buffer/process."
-  (let* ((name (magnus-instance-name instance))
-         (buffer-name (format "*claude:%s*" name))
-         (buffer (get-buffer buffer-name)))
-    (when (and buffer (buffer-live-p buffer))
-      (magnus-instances-update instance
-                               :buffer buffer
-                               :status (if (get-buffer-process buffer)
-                                           'running
-                                         'stopped)))))
+  (if (magnus-provider-external-p instance)
+      (progn
+        ;; App Server stdio connections cannot survive Emacs itself.  Leave the
+        ;; persisted thread ID intact; visiting the instance will resume it.
+        (when (eq (magnus-instance-status instance) 'running)
+          (magnus-instances-update instance :status 'stopped :buffer nil))
+        nil)
+    (let* ((name (magnus-instance-name instance))
+           (buffer-name (format "*claude:%s*" name))
+           (buffer (get-buffer buffer-name)))
+      (when (and buffer (buffer-live-p buffer))
+        (magnus-instances-update instance
+                                 :buffer buffer
+                                 :status (if (get-buffer-process buffer)
+                                             'running
+                                           'stopped))))))
 
 ;;; Headless mode — fire-and-forget agents
 

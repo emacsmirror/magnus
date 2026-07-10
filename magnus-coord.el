@@ -18,6 +18,7 @@
 ;;; Code:
 
 (require 'magnus-instances)
+(require 'magnus-provider)
 
 (declare-function vterm-send-string "vterm")
 (declare-function project-root "project")
@@ -178,31 +179,37 @@ This prevents partial reads when agents write concurrently."
   "Hash of instance-id → timestamp of last Magnus system nudge.")
 
 (defun magnus-coord-nudge-agent (instance message &optional source)
-  "Nudge INSTANCE by sending MESSAGE to its vterm buffer.
+  "Nudge INSTANCE by sending MESSAGE through its provider.
 When SOURCE is non-nil, prepend \"[From SOURCE]:\" to distinguish
 system messages from user-typed input.  System messages from Magnus
 are debounced per `magnus-coord-nudge-debounce'."
   (catch 'magnus-debounced
-  (let ((id (magnus-instance-id instance)))
-    (when (and (string= source "Magnus")
-               magnus-coord-nudge-debounce)
-      (let ((last (gethash id magnus-coord--last-nudge 0)))
-        (when (< (- (float-time) last) magnus-coord-nudge-debounce)
-          (throw 'magnus-debounced nil))))
-    (when-let ((buffer (magnus-instance-buffer instance)))
-      (when (buffer-live-p buffer)
-        (let ((text (if source
-                        (format "[From %s]: %s" source message)
-                      message)))
-          (when (string= source "Magnus")
-            (puthash id (float-time) magnus-coord--last-nudge))
-          (with-current-buffer buffer
-            (vterm-send-string text)
-            (run-with-timer 0.1 nil
-                            (lambda ()
-                              (when (buffer-live-p buffer)
-                                (with-current-buffer buffer
-                                  (vterm-send-return))))))))))))
+    (let ((id (magnus-instance-id instance)))
+      (when (and (string= source "Magnus")
+                 magnus-coord-nudge-debounce)
+        (let ((last (gethash id magnus-coord--last-nudge 0)))
+          (when (< (- (float-time) last) magnus-coord-nudge-debounce)
+            (throw 'magnus-debounced nil))))
+      (let ((text (if source
+                      (format "[From %s]: %s" source message)
+                    message)))
+        (if (magnus-provider-external-p instance)
+            (progn
+              (when (string= source "Magnus")
+                (puthash id (float-time) magnus-coord--last-nudge))
+              (magnus-provider-call instance 'send text))
+          (when-let ((buffer (magnus-instance-buffer instance)))
+            (when (buffer-live-p buffer)
+              (when (string= source "Magnus")
+                (puthash id (float-time) magnus-coord--last-nudge))
+              (with-current-buffer buffer
+                (vterm-send-string text)
+                (run-with-timer
+                 0.1 nil
+                 (lambda ()
+                   (when (buffer-live-p buffer)
+                     (with-current-buffer buffer
+                       (vterm-send-return)))))))))))))
 
 
 ;;; Periodic reminders
