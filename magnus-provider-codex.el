@@ -44,6 +44,16 @@ Magnus always supplies a small provider-neutral coordination preamble."
   :type '(choice (const :tag "None" nil) string)
   :group 'magnus)
 
+(defcustom magnus-codex-active-turn-delivery 'queue
+  "How `magnus-codex-send' handles text while a turn is active.
+`queue' preserves Claude/vterm semantics by starting a new turn after the
+current one completes.  `steer' injects the text into the active turn via
+App Server's turn/steer method.  Calls to `magnus-codex-steer' always steer
+regardless of this setting."
+  :type '(choice (const :tag "Queue for the next turn" queue)
+                 (const :tag "Steer the active turn" steer))
+  :group 'magnus)
+
 (defvar magnus-codex-event-hook nil
   "Hook run after a Codex server event.
 Functions receive INSTANCE, METHOD, and PARAMS.")
@@ -58,9 +68,6 @@ Functions receive INSTANCE, REQUEST-ID, METHOD, and PARAMS.  Use
 
 (defvar magnus-codex--active-turns (make-hash-table :test #'equal)
   "Instance ID to active Codex turn ID map.")
-
-(defvar magnus-codex--approvals (make-hash-table :test #'equal)
-  "JSON-RPC request ID to pending approval plist map.")
 
 (defvar-local magnus-codex--instance nil
   "Codex instance represented by the current output buffer.")
@@ -111,6 +118,13 @@ Functions receive INSTANCE, REQUEST-ID, METHOD, and PARAMS.  Use
   (let ((process (gethash (magnus-instance-id instance)
                           magnus-codex--connections)))
     (and (process-live-p process) process)))
+
+(defun magnus-codex--approval-table (process)
+  "Return PROCESS's private pending approval table."
+  (or (process-get process 'magnus-codex-approvals)
+      (let ((table (make-hash-table :test #'equal)))
+        (process-put process 'magnus-codex-approvals table)
+        table)))
 
 (defun magnus-codex--json (object)
   "Serialize OBJECT as compact JSON."
@@ -196,7 +210,7 @@ CALLBACK receives RESULT and ERROR, exactly one of which is non-nil."
         (progn
           (puthash id (list :instance instance :process process
                             :method method :params params)
-                   magnus-codex--approvals)
+                   (magnus-codex--approval-table process))
           (magnus-codex--insert
            instance
            (format "\n[approval pending] %s\n%s\n"
@@ -220,7 +234,14 @@ CALLBACK receives RESULT and ERROR, exactly one of which is non-nil."
   "Return a readable summary of approval PARAMS."
   (string-join
    (delq nil
-         (list (when-let ((command (alist-get 'command params))) command)
+         (list (when-let ((command (alist-get 'command params)))
+                 (cond
+                  ((stringp command) command)
+                  ((listp command)
+                   (string-join (mapcar (lambda (arg) (format "%s" arg))
+                                        command)
+                                " "))
+                  (t (format "%s" command))))
                (when-let ((cwd (alist-get 'cwd params)))
                  (format "cwd: %s" cwd))
                (when-let ((reason (alist-get 'reason params))) reason)))
@@ -230,9 +251,10 @@ CALLBACK receives RESULT and ERROR, exactly one of which is non-nil."
   "Respond to INSTANCE approval REQUEST-ID with DECISION.
 DECISION is normally accept, acceptForSession, decline, or cancel.  A
 permission-profile request instead requires its complete response alist."
-  (let* ((entry (gethash request-id magnus-codex--approvals))
+  (let* ((process (magnus-codex--connection instance))
+         (table (and process (magnus-codex--approval-table process)))
+         (entry (and table (gethash request-id table)))
          (owner (plist-get entry :instance))
-         (process (plist-get entry :process))
          (method (plist-get entry :method))
          (result (if (equal method "item/permissions/requestApproval")
                      decision
@@ -250,7 +272,7 @@ permission-profile request instead requires its complete response alist."
     (magnus-codex--send-object
      process `((jsonrpc . "2.0") (id . ,request-id)
                (result . ,result)))
-    (remhash request-id magnus-codex--approvals)
+    (remhash request-id table)
     (magnus-codex--insert instance
                           (format "[approval answered: %s]\n" decision)
                           'font-lock-comment-face)))
@@ -270,6 +292,7 @@ permission-profile request instead requires its complete response alist."
                              (magnus-codex--format-plan params)
                              'font-lock-comment-face))
       ("turn/started"
+       (process-put process 'magnus-codex-turn-starting nil)
        (let ((turn-id (magnus-codex--turn-id (alist-get 'turn params))))
          (when turn-id
            (puthash (magnus-instance-id instance) turn-id
@@ -278,8 +301,10 @@ permission-profile request instead requires its complete response alist."
                              'font-lock-comment-face))
       ("turn/completed"
        (remhash (magnus-instance-id instance) magnus-codex--active-turns)
+       (process-put process 'magnus-codex-turn-starting nil)
        (magnus-codex--insert instance "\n[turn completed]\n\n"
-                             'font-lock-comment-face))
+                             'font-lock-comment-face)
+       (magnus-codex--start-next-queued-turn process instance))
       ("thread/status/changed"
        (magnus-codex--insert
         instance (format "\n[status: %s]\n"
@@ -318,7 +343,7 @@ permission-profile request instead requires its complete response alist."
     (when-let ((instance (process-get process 'magnus-codex-instance)))
       (remhash (magnus-instance-id instance) magnus-codex--connections)
       (remhash (magnus-instance-id instance) magnus-codex--active-turns)
-      (magnus-codex--clear-approvals instance)
+      (magnus-codex--clear-approvals instance process)
       (unless (eq (magnus-instance-status instance) 'purged)
         (magnus-instances-update instance :status 'stopped))
       (unless (process-get process 'magnus-codex-intentional-stop)
@@ -328,16 +353,13 @@ permission-profile request instead requires its complete response alist."
                  (get-buffer magnus-buffer-name))
         (magnus-status-refresh)))))
 
-(defun magnus-codex--clear-approvals (instance)
+(defun magnus-codex--clear-approvals (instance &optional process)
   "Remove pending approvals owned by INSTANCE."
-  (let (request-ids)
-    (maphash
-     (lambda (request-id entry)
-       (when (eq (plist-get entry :instance) instance)
-         (push request-id request-ids)))
-     magnus-codex--approvals)
-    (dolist (request-id request-ids)
-      (remhash request-id magnus-codex--approvals))))
+  (when-let ((connection
+              (or process
+                  (gethash (magnus-instance-id instance)
+                           magnus-codex--connections))))
+    (clrhash (magnus-codex--approval-table connection))))
 
 (defun magnus-codex--start-process (instance)
   "Start a Codex App Server process for INSTANCE."
@@ -357,8 +379,12 @@ permission-profile request instead requires its complete response alist."
                    :sentinel #'magnus-codex--sentinel)))
     (process-put process 'magnus-codex-instance instance)
     (process-put process 'magnus-codex-pending (make-hash-table :test #'equal))
+    (process-put process 'magnus-codex-approvals
+                 (make-hash-table :test #'equal))
     (process-put process 'magnus-codex-next-id 0)
     (process-put process 'magnus-codex-partial "")
+    (process-put process 'magnus-codex-input-queue nil)
+    (process-put process 'magnus-codex-turn-starting nil)
     (puthash (magnus-instance-id instance) process magnus-codex--connections)
     process))
 
@@ -487,29 +513,65 @@ permission-profile request instead requires its complete response alist."
   "Build App Server user input for TEXT."
   `[((type . "text") (text . ,text))])
 
-(defun magnus-codex-send (instance text)
-  "Send TEXT to Codex INSTANCE, steering when a turn is active."
-  (if-let ((turn-id (gethash (magnus-instance-id instance)
-                             magnus-codex--active-turns)))
-      (magnus-codex-steer instance text turn-id)
-    (let ((process (or (magnus-codex--connection instance)
-                       (user-error "Codex instance is not running")))
-          (thread-id (or (magnus-instance-session-id instance)
-                         (user-error "Codex thread is not ready yet"))))
-      (magnus-codex--insert instance (format "\nYou: %s\n\n" text)
-                            'font-lock-keyword-face)
-      (magnus-codex--request
-       process "turn/start"
-       `((threadId . ,thread-id) (input . ,(magnus-codex--input text)))
-       (lambda (result error)
-         (if error
-             (magnus-codex--insert instance
-                                   (format "[turn/start failed] %s\n" error)
-                                   'error)
-           (let ((turn-id (magnus-codex--turn-id (alist-get 'turn result))))
-             (when turn-id
+(defun magnus-codex--queue-input (process text)
+  "Append TEXT to PROCESS's next-turn input queue."
+  (process-put process 'magnus-codex-input-queue
+               (append (process-get process 'magnus-codex-input-queue)
+                       (list text))))
+
+(defun magnus-codex--start-next-queued-turn (process instance)
+  "Start INSTANCE's next queued turn through PROCESS when idle."
+  (unless (or (gethash (magnus-instance-id instance)
+                       magnus-codex--active-turns)
+              (process-get process 'magnus-codex-turn-starting))
+    (when-let ((queue (process-get process 'magnus-codex-input-queue)))
+      (let ((text (car queue))
+            (thread-id (magnus-instance-session-id instance)))
+        (unless thread-id
+          (user-error "Codex thread is not ready yet"))
+        (process-put process 'magnus-codex-input-queue (cdr queue))
+        (process-put process 'magnus-codex-turn-starting t)
+        (magnus-codex--insert instance (format "\nYou: %s\n\n" text)
+                              'font-lock-keyword-face)
+        (magnus-codex--request
+         process "turn/start"
+         `((threadId . ,thread-id) (input . ,(magnus-codex--input text)))
+         (lambda (result error)
+           (process-put process 'magnus-codex-turn-starting nil)
+           (if error
+               (progn
+                 (process-put
+                  process 'magnus-codex-input-queue
+                  (cons text (process-get process
+                                          'magnus-codex-input-queue)))
+                 (magnus-codex--insert
+                  instance
+                  (format "[turn/start failed; message retained] %s\n" error)
+                  'error))
+             (when-let ((turn-id
+                         (magnus-codex--turn-id (alist-get 'turn result))))
                (puthash (magnus-instance-id instance) turn-id
                         magnus-codex--active-turns)))))))))
+
+(defun magnus-codex-send (instance text)
+  "Send TEXT to Codex INSTANCE according to the active-turn delivery policy.
+By default, text received during an active turn is queued for a new turn so
+coordination nudges match Claude/vterm behavior.  See
+`magnus-codex-active-turn-delivery' and `magnus-codex-steer'."
+  (let* ((process (or (magnus-codex--connection instance)
+                      (user-error "Codex instance is not running")))
+         (_thread-id (or (magnus-instance-session-id instance)
+                         (user-error "Codex thread is not ready yet")))
+         (turn-id (gethash (magnus-instance-id instance)
+                           magnus-codex--active-turns)))
+    (if (and turn-id (eq magnus-codex-active-turn-delivery 'steer))
+        (magnus-codex-steer instance text turn-id)
+      (magnus-codex--queue-input process text)
+      (if (or turn-id (process-get process 'magnus-codex-turn-starting))
+          (magnus-codex--insert instance
+                                "\n[message queued for next turn]\n"
+                                'font-lock-comment-face)
+        (magnus-codex--start-next-queued-turn process instance)))))
 
 (defun magnus-codex-steer (instance text &optional expected-turn-id)
   "Steer active Codex INSTANCE turn with TEXT.
@@ -601,21 +663,24 @@ When FORCE is non-nil, kill it immediately."
   (interactive)
   (unless magnus-codex--instance
     (user-error "This is not a Magnus Codex buffer"))
-  (let (requests)
-    (maphash
-     (lambda (request-id entry)
-       (when (eq (plist-get entry :instance) magnus-codex--instance)
-         (push (cons (format "%s: %s" request-id (plist-get entry :method))
+  (let* ((process (magnus-codex--connection magnus-codex--instance))
+         (table (and process (magnus-codex--approval-table process)))
+         requests)
+    (when table
+      (maphash
+       (lambda (request-id entry)
+         (push (cons (format "%s: %s" request-id
+                             (plist-get entry :method))
                      request-id)
-               requests)))
-     magnus-codex--approvals)
+               requests))
+       table))
     (unless requests
       (user-error "This Codex instance has no pending approvals"))
     (let* ((label (if (= (length requests) 1)
                       (caar requests)
                     (completing-read "Approval: " requests nil t)))
            (request-id (cdr (assoc label requests)))
-           (entry (gethash request-id magnus-codex--approvals)))
+           (entry (gethash request-id table)))
       (when (equal (plist-get entry :method) "item/permissions/requestApproval")
         (user-error "Permission-profile approvals require a custom approval handler"))
       (magnus-codex-respond-approval

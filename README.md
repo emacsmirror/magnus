@@ -41,7 +41,7 @@ Spawn, kill, suspend/resume, rename, and switch between Claude Code instances ru
 Run `M-x magnus-create-codex` to create a Codex instance through Codex App
 Server. Codex is strictly opt-in: existing commands, saved state, vterm
 behavior, and Claude storage paths remain unchanged. Codex instances support
-thread resume, streamed messages and plans, same-turn steering, interruption,
+thread resume, streamed messages and plans, explicit steering, interruption,
 and semantic approval callbacks. They are labeled `[codex]` in the status
 buffer.
 
@@ -49,9 +49,14 @@ This requires a `codex` executable with `codex app-server` support. Customize
 its path with `magnus-codex-executable`. App Server connections use stdio and
 are restarted transparently when a saved Codex thread is revisited.
 
-Inside a Codex buffer, press `m` to send or steer, `a` to answer a pending
-command/file approval, and `C-c C-k` to interrupt the active turn. Magnus also
-adapts its full onboarding philosophy for Codex: named identity, first-person
+Inside a Codex buffer, press `m` to send, `a` to answer a pending command/file
+approval, and `C-c C-k` to interrupt the active turn. Messages received while
+a turn is active queue for the next turn by default, matching Claude/vterm
+behavior and preventing a casual coordination nudge from redirecting work in
+progress. Set `magnus-codex-active-turn-delivery` to `steer` for immediate
+turn/steer injection; explicit calls to `magnus-codex-steer` always steer.
+Magnus also adapts its full onboarding philosophy for Codex: named identity,
+first-person
 memory, coordination claims and discoveries, attention etiquette, debriefing,
 and candid `[thinking]`/`[response]` engineering journals. Claude's established
 prompt remains unchanged.

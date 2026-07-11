@@ -23,6 +23,7 @@
 (declare-function vterm-send-string "vterm")
 (declare-function project-root "project")
 (declare-function vterm-send-return "vterm")
+(declare-function magnus-process-running-p "magnus-process")
 
 (defvar magnus-claude-executable)
 (declare-function magnus--headless-command "magnus")
@@ -178,6 +179,23 @@ This prevents partial reads when agents write concurrently."
 (defvar magnus-coord--last-nudge (make-hash-table :test 'equal)
   "Hash of instance-id → timestamp of last Magnus system nudge.")
 
+(defun magnus-coord--log-undelivered-nudge (instance text reason)
+  "Record that TEXT could not reach INSTANCE because of REASON."
+  (let* ((name (magnus-instance-name instance))
+         (directory (magnus-instance-directory instance))
+         (safe-text (replace-regexp-in-string
+                     "@" "(at) "
+                     (replace-regexp-in-string "[\n\r]+" " " text)))
+         (entry (format "Undelivered nudge to %s (%s): %s"
+                        name reason safe-text)))
+    (condition-case err
+        (magnus-coord-add-log directory "Magnus" entry)
+      (error
+       (message "Magnus: could not log undelivered nudge for %s: %s"
+                name (error-message-string err))))
+    (message "Magnus: %s" entry)
+    nil))
+
 (defun magnus-coord-nudge-agent (instance message &optional source)
   "Nudge INSTANCE by sending MESSAGE through its provider.
 When SOURCE is non-nil, prepend \"[From SOURCE]:\" to distinguish
@@ -193,23 +211,28 @@ are debounced per `magnus-coord-nudge-debounce'."
       (let ((text (if source
                       (format "[From %s]: %s" source message)
                     message)))
-        (if (magnus-provider-external-p instance)
-            (progn
+        (condition-case err
+            (if (not (magnus-process-running-p instance))
+                (magnus-coord--log-undelivered-nudge
+                 instance text "not running")
+              (if (magnus-provider-external-p instance)
+                  (magnus-provider-call instance 'send text)
+                (let ((buffer (magnus-instance-buffer instance)))
+                  (unless (buffer-live-p buffer)
+                    (error "agent buffer is not live"))
+                  (with-current-buffer buffer
+                    (vterm-send-string text)
+                    (run-with-timer
+                     0.1 nil
+                     (lambda ()
+                       (when (buffer-live-p buffer)
+                         (with-current-buffer buffer
+                           (vterm-send-return))))))))
               (when (string= source "Magnus")
-                (puthash id (float-time) magnus-coord--last-nudge))
-              (magnus-provider-call instance 'send text))
-          (when-let ((buffer (magnus-instance-buffer instance)))
-            (when (buffer-live-p buffer)
-              (when (string= source "Magnus")
-                (puthash id (float-time) magnus-coord--last-nudge))
-              (with-current-buffer buffer
-                (vterm-send-string text)
-                (run-with-timer
-                 0.1 nil
-                 (lambda ()
-                   (when (buffer-live-p buffer)
-                     (with-current-buffer buffer
-                       (vterm-send-return)))))))))))))
+                (puthash id (float-time) magnus-coord--last-nudge)))
+          (error
+           (magnus-coord--log-undelivered-nudge
+            instance text (error-message-string err))))))))
 
 
 ;;; Periodic reminders
