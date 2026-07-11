@@ -138,7 +138,7 @@ would corrupt terminal rendering and violate the single-writer boundary."
   "Encode TEXT as a masked client WebSocket frame with OPCODE.
 OPCODE defaults to 1, the text-frame opcode."
   (let* ((payload (if (multibyte-string-p text)
-                      (encode-coding-string text 'utf-8 t)
+                      (encode-coding-string text 'utf-8)
                     (copy-sequence text)))
          (length (length payload))
          (mask (magnus-codex--byte-string
@@ -212,7 +212,7 @@ CALLBACK receives RESULT and ERROR, exactly one of which is non-nil."
               "Connection: Upgrade\r\n"
               "Sec-WebSocket-Key: " key "\r\n"
               "Sec-WebSocket-Version: 13\r\n\r\n")
-      'utf-8 t))))
+      'utf-8))))
 
 (defun magnus-codex--websocket-accept (process)
   "Return the expected WebSocket accept value for PROCESS's handshake."
@@ -266,7 +266,9 @@ CALLBACK receives RESULT and ERROR, exactly one of which is non-nil."
           (process-put process 'magnus-codex-websocket-ready t)
           (when-let ((callback (process-get process 'magnus-codex-on-open)))
             (process-put process 'magnus-codex-on-open nil)
-            (funcall callback))
+            ;; Emacs 29 can leave a write to this same process buffered when it
+            ;; is issued reentrantly from the process filter.
+            (run-at-time 0 nil callback))
           (unless (string-empty-p remainder)
             (magnus-codex--consume-frames process remainder)))))))
 
@@ -558,12 +560,19 @@ permission-profile request instead requires its complete response alist."
   "Ensure the managed local Codex App Server daemon is running."
   (unless (executable-find magnus-codex-executable)
     (user-error "Cannot find Codex executable: %s" magnus-codex-executable))
-  (with-temp-buffer
-    (let ((status (process-file magnus-codex-executable nil t nil
-                                "app-server" "daemon" "start")))
-      (unless (and (integerp status) (zerop status))
-        (user-error "Could not start Codex App Server daemon: %s"
-                    (string-trim (buffer-string)))))))
+  (let ((socket (expand-file-name
+                 "app-server-control/app-server-control.sock"
+                 (or (getenv "CODEX_HOME")
+                     (expand-file-name ".codex" "~")))))
+    ;; `daemon start' can wait on its management lock when invoked from a GUI
+    ;; Emacs even though the healthy daemon socket already exists.
+    (unless (file-exists-p socket)
+      (with-temp-buffer
+        (let ((status (process-file magnus-codex-executable nil t nil
+                                    "app-server" "daemon" "start")))
+          (unless (and (integerp status) (zerop status))
+            (user-error "Could not start Codex App Server daemon: %s"
+                        (string-trim (buffer-string)))))))))
 
 (defun magnus-codex--start-process (instance)
   "Start INSTANCE's semantic observer proxy to the managed daemon."
@@ -627,7 +636,13 @@ INITIAL-MESSAGE, when non-nil, is submitted by the TUI as its first prompt."
            (delete-process process))
        (magnus-codex--notify process "initialized")
        (if (magnus-instance-session-id instance)
-           (magnus-codex--open-thread process instance initial-message)
+           (progn
+             (magnus-codex--insert
+              instance
+              (format "[handing saved thread to TUI: %s]\n"
+                      (magnus-instance-session-id instance))
+              'font-lock-comment-face)
+             (magnus-codex--spawn-tui instance initial-message))
          (magnus-codex--start-new-thread
           process instance initial-message))))))
 
@@ -671,37 +686,6 @@ overrides, so the den contract is made visible and persistent in history."
           (setq entry candidate))))
     (when entry
       (apply #'magnus-codex--start-new-thread entry))))
-
-(defun magnus-codex--open-thread (process instance initial-message)
-  "Resume INSTANCE on observer PROCESS, then launch its TUI."
-  (let* ((thread-id (magnus-instance-session-id instance))
-         (method "thread/resume")
-         (params `((threadId . ,thread-id)
-                   (cwd . ,(magnus-instance-directory instance))
-                   (developerInstructions . ,(magnus-codex--instructions instance)))))
-    (magnus-codex--request
-     process method params
-     (lambda (result error)
-       (if error
-           (progn
-             (magnus-codex--insert instance
-                                   (format "[%s failed] %s\n" method error)
-                                   'error)
-             ;; A brand-new TUI session has no rollout until its first turn.
-             ;; If it was archived before then, nothing can be lost: clear the
-             ;; unusable ID and let the TUI create a fresh persisted identity.
-             (magnus-instances-update instance :session-id nil)
-             (magnus-codex--start-new-thread
-              process instance initial-message))
-         (let ((new-id (alist-get 'id (alist-get 'thread result))))
-           (when new-id
-             (magnus-instances-update instance :session-id new-id))
-           (magnus-codex--insert instance
-                                 (format "[thread %s: %s]\n\n"
-                                         (if thread-id "resumed" "started")
-                                         (or new-id thread-id))
-                                 'font-lock-comment-face)
-           (magnus-codex--spawn-tui instance initial-message)))))))
 
 (defun magnus-codex--tui-command (instance &optional initial-message)
   "Return the shell command used to run INSTANCE's new or resumed TUI.

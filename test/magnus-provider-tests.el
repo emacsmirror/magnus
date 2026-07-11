@@ -40,7 +40,7 @@
 
 (defun magnus-test--server-websocket-frame (text)
   "Encode TEXT as an unmasked, final server WebSocket text frame."
-  (let* ((payload (encode-coding-string text 'utf-8 t))
+  (let* ((payload (encode-coding-string text 'utf-8))
          (length (length payload)))
     (concat
      (cond
@@ -127,6 +127,13 @@
           (should (equal (magnus-codex--websocket-accept process)
                          "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")))
       (delete-process process))))
+
+(ert-deftest magnus-codex-client-websocket-frames-are-unibyte ()
+  (let ((frame (magnus-codex--websocket-frame
+                "A deliberately ASCII JSON payload long enough to mask")))
+    (should-not (multibyte-string-p frame))
+    (should (= (aref frame 0) 129))
+    (should-not (zerop (logand (aref frame 1) 128)))))
 
 (ert-deftest magnus-codex-onboards-returning-identity-from-memory ()
   (let* ((directory (make-temp-file "magnus-codex-memory-" t))
@@ -343,25 +350,27 @@
                                   (and new-terminal (car new-terminal)))))
         (when (buffer-live-p buffer) (kill-buffer buffer))))))
 
-(ert-deftest magnus-codex-open-thread-hands-session-to-tui ()
+(ert-deftest magnus-codex-existing-thread-goes-straight-to-tui ()
   (let* ((instance (magnus-instances-create "/tmp" "handoff-codex" 'codex))
          (process (magnus-test--codex-process instance))
-         spawned)
+         spawned notified)
     (magnus-instances-update instance :session-id "thread-existing")
     (unwind-protect
         (cl-letf (((symbol-function 'magnus-codex--request)
                    (lambda (_process method params callback)
-                     (should (equal method "thread/resume"))
-                     (should (equal (alist-get 'threadId params)
-                                    "thread-existing"))
-                     (funcall callback
-                              '((thread . ((id . "thread-existing")))) nil)))
+                     (should (equal method "initialize"))
+                     (should params)
+                     (funcall callback '((userAgent . "test")) nil)))
+                  ((symbol-function 'magnus-codex--notify)
+                   (lambda (_process method &optional _params)
+                     (setq notified method)))
                   ((symbol-function 'magnus-codex--spawn-tui)
                    (lambda (candidate message)
                      (setq spawned (list candidate message)))))
-          (magnus-codex--open-thread process instance "first task")
+          (magnus-codex--initialize process instance "first task")
           (should (equal (magnus-instance-session-id instance)
                          "thread-existing"))
+          (should (equal notified "initialized"))
           (should (eq (car spawned) instance))
           (should (equal (cadr spawned) "first task")))
       (delete-process process))))
