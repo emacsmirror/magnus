@@ -462,9 +462,9 @@ via `magnus-process-resurrect-purged'."
     (magnus-instances-update instance
                              :status 'purged
                              :buffer nil
-                             :purged-at (float-time))
-    ;; Index expertise tags asynchronously
-    (magnus--agents-index-update instance)))
+                             :purged-at (float-time)))
+  ;; Index expertise tags asynchronously for every provider.
+  (magnus--agents-index-update instance))
 
 (defun magnus-process-resurrect-purged (instance)
   "Resurrect a purged INSTANCE by resuming its provider session.
@@ -484,9 +484,9 @@ nudge the agent to re-read it."
     (if (magnus-provider-external-p instance)
         (magnus-provider-call instance 'resume)
       (magnus-process--spawn-with-session instance session-id))
-    ;; If instructions were outdated, nudge agent to re-read after spawn
-    (when (and instructions-stale
-               (not (magnus-provider-external-p instance)))
+    ;; If instructions were outdated, nudge agent to re-read after spawn.
+    ;; External providers queue this until their resumed TUI is ready.
+    (when instructions-stale
       (run-with-timer
        5 nil
        (lambda ()
