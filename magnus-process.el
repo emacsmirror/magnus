@@ -469,7 +469,7 @@ via `magnus-process-resurrect-purged'."
     (magnus--agents-index-update instance)))
 
 (defun magnus-process-resurrect-purged (instance)
-  "Resurrect a purged INSTANCE by resuming its Claude Code session.
+  "Resurrect a purged INSTANCE by resuming its provider session.
 If the instructions file was updated since the agent was archived,
 nudge the agent to re-read it."
   (let* ((session-id (magnus-instance-session-id instance))
@@ -644,8 +644,8 @@ if a session ID exists, or spawn a fresh process."
   "Try to reconnect INSTANCE to an existing buffer/process."
   (if (magnus-provider-external-p instance)
       (progn
-        ;; App Server stdio connections cannot survive Emacs itself.  Leave the
-        ;; persisted thread ID intact; visiting the instance will resume it.
+        ;; The managed daemon may survive Emacs, but its observer connection and
+        ;; vterm cannot.  Preserve the thread ID; visiting resumes a fresh TUI.
         (when (eq (magnus-instance-status instance) 'running)
           (magnus-instances-update instance :status 'stopped :buffer nil))
         nil)

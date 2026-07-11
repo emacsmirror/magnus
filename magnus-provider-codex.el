@@ -8,10 +8,11 @@
 
 ;;; Commentary:
 
-;; Opt-in Codex support using the versioned App Server JSON-RPC protocol over
-;; stdio.  This module does not alter Magnus's default Claude Code/vterm path.
-;; It provides thread start/resume, turn start/steer/interrupt, streamed agent
-;; messages and plans, and a semantic approval callback surface.
+;; Opt-in Codex support with a real Codex TUI in a vterm buffer.  A lightweight
+;; JSON-RPC observer connects through `codex app-server proxy' to the managed
+;; local daemon, while the TUI is the sole interactive writer for the thread.
+;; This preserves native input, approvals, rendering, and session resurrection
+;; without starting one App Server per Magnus agent.
 
 ;;; Code:
 
@@ -22,6 +23,11 @@
 (require 'magnus-provider)
 
 (declare-function magnus-status-refresh "magnus-status")
+(declare-function magnus-process--create-vterm-buffer "magnus-process"
+                  (buffer-name))
+(declare-function vterm-send-key "vterm" (key &optional shift meta ctrl))
+(declare-function vterm-send-return "vterm" ())
+(declare-function vterm-send-string "vterm" (string &optional paste-p))
 (defvar magnus-buffer-name)
 
 (defcustom magnus-codex-executable "codex"
@@ -44,14 +50,10 @@ Magnus always supplies a small provider-neutral coordination preamble."
   :type '(choice (const :tag "None" nil) string)
   :group 'magnus)
 
-(defcustom magnus-codex-active-turn-delivery 'queue
-  "How `magnus-codex-send' handles text while a turn is active.
-`queue' preserves Claude/vterm semantics by starting a new turn after the
-current one completes.  `steer' injects the text into the active turn via
-App Server's turn/steer method.  Calls to `magnus-codex-steer' always steer
-regardless of this setting."
-  :type '(choice (const :tag "Queue for the next turn" queue)
-                 (const :tag "Steer the active turn" steer))
+(defcustom magnus-codex-remote "unix://"
+  "Remote endpoint passed to the Codex TUI.
+The default selects the managed App Server daemon's standard Unix socket."
+  :type 'string
   :group 'magnus)
 
 (defvar magnus-codex-event-hook nil
@@ -64,156 +66,46 @@ Functions receive INSTANCE, REQUEST-ID, METHOD, and PARAMS.  Use
 `magnus-codex-respond-approval' to answer the request.")
 
 (defvar magnus-codex--connections (make-hash-table :test #'equal)
-  "Instance ID to App Server process map.")
+  "Instance ID to App Server observer proxy map.")
 
 (defvar magnus-codex--active-turns (make-hash-table :test #'equal)
   "Instance ID to active Codex turn ID map.")
 
+(defvar magnus-codex--show-on-ready (make-hash-table :test #'equal)
+  "Instance IDs whose TUI should be displayed after asynchronous startup.")
+
+(defvar magnus-codex--new-thread-owner nil
+  "Instance ID currently waiting for its TUI-created thread ID.")
+
+(defvar magnus-codex--new-thread-queue nil
+  "FIFO of (PROCESS INSTANCE INITIAL-MESSAGE) waiting to create TUI threads.")
+
 (defvar-local magnus-codex--instance nil
-  "Codex instance represented by the current output buffer.")
+  "Magnus instance represented by the current Codex TUI buffer.")
 
-(defvar-local magnus-codex--prompt-marker nil
-  "Marker at the beginning of the inline Codex prompt.")
-
-(defvar-local magnus-codex--input-marker nil
-  "Marker at the beginning of editable inline Codex input.")
-
-(defun magnus-codex-enable-inline-input ()
-  "Protect the current transcript and add an editable inline prompt."
-  (interactive)
-  (let ((inhibit-read-only t))
-    (setq buffer-read-only nil)
-    (unless (and (markerp magnus-codex--prompt-marker)
-                 (marker-position magnus-codex--prompt-marker)
-                 (markerp magnus-codex--input-marker)
-                 (marker-position magnus-codex--input-marker))
-      (add-text-properties
-       (point-min) (point-max)
-       '(read-only t rear-nonsticky (read-only face)))
-      (goto-char (point-max))
-      (unless (bolp)
-        (insert (propertize "\n" 'read-only t)))
-      (let ((prompt-start (point)))
-        (insert (propertize "> "
-                            'read-only t
-                            'face 'font-lock-keyword-face
-                            'front-sticky '(read-only face)
-                            'rear-nonsticky '(read-only face)))
-        (setq magnus-codex--prompt-marker
-              (copy-marker prompt-start t))
-        (setq magnus-codex--input-marker (copy-marker (point) nil))))
-    (goto-char (point-max))))
-
-(define-derived-mode magnus-codex-mode fundamental-mode "Magnus-Codex"
-  "Major mode for streamed Codex App Server output."
-  :group 'magnus
-  (setq buffer-read-only nil)
-  (setq-local truncate-lines nil)
-  (setq-local word-wrap t)
-  (magnus-codex-enable-inline-input))
-
-(let ((map magnus-codex-mode-map))
-  ;; Older builds derived this mode from `special-mode'; reset the parent so
-  ;; reloading the provider makes printable keys self-insert immediately.
-  (set-keymap-parent map nil)
-  (define-key map (kbd "C-c m") #'magnus-codex-send-message)
-  (define-key map (kbd "C-c a") #'magnus-codex-answer-approval)
-  (define-key map (kbd "RET") #'magnus-codex-submit-input)
-  (define-key map (kbd "<return>") #'magnus-codex-submit-input)
-  (define-key map (kbd "C-c C-c") #'magnus-codex-submit-input)
-  (define-key map (kbd "C-c C-k") #'magnus-codex-interrupt-current)
-  (define-key map (kbd "DEL") #'magnus-codex-backward-delete)
-  (define-key map (kbd "<backspace>") #'magnus-codex-backward-delete)
-  (define-key map (kbd "C-a") #'magnus-codex-beginning-of-input)
-  (define-key map [remap self-insert-command] #'magnus-codex-self-insert)
-  (define-key map [remap yank] #'magnus-codex-yank))
-
-(defun magnus-codex--buffer (instance)
-  "Create or return the output buffer for INSTANCE."
-  (let ((buffer (magnus-instance-buffer instance)))
-    (if (buffer-live-p buffer)
-        buffer
-      (setq buffer (get-buffer-create
-                    (format "*codex:%s*" (magnus-instance-name instance))))
-      (with-current-buffer buffer
-        (magnus-codex-mode)
-        (setq-local magnus-codex--instance instance)
-        (let ((inhibit-read-only t))
-          (erase-buffer)
-          (when (markerp magnus-codex--prompt-marker)
-            (set-marker magnus-codex--prompt-marker nil))
-          (when (markerp magnus-codex--input-marker)
-            (set-marker magnus-codex--input-marker nil))
-          (setq magnus-codex--prompt-marker nil
-                magnus-codex--input-marker nil)
-          (insert (format "Codex agent: %s\nDirectory: %s\n\n"
-                          (magnus-instance-name instance)
-                          (magnus-instance-directory instance))))
-        (magnus-codex-enable-inline-input))
-      (magnus-instances-update instance :buffer buffer)
-      buffer)))
+(defun magnus-codex--observer-buffer (instance)
+  "Return INSTANCE's hidden semantic observer log buffer."
+  (get-buffer-create
+   (format " *magnus-codex-observer:%s*" (magnus-instance-name instance))))
 
 (defun magnus-codex--insert (instance text &optional face)
-  "Append TEXT to INSTANCE's output buffer, optionally using FACE."
-  (let ((buffer (magnus-codex--buffer instance)))
-    (when (buffer-live-p buffer)
-      (with-current-buffer buffer
-        (unless (and (markerp magnus-codex--prompt-marker)
-                     (marker-position magnus-codex--prompt-marker))
-          (magnus-codex-enable-inline-input))
-        (let ((inhibit-read-only t)
-              (moving (= (point) (point-max))))
-          (goto-char magnus-codex--prompt-marker)
-          (let ((start (point)))
-            (insert text)
-            (add-text-properties
-             start (point)
-             (append '(read-only t rear-nonsticky (read-only face))
-                     (when face (list 'face face)))))
-          (when moving (goto-char (point-max))))))))
+  "Append TEXT to INSTANCE's hidden observer log, optionally using FACE.
+Observer events must never be inserted into the live TUI buffer: doing so
+would corrupt terminal rendering and violate the single-writer boundary."
+  (with-current-buffer (magnus-codex--observer-buffer instance)
+    (let ((inhibit-read-only t)
+          (start (point-max)))
+      (goto-char start)
+      (insert text)
+      (when face
+        (add-text-properties start (point) (list 'face face))))))
 
-(defun magnus-codex-self-insert (count)
-  "Insert the typed character COUNT times in the inline input field."
-  (interactive "p")
-  (magnus-codex-enable-inline-input)
-  (goto-char (point-max))
-  (self-insert-command count))
-
-(defun magnus-codex-yank ()
-  "Yank at the end of the inline input field."
-  (interactive)
-  (magnus-codex-enable-inline-input)
-  (goto-char (point-max))
-  (call-interactively #'yank))
-
-(defun magnus-codex-beginning-of-input ()
-  "Move to the beginning of the editable inline input field."
-  (interactive)
-  (magnus-codex-enable-inline-input)
-  (goto-char magnus-codex--input-marker))
-
-(defun magnus-codex-backward-delete (count)
-  "Delete COUNT characters backward within the inline input field."
-  (interactive "p")
-  (magnus-codex-enable-inline-input)
-  (goto-char (point-max))
-  (let ((available (- (point) magnus-codex--input-marker)))
-    (when (> available 0)
-      (delete-region (- (point) (min count available)) (point)))))
-
-(defun magnus-codex-submit-input ()
-  "Submit editable inline input to the current Codex instance."
-  (interactive)
-  (unless magnus-codex--instance
-    (user-error "This is not a Magnus Codex buffer"))
-  (magnus-codex-enable-inline-input)
-  (let ((text (string-trim
-               (buffer-substring-no-properties
-                magnus-codex--input-marker (point-max)))))
-    (unless (string-empty-p text)
-      (let ((inhibit-read-only t))
-        (delete-region magnus-codex--input-marker (point-max)))
-      (magnus-codex-send magnus-codex--instance text))))
+(defun magnus-codex--tui-process (instance)
+  "Return INSTANCE's live vterm process, or nil."
+  (when-let ((buffer (magnus-instance-buffer instance)))
+    (and (buffer-live-p buffer)
+         (let ((process (get-buffer-process buffer)))
+           (and (process-live-p process) process)))))
 
 (defun magnus-codex--connection (instance)
   "Return the live App Server process for INSTANCE, or nil."
@@ -232,11 +124,54 @@ Functions receive INSTANCE, REQUEST-ID, METHOD, and PARAMS.  Use
   "Serialize OBJECT as compact JSON."
   (json-serialize object :null-object nil :false-object :json-false))
 
+(defun magnus-codex--byte-string (&rest bytes)
+  "Return a unibyte string containing BYTES."
+  (apply #'unibyte-string bytes))
+
+(defun magnus-codex--integer-bytes (value count)
+  "Encode non-negative integer VALUE as COUNT network-order bytes."
+  (apply #'magnus-codex--byte-string
+         (cl-loop for shift from (* 8 (1- count)) downto 0 by 8
+                  collect (logand 255 (ash value (- shift))))))
+
+(defun magnus-codex--websocket-frame (text &optional opcode)
+  "Encode TEXT as a masked client WebSocket frame with OPCODE.
+OPCODE defaults to 1, the text-frame opcode."
+  (let* ((payload (if (multibyte-string-p text)
+                      (encode-coding-string text 'utf-8 t)
+                    (copy-sequence text)))
+         (length (length payload))
+         (mask (magnus-codex--byte-string
+                (random 256) (random 256) (random 256) (random 256)))
+         (header
+          (cond
+           ((< length 126)
+            (magnus-codex--byte-string
+             (logior 128 (or opcode 1)) (logior 128 length)))
+           ((< length 65536)
+            (concat (magnus-codex--byte-string
+                     (logior 128 (or opcode 1)) 254)
+                    (magnus-codex--integer-bytes length 2)))
+           (t
+            (concat (magnus-codex--byte-string
+                     (logior 128 (or opcode 1)) 255)
+                    (magnus-codex--integer-bytes length 8))))))
+    (dotimes (index length)
+      (aset payload index
+            (logxor (aref payload index) (aref mask (% index 4)))))
+    (concat header mask payload)))
+
+(defun magnus-codex--send-frame (process text &optional opcode)
+  "Send TEXT to PROCESS as a client WebSocket frame with OPCODE."
+  (process-send-string process (magnus-codex--websocket-frame text opcode)))
+
 (defun magnus-codex--send-object (process object)
-  "Send JSON-RPC OBJECT followed by a newline to PROCESS."
+  "Send JSON-RPC OBJECT as one WebSocket text frame through PROCESS."
   (unless (process-live-p process)
     (user-error "Codex App Server is not running"))
-  (process-send-string process (concat (magnus-codex--json object) "\n")))
+  (unless (process-get process 'magnus-codex-websocket-ready)
+    (user-error "Codex App Server observer is not ready"))
+  (magnus-codex--send-frame process (magnus-codex--json object)))
 
 (defun magnus-codex--request (process method params callback)
   "Send METHOD request with PARAMS through PROCESS and register CALLBACK.
@@ -261,25 +196,159 @@ CALLBACK receives RESULT and ERROR, exactly one of which is non-nil."
   (json-parse-string line :object-type 'alist :array-type 'list
                      :null-object nil :false-object :json-false))
 
+(defun magnus-codex--websocket-handshake (process)
+  "Begin the HTTP Upgrade handshake through observer proxy PROCESS."
+  (let ((key (base64-encode-string
+              (apply #'magnus-codex--byte-string
+                     (cl-loop repeat 16 collect (random 256)))
+              t)))
+    (process-put process 'magnus-codex-websocket-key key)
+    (process-send-string
+     process
+     (encode-coding-string
+      (concat "GET / HTTP/1.1\r\n"
+              "Host: localhost\r\n"
+              "Upgrade: websocket\r\n"
+              "Connection: Upgrade\r\n"
+              "Sec-WebSocket-Key: " key "\r\n"
+              "Sec-WebSocket-Version: 13\r\n\r\n")
+      'utf-8 t))))
+
+(defun magnus-codex--websocket-accept (process)
+  "Return the expected WebSocket accept value for PROCESS's handshake."
+  (base64-encode-string
+   (secure-hash
+    'sha1
+    (concat (process-get process 'magnus-codex-websocket-key)
+            "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+    nil nil t)
+   t))
+
 (defun magnus-codex--filter (process output)
-  "Consume newline-delimited JSON-RPC OUTPUT from PROCESS."
-  (let* ((partial (concat (or (process-get process 'magnus-codex-partial) "")
-                          output))
-         (lines (split-string partial "\n"))
-         (complete (butlast lines))
-         (remainder (car (last lines))))
-    (process-put process 'magnus-codex-partial remainder)
-    (dolist (line complete)
-      (unless (string-empty-p line)
-        (condition-case err
-            (magnus-codex--dispatch-message
-             process (magnus-codex--parse-line line))
-          (error
-           (when-let ((instance (process-get process 'magnus-codex-instance)))
-             (magnus-codex--insert
-              instance
-              (format "\n[protocol error] %s\n" (error-message-string err))
-              'error))))))))
+  "Safely consume App Server OUTPUT from observer PROCESS."
+  (condition-case err
+      (magnus-codex--filter-output process output)
+    (error
+     (when-let ((instance (process-get process 'magnus-codex-instance)))
+       (magnus-codex--insert
+        instance
+        (format "\n[observer protocol failure] %s\n"
+                (error-message-string err))
+        'error))
+     (when (process-live-p process)
+       (delete-process process)))))
+
+(defun magnus-codex--filter-output (process output)
+  "Consume WebSocket handshake and framed App Server OUTPUT from PROCESS."
+  (if (process-get process 'magnus-codex-websocket-ready)
+      (magnus-codex--consume-frames process output)
+    (let* ((partial (concat
+                     (or (process-get process 'magnus-codex-handshake-buffer)
+                         (magnus-codex--byte-string))
+                     output))
+           (end (string-match "\r\n\r\n" partial)))
+      (if (not end)
+          (process-put process 'magnus-codex-handshake-buffer partial)
+        (let ((headers (decode-coding-string
+                        (substring partial 0 (+ end 4)) 'utf-8 t))
+              (remainder (substring partial (+ end 4))))
+          (let ((case-fold-search t))
+            (unless (string-match-p "\\`HTTP/1\\.[01] 101\\b" headers)
+              (error "Codex App Server WebSocket upgrade failed: %s"
+                     (string-trim headers)))
+            (unless (and
+                     (string-match
+                      "^Sec-WebSocket-Accept:[ \t]*\\([^\r\n]+\\)" headers)
+                     (equal (string-trim (match-string 1 headers))
+                            (magnus-codex--websocket-accept process)))
+              (error "Codex App Server returned an invalid WebSocket accept")))
+          (process-put process 'magnus-codex-handshake-buffer nil)
+          (process-put process 'magnus-codex-websocket-ready t)
+          (when-let ((callback (process-get process 'magnus-codex-on-open)))
+            (process-put process 'magnus-codex-on-open nil)
+            (funcall callback))
+          (unless (string-empty-p remainder)
+            (magnus-codex--consume-frames process remainder)))))))
+
+(defun magnus-codex--read-integer (data start count)
+  "Read COUNT network-order bytes from DATA beginning at START."
+  (cl-loop with value = 0
+           for index from start below (+ start count)
+           do (setq value (+ (ash value 8) (aref data index)))
+           finally return value))
+
+(defun magnus-codex--consume-frames (process output)
+  "Consume zero or more WebSocket frames from PROCESS OUTPUT."
+  (let ((data (concat (or (process-get process 'magnus-codex-frame-buffer)
+                          (magnus-codex--byte-string))
+                      output))
+        (continue t))
+    (while continue
+      (if (< (length data) 2)
+          (setq continue nil)
+        (let* ((first (aref data 0))
+               (second (aref data 1))
+               (fin (not (zerop (logand first 128))))
+               (opcode (logand first 15))
+               (masked (not (zerop (logand second 128))))
+               (short-length (logand second 127))
+               (length-bytes (cond ((= short-length 126) 2)
+                                   ((= short-length 127) 8)
+                                   (t 0)))
+               (base (+ 2 length-bytes))
+               (mask-length (if masked 4 0)))
+          (if (< (length data) (+ base mask-length))
+              (setq continue nil)
+            (let ((payload-length
+                   (if (zerop length-bytes)
+                       short-length
+                     (magnus-codex--read-integer data 2 length-bytes))))
+              (when (> payload-length (* 16 1024 1024))
+                (error "Codex observer frame exceeds 16 MiB"))
+              (let* ((payload-start (+ base mask-length))
+                     (frame-end (+ payload-start payload-length)))
+                (if (> frame-end (length data))
+                    (setq continue nil)
+                  (let ((payload (copy-sequence
+                                  (substring data payload-start frame-end))))
+                    (when masked
+                      (let ((mask (substring data base (+ base 4))))
+                        (dotimes (index payload-length)
+                          (aset payload index
+                                (logxor (aref payload index)
+                                        (aref mask (% index 4)))))))
+                    (setq data (substring data frame-end))
+                    (magnus-codex--handle-frame
+                     process fin opcode payload)))))))))
+    (process-put process 'magnus-codex-frame-buffer data)))
+
+(defun magnus-codex--handle-frame (process fin opcode payload)
+  "Handle one WebSocket frame from PROCESS with FIN, OPCODE, and PAYLOAD."
+  (pcase opcode
+    (8
+     (process-put process 'magnus-codex-intentional-stop t)
+     (delete-process process))
+    (9 (magnus-codex--send-frame process payload 10))
+    (10 nil)
+    ((or 0 1)
+     (let ((fragments (append (process-get process 'magnus-codex-fragments)
+                              (list payload))))
+       (if (not fin)
+           (process-put process 'magnus-codex-fragments fragments)
+         (process-put process 'magnus-codex-fragments nil)
+         (condition-case err
+             (magnus-codex--dispatch-message
+              process
+              (magnus-codex--parse-line
+               (decode-coding-string (apply #'concat fragments) 'utf-8 t)))
+           (error
+            (when-let ((instance
+                        (process-get process 'magnus-codex-instance)))
+              (magnus-codex--insert
+               instance
+               (format "\n[protocol error] %s\n" (error-message-string err))
+               'error)))))))
+    (_ nil)))
 
 (defun magnus-codex--dispatch-message (process message)
   "Dispatch parsed JSON-RPC MESSAGE received from PROCESS."
@@ -389,6 +458,18 @@ permission-profile request instead requires its complete response alist."
     (pcase method
       ("item/agentMessage/delta"
        (magnus-codex--insert instance (or (alist-get 'delta params) "")))
+      ("thread/started"
+       (when (and (process-get process 'magnus-codex-awaiting-tui-thread)
+                  (equal magnus-codex--new-thread-owner
+                         (magnus-instance-id instance)))
+         (when-let ((thread-id
+                     (alist-get 'id (alist-get 'thread params))))
+           (process-put process 'magnus-codex-awaiting-tui-thread nil)
+           (magnus-instances-update instance :session-id thread-id)
+           (magnus-codex--insert
+            instance (format "[TUI thread started: %s]\n" thread-id)
+            'font-lock-comment-face)
+           (magnus-codex--release-new-thread-owner instance))))
       ("turn/plan/updated"
        (magnus-codex--insert instance
                              (magnus-codex--format-plan params)
@@ -405,8 +486,7 @@ permission-profile request instead requires its complete response alist."
        (remhash (magnus-instance-id instance) magnus-codex--active-turns)
        (process-put process 'magnus-codex-turn-starting nil)
        (magnus-codex--insert instance "\n[turn completed]\n\n"
-                             'font-lock-comment-face)
-       (magnus-codex--start-next-queued-turn process instance))
+                             'font-lock-comment-face))
       ("thread/status/changed"
        (magnus-codex--insert
         instance (format "\n[status: %s]\n"
@@ -440,16 +520,27 @@ permission-profile request instead requires its complete response alist."
    "\n"))
 
 (defun magnus-codex--sentinel (process event)
-  "Handle PROCESS termination EVENT."
+  "Handle observer PROCESS termination EVENT."
   (unless (process-live-p process)
     (when-let ((instance (process-get process 'magnus-codex-instance)))
-      (remhash (magnus-instance-id instance) magnus-codex--connections)
+      (when (process-get process 'magnus-codex-awaiting-tui-thread)
+        (process-put process 'magnus-codex-awaiting-tui-thread nil)
+        (when-let ((terminal (magnus-codex--tui-process instance)))
+          (set-process-query-on-exit-flag terminal nil)
+          (kill-process terminal))
+        (magnus-codex--release-new-thread-owner instance))
+      (when (eq process (gethash (magnus-instance-id instance)
+                                 magnus-codex--connections))
+        (remhash (magnus-instance-id instance) magnus-codex--connections))
       (remhash (magnus-instance-id instance) magnus-codex--active-turns)
       (magnus-codex--clear-approvals instance process)
-      (unless (eq (magnus-instance-status instance) 'purged)
+      ;; Once the TUI owns the thread, observer failure must not terminate or
+      ;; misreport the interactive session.  Before that handoff it is fatal.
+      (unless (or (magnus-codex--tui-process instance)
+                  (eq (magnus-instance-status instance) 'purged))
         (magnus-instances-update instance :status 'stopped))
       (unless (process-get process 'magnus-codex-intentional-stop)
-        (magnus-codex--insert instance (format "\n[App Server %s]" event)
+        (magnus-codex--insert instance (format "\n[observer %s]" event)
                               'font-lock-comment-face))
       (when (and (boundp 'magnus-buffer-name)
                  (get-buffer magnus-buffer-name))
@@ -463,17 +554,28 @@ permission-profile request instead requires its complete response alist."
                            magnus-codex--connections))))
     (clrhash (magnus-codex--approval-table connection))))
 
+(defun magnus-codex--ensure-daemon ()
+  "Ensure the managed local Codex App Server daemon is running."
+  (unless (executable-find magnus-codex-executable)
+    (user-error "Cannot find Codex executable: %s" magnus-codex-executable))
+  (with-temp-buffer
+    (let ((status (process-file magnus-codex-executable nil t nil
+                                "app-server" "daemon" "start")))
+      (unless (and (integerp status) (zerop status))
+        (user-error "Could not start Codex App Server daemon: %s"
+                    (string-trim (buffer-string)))))))
+
 (defun magnus-codex--start-process (instance)
-  "Start a Codex App Server process for INSTANCE."
+  "Start INSTANCE's semantic observer proxy to the managed daemon."
   (let* ((name (format "magnus-codex-%s" (magnus-instance-id instance)))
          (stderr (get-buffer-create (format " *%s-stderr*" name)))
          (default-directory (magnus-instance-directory instance))
          (process (make-process
                    :name name
                    :command (list magnus-codex-executable
-                                  "app-server" "--stdio")
+                                  "app-server" "proxy")
                    :connection-type 'pipe
-                   :coding 'utf-8-unix
+                   :coding 'binary
                    :noquery t
                    :buffer nil
                    :stderr stderr
@@ -484,44 +586,99 @@ permission-profile request instead requires its complete response alist."
     (process-put process 'magnus-codex-approvals
                  (make-hash-table :test #'equal))
     (process-put process 'magnus-codex-next-id 0)
-    (process-put process 'magnus-codex-partial "")
+    (process-put process 'magnus-codex-handshake-buffer
+                 (magnus-codex--byte-string))
+    (process-put process 'magnus-codex-frame-buffer
+                 (magnus-codex--byte-string))
+    (process-put process 'magnus-codex-websocket-ready nil)
     (process-put process 'magnus-codex-input-queue nil)
     (process-put process 'magnus-codex-turn-starting nil)
     (puthash (magnus-instance-id instance) process magnus-codex--connections)
     process))
 
 (defun magnus-codex-start (instance &optional initial-message)
-  "Start or resume Codex INSTANCE, then optionally send INITIAL-MESSAGE."
+  "Start or resume Codex INSTANCE in a TUI.
+INITIAL-MESSAGE, when non-nil, is submitted by the TUI as its first prompt."
   (when (magnus-codex--connection instance)
     (user-error "Codex instance `%s' is already running"
                 (magnus-instance-name instance)))
-  (magnus-codex--buffer instance)
+  (magnus-codex--ensure-daemon)
   (let ((process (magnus-codex--start-process instance)))
-    (magnus-codex--request
-     process "initialize"
-     '((clientInfo . ((name . "magnus") (title . "Magnus")
-                      (version . "0.1.0")))
-       (capabilities . ((experimentalApi . :json-false))))
-     (lambda (_result error)
-       (if error
-           (progn
-             (magnus-codex--insert instance
-                                   (format "[initialize failed] %s\n" error)
-                                   'error)
-             (delete-process process))
-         (magnus-codex--notify process "initialized")
-         (magnus-codex--open-thread process instance initial-message))))
+    (process-put process 'magnus-codex-on-open
+                 (lambda ()
+                   (magnus-codex--initialize
+                    process instance initial-message)))
+    (magnus-codex--websocket-handshake process)
     process))
 
+(defun magnus-codex--initialize (process instance initial-message)
+  "Initialize observer PROCESS, then open INSTANCE with INITIAL-MESSAGE."
+  (magnus-codex--request
+   process "initialize"
+   '((clientInfo . ((name . "magnus") (title . "Magnus")
+                    (version . "0.1.0")))
+     (capabilities . ((experimentalApi . :json-false))))
+   (lambda (_result error)
+     (if error
+         (progn
+           (magnus-codex--insert instance
+                                 (format "[initialize failed] %s\n" error)
+                                 'error)
+           (delete-process process))
+       (magnus-codex--notify process "initialized")
+       (if (magnus-instance-session-id instance)
+           (magnus-codex--open-thread process instance initial-message)
+         (magnus-codex--start-new-thread
+          process instance initial-message))))))
+
+(defun magnus-codex--start-new-thread (process instance initial-message)
+  "Launch a new TUI-owned thread, serializing its identity handoff."
+  (if magnus-codex--new-thread-owner
+      (setq magnus-codex--new-thread-queue
+            (append magnus-codex--new-thread-queue
+                    (list (list process instance initial-message))))
+    (setq magnus-codex--new-thread-owner (magnus-instance-id instance))
+    (process-put process 'magnus-codex-awaiting-tui-thread t)
+    (magnus-codex--spawn-tui
+     instance (magnus-codex--onboarding-prompt instance initial-message))))
+
+(defun magnus-codex--onboarding-prompt (instance &optional initial-message)
+  "Return durable first-turn onboarding for INSTANCE and INITIAL-MESSAGE.
+Remote TUI-created threads do not reliably honor CLI developer-instruction
+overrides, so the den contract is made visible and persistent in history."
+  (concat
+   (magnus-codex--instructions instance)
+   (if initial-message
+       (concat "\n\nInitial task from the user:\n" initial-message)
+     (concat "\n\nNo separate task was supplied. Complete your orientation, "
+             "report that you are ready, and then wait for the user."))))
+
+(defun magnus-codex--release-new-thread-owner (instance)
+  "Release INSTANCE's new-thread handoff lock and start the next TUI."
+  (when (equal magnus-codex--new-thread-owner
+               (magnus-instance-id instance))
+    (setq magnus-codex--new-thread-owner nil)
+    (magnus-codex--start-next-new-thread)))
+
+(defun magnus-codex--start-next-new-thread ()
+  "Start the next valid queued new Codex TUI, if any."
+  (let (entry)
+    (while (and magnus-codex--new-thread-queue (not entry))
+      (let ((candidate (pop magnus-codex--new-thread-queue)))
+        (when (and (process-live-p (car candidate))
+                   (not (eq (magnus-instance-status (cadr candidate))
+                            'purged)))
+          (setq entry candidate))))
+    (when entry
+      (apply #'magnus-codex--start-new-thread entry))))
+
 (defun magnus-codex--open-thread (process instance initial-message)
-  "Start or resume INSTANCE thread on PROCESS, then send INITIAL-MESSAGE."
+  "Resume INSTANCE on observer PROCESS, then launch its TUI."
   (let* ((thread-id (magnus-instance-session-id instance))
-         (method (if thread-id "thread/resume" "thread/start"))
-         (common `((cwd . ,(magnus-instance-directory instance))
-                   (developerInstructions . ,(magnus-codex--instructions instance))))
-         (params (if thread-id
-                     (cons `(threadId . ,thread-id) common)
-                   common)))
+         (method "thread/resume")
+         (params `((threadId . ,thread-id)
+                   (cwd . ,(magnus-instance-directory instance))
+                   (developerInstructions . ,(magnus-codex--instructions instance)))))
     (magnus-codex--request
      process method params
      (lambda (result error)
@@ -530,19 +687,97 @@ permission-profile request instead requires its complete response alist."
              (magnus-codex--insert instance
                                    (format "[%s failed] %s\n" method error)
                                    'error)
-             (magnus-instances-update instance :status 'stopped)
-             (delete-process process))
+             ;; A brand-new TUI session has no rollout until its first turn.
+             ;; If it was archived before then, nothing can be lost: clear the
+             ;; unusable ID and let the TUI create a fresh persisted identity.
+             (magnus-instances-update instance :session-id nil)
+             (magnus-codex--start-new-thread
+              process instance initial-message))
          (let ((new-id (alist-get 'id (alist-get 'thread result))))
            (when new-id
              (magnus-instances-update instance :session-id new-id))
-           (magnus-instances-update instance :status 'running)
            (magnus-codex--insert instance
                                  (format "[thread %s: %s]\n\n"
                                          (if thread-id "resumed" "started")
                                          (or new-id thread-id))
                                  'font-lock-comment-face)
-           (when initial-message
-             (magnus-codex-send instance initial-message))))))))
+           (magnus-codex--spawn-tui instance initial-message)))))))
+
+(defun magnus-codex--tui-command (instance &optional initial-message)
+  "Return the shell command used to run INSTANCE's new or resumed TUI.
+INITIAL-MESSAGE becomes the optional initial prompt."
+  (let ((thread-id (magnus-instance-session-id instance)))
+    (mapconcat
+     #'shell-quote-argument
+     (append (list "exec" magnus-codex-executable)
+             (when thread-id (list "resume"))
+             (list "--remote" magnus-codex-remote
+                   "-C" (magnus-instance-directory instance))
+             (when thread-id (list thread-id))
+             (when initial-message (list initial-message)))
+     " ")))
+
+(defun magnus-codex--spawn-tui (instance &optional initial-message)
+  "Launch INSTANCE's full Codex TUI, optionally with INITIAL-MESSAGE."
+  (let* ((buffer-name (format "*codex:%s*" (magnus-instance-name instance)))
+         (default-directory (magnus-instance-directory instance))
+         (buffer (magnus-process--create-vterm-buffer buffer-name))
+         (command (magnus-codex--tui-command instance initial-message)))
+    (with-current-buffer buffer
+      (setq-local magnus-codex--instance instance))
+    ;; A freshly created vterm may still be initializing its login shell.  Give
+    ;; it one tick before pasting, then another before submitting the command.
+    (run-with-timer
+     0.1 nil
+     (lambda ()
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (vterm-send-string command)))))
+    (run-with-timer
+     0.5 nil
+     (lambda ()
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (vterm-send-return)))))
+    (magnus-instances-update instance :buffer buffer :status 'running)
+    (magnus-codex--setup-tui-sentinel instance buffer)
+    (when (gethash (magnus-instance-id instance) magnus-codex--show-on-ready)
+      (remhash (magnus-instance-id instance) magnus-codex--show-on-ready)
+      (pop-to-buffer buffer))
+    (when (and (boundp 'magnus-buffer-name)
+               (get-buffer magnus-buffer-name))
+      (magnus-status-refresh))
+    buffer))
+
+(defun magnus-codex--setup-tui-sentinel (instance buffer)
+  "Track the interactive Codex process for INSTANCE in BUFFER."
+  (when-let ((process (get-buffer-process buffer)))
+    (process-put process 'magnus-codex-observer
+                 (magnus-codex--connection instance))
+    (set-process-sentinel
+     process
+     (lambda (terminal _event)
+       (unless (process-live-p terminal)
+         (when-let ((observer
+                     (process-get terminal 'magnus-codex-observer)))
+           (process-put observer 'magnus-codex-intentional-stop t)
+           (when (process-live-p observer)
+             (delete-process observer)))
+         ;; A stale vterm can report its exit after a replacement TUI exists.
+         ;; Only the terminal still owned by INSTANCE may release or stop it.
+         (when (and (buffer-live-p (magnus-instance-buffer instance))
+                    (eq terminal
+                        (get-buffer-process
+                         (magnus-instance-buffer instance))))
+           (when (and (null (magnus-instance-session-id instance))
+                      (equal magnus-codex--new-thread-owner
+                             (magnus-instance-id instance)))
+             (magnus-codex--release-new-thread-owner instance))
+           (unless (eq (magnus-instance-status instance) 'purged)
+             (magnus-instances-update instance :status 'stopped))
+           (when (and (boundp 'magnus-buffer-name)
+                      (get-buffer magnus-buffer-name))
+             (magnus-status-refresh))))))))
 
 (defun magnus-codex--instructions (instance)
   "Build Magnus identity and coordination instructions for Codex INSTANCE."
@@ -615,153 +850,76 @@ permission-profile request instead requires its complete response alist."
   "Build App Server user input for TEXT."
   `[((type . "text") (text . ,text))])
 
-(defun magnus-codex--queue-input (process text)
-  "Append TEXT to PROCESS's next-turn input queue."
-  (process-put process 'magnus-codex-input-queue
-               (append (process-get process 'magnus-codex-input-queue)
-                       (list text))))
-
-(defun magnus-codex--start-next-queued-turn (process instance)
-  "Start INSTANCE's next queued turn through PROCESS when idle."
-  (unless (or (gethash (magnus-instance-id instance)
-                       magnus-codex--active-turns)
-              (process-get process 'magnus-codex-turn-starting))
-    (when-let ((queue (process-get process 'magnus-codex-input-queue)))
-      (let ((text (car queue))
-            (thread-id (magnus-instance-session-id instance)))
-        (unless thread-id
-          (user-error "Codex thread is not ready yet"))
-        (process-put process 'magnus-codex-input-queue (cdr queue))
-        (process-put process 'magnus-codex-turn-starting t)
-        (magnus-codex--insert instance (format "\nYou: %s\n\n" text)
-                              'font-lock-keyword-face)
-        (magnus-codex--request
-         process "turn/start"
-         `((threadId . ,thread-id) (input . ,(magnus-codex--input text)))
-         (lambda (result error)
-           (process-put process 'magnus-codex-turn-starting nil)
-           (if error
-               (progn
-                 (process-put
-                  process 'magnus-codex-input-queue
-                  (cons text (process-get process
-                                          'magnus-codex-input-queue)))
-                 (magnus-codex--insert
-                  instance
-                  (format "[turn/start failed; message retained] %s\n" error)
-                  'error))
-             (when-let ((turn-id
-                         (magnus-codex--turn-id (alist-get 'turn result))))
-               (puthash (magnus-instance-id instance) turn-id
-                        magnus-codex--active-turns)))))))))
-
 (defun magnus-codex-send (instance text)
-  "Send TEXT to Codex INSTANCE according to the active-turn delivery policy.
-By default, text received during an active turn is queued for a new turn so
-coordination nudges match Claude/vterm behavior.  See
-`magnus-codex-active-turn-delivery' and `magnus-codex-steer'."
-  (let* ((process (or (magnus-codex--connection instance)
-                      (user-error "Codex instance is not running")))
-         (_thread-id (or (magnus-instance-session-id instance)
-                         (user-error "Codex thread is not ready yet")))
-         (turn-id (gethash (magnus-instance-id instance)
-                           magnus-codex--active-turns)))
-    (if (and turn-id (eq magnus-codex-active-turn-delivery 'steer))
-        (magnus-codex-steer instance text turn-id)
-      (magnus-codex--queue-input process text)
-      (if (or turn-id (process-get process 'magnus-codex-turn-starting))
-          (magnus-codex--insert instance
-                                "\n[message queued for next turn]\n"
-                                'font-lock-comment-face)
-        (magnus-codex--start-next-queued-turn process instance)))))
+  "Submit TEXT through INSTANCE's Codex TUI.
+The semantic observer never starts or steers turns; this keeps the TUI as the
+only interactive writer and lets Codex apply its native input semantics."
+  (let ((buffer (magnus-instance-buffer instance)))
+    (unless (and (buffer-live-p buffer) (magnus-codex--tui-process instance))
+      (user-error "Codex instance `%s' is not running"
+                  (magnus-instance-name instance)))
+    (with-current-buffer buffer
+      (vterm-send-string text))
+    (run-with-timer
+     0.1 nil
+     (lambda ()
+       (when (and (buffer-live-p buffer)
+                  (process-live-p (get-buffer-process buffer)))
+         (with-current-buffer buffer
+           (vterm-send-return)))))))
 
-(defun magnus-codex-steer (instance text &optional expected-turn-id)
-  "Steer active Codex INSTANCE turn with TEXT.
-EXPECTED-TURN-ID defaults to INSTANCE's current active turn."
-  (let ((process (or (magnus-codex--connection instance)
-                     (user-error "Codex instance is not running")))
-        (thread-id (or (magnus-instance-session-id instance)
-                       (user-error "Codex thread is not ready yet")))
-        (turn-id (or expected-turn-id
-                     (gethash (magnus-instance-id instance)
-                              magnus-codex--active-turns)
-                     (user-error "Codex has no active turn to steer"))))
-    (magnus-codex--insert instance (format "\nYou (steer): %s\n\n" text)
-                          'font-lock-keyword-face)
-    (magnus-codex--request
-     process "turn/steer"
-     `((threadId . ,thread-id) (expectedTurnId . ,turn-id)
-       (input . ,(magnus-codex--input text)))
-     (lambda (_result error)
-       (when error
-         (magnus-codex--insert instance
-                               (format "[turn/steer failed] %s\n" error)
-                               'error))))))
+(defun magnus-codex-steer (instance text &optional _expected-turn-id)
+  "Submit TEXT through INSTANCE's TUI using Codex's native active-turn UI."
+  (magnus-codex-send instance text))
 
 (defun magnus-codex-interrupt (instance)
-  "Interrupt the active turn for Codex INSTANCE."
-  (let ((process (or (magnus-codex--connection instance)
-                     (user-error "Codex instance is not running")))
-        (thread-id (or (magnus-instance-session-id instance)
-                       (user-error "Codex thread is not ready yet")))
-        (turn-id (or (gethash (magnus-instance-id instance)
-                              magnus-codex--active-turns)
-                     (user-error "Codex has no active turn"))))
-    (magnus-codex--request
-     process "turn/interrupt"
-     `((threadId . ,thread-id) (turnId . ,turn-id))
-     (lambda (_result error)
-       (if error
-           (magnus-codex--insert instance
-                                 (format "[interrupt failed] %s\n" error)
-                                 'error)
-         (remhash (magnus-instance-id instance) magnus-codex--active-turns)
-         (magnus-codex--insert instance "[turn interrupted]\n"
-                               'font-lock-comment-face))))))
+  "Interrupt the active turn through Codex INSTANCE's TUI."
+  (let ((buffer (magnus-instance-buffer instance)))
+    (unless (and (buffer-live-p buffer) (magnus-codex--tui-process instance))
+      (user-error "Codex instance `%s' is not running"
+                  (magnus-instance-name instance)))
+    (with-current-buffer buffer
+      (vterm-send-key "C-c"))))
 
 (defun magnus-codex-stop (instance &optional force)
-  "Stop Codex INSTANCE App Server process.
-When FORCE is non-nil, kill it immediately."
+  "Stop Codex INSTANCE's TUI and observer, never the shared daemon.
+When FORCE is non-nil, kill subprocesses immediately."
   (let ((buffer (magnus-instance-buffer instance)))
-    (when-let ((process (magnus-codex--connection instance)))
-      (process-put process 'magnus-codex-intentional-stop t)
-      (if force (kill-process process) (delete-process process)))
+    (when-let ((observer (magnus-codex--connection instance)))
+      (process-put observer 'magnus-codex-intentional-stop t)
+      (if force (kill-process observer) (delete-process observer)))
     (when (buffer-live-p buffer)
+      (when-let ((terminal (get-buffer-process buffer)))
+        (set-process-query-on-exit-flag terminal nil)
+        (when (process-live-p terminal)
+          (if force (kill-process terminal) (delete-process terminal))))
       (kill-buffer buffer)))
   (remhash (magnus-instance-id instance) magnus-codex--connections)
   (remhash (magnus-instance-id instance) magnus-codex--active-turns)
+  (remhash (magnus-instance-id instance) magnus-codex--show-on-ready)
+  (setq magnus-codex--new-thread-queue
+        (cl-remove-if (lambda (entry) (eq (cadr entry) instance))
+                      magnus-codex--new-thread-queue))
+  (magnus-codex--release-new-thread-owner instance)
   (magnus-instances-update instance :status 'stopped :buffer nil))
 
 (defun magnus-codex-running-p (instance)
-  "Return non-nil if Codex INSTANCE has a live App Server connection."
-  (and (magnus-codex--connection instance) t))
+  "Return non-nil when Codex INSTANCE has a live interactive TUI."
+  (and (magnus-codex--tui-process instance) t))
 
 (defun magnus-codex-switch-to (instance)
-  "Switch to Codex INSTANCE, resuming its thread when necessary."
-  (unless (magnus-codex-running-p instance)
-    (magnus-codex-start instance))
-  (pop-to-buffer (magnus-codex--buffer instance)))
-
-(defun magnus-codex-send-message ()
-  "Prompt for and send a message from a Codex output buffer."
-  (interactive)
-  (unless magnus-codex--instance
-    (user-error "This is not a Magnus Codex buffer"))
-  (let ((text (read-string (format "Message to %s: "
-                                   (magnus-instance-name
-                                    magnus-codex--instance)))))
-    (unless (string-empty-p text)
-      (magnus-codex-send magnus-codex--instance text))))
-
-(defun magnus-codex-interrupt-current ()
-  "Interrupt the Codex instance represented by the current buffer."
-  (interactive)
-  (unless magnus-codex--instance
-    (user-error "This is not a Magnus Codex buffer"))
-  (magnus-codex-interrupt magnus-codex--instance))
+  "Switch to Codex INSTANCE, resuming its TUI when necessary."
+  (if (magnus-codex-running-p instance)
+      (pop-to-buffer (magnus-instance-buffer instance))
+    (puthash (magnus-instance-id instance) t magnus-codex--show-on-ready)
+    (unless (magnus-codex--connection instance)
+      (magnus-codex-start instance))
+    (message "Magnus: starting Codex TUI for %s..."
+             (magnus-instance-name instance))))
 
 (defun magnus-codex-answer-approval ()
-  "Answer a pending command or file approval in the current Codex buffer."
+  "Answer a fallback observer approval in the current Codex TUI.
+Normal interactive approvals are owned and rendered by the TUI itself."
   (interactive)
   (unless magnus-codex--instance
     (user-error "This is not a Magnus Codex buffer"))

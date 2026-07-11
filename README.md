@@ -39,29 +39,35 @@ Spawn, kill, suspend/resume, rename, and switch between Claude Code instances ru
 ### Optional Codex Instances
 
 Run `M-x magnus-create-codex` to create a Codex instance through Codex App
-Server. Codex is strictly opt-in: existing commands, saved state, vterm
-behavior, and Claude storage paths remain unchanged. Codex instances support
-thread resume, streamed messages and plans, explicit steering, interruption,
-and semantic approval callbacks. They are labeled `[codex]` in the status
-buffer.
+Server. Codex is strictly opt-in: existing commands, saved state, Claude
+behavior, and Claude storage paths remain unchanged. Each Codex instance runs
+the full native Codex TUI in a vterm buffer and is labeled `[codex]` in the
+status buffer.
 
-This requires a `codex` executable with `codex app-server` support. Customize
-its path with `magnus-codex-executable`. App Server connections use stdio and
-are restarted transparently when a saved Codex thread is revisited.
+This requires a `codex` executable with managed App Server support (`codex
+app-server daemon` and `codex app-server proxy`). Customize its path with
+`magnus-codex-executable`. Magnus starts or reuses one idle shared daemon. A
+small per-instance observer connects to that daemon through the local Unix
+socket while the TUI connects to the same thread with `--remote unix://`.
+The observer handles identity, lifecycle, status events, and persisted thread
+IDs; it never writes interactive turns or terminal output.
 
-Inside a Codex buffer, type directly at the `> ` prompt and press `RET` to
-send. Use `C-c a` to answer a pending command/file approval, `C-c m` for
-minibuffer-based message entry, and `C-c C-k` to interrupt the active turn.
-Messages received while
-a turn is active queue for the next turn by default, matching Claude/vterm
-behavior and preventing a casual coordination nudge from redirecting work in
-progress. Set `magnus-codex-active-turn-delivery` to `steer` for immediate
-turn/steer injection; explicit calls to `magnus-codex-steer` always steer.
-Magnus also adapts its full onboarding philosophy for Codex: named identity,
-first-person
-memory, coordination claims and discoveries, attention etiquette, debriefing,
-and candid `[thinking]`/`[response]` engineering journals. Claude's established
-prompt remains unchanged.
+Inside a Codex buffer, use the TUI exactly as you would in a terminal: type at
+its composer, answer approvals in its native UI, and use Magnus's `C-g`
+binding to send Escape. Direct messages and coordination nudges are typed into
+that same vterm, making the TUI the sole interactive writer; Codex therefore
+owns the semantics of input received during an active turn. Archiving stops
+only the TUI and observer, not the shared daemon. Revisiting an archived agent
+resumes its persisted thread in a fresh TUI.
+
+New Codex TUI launches are serialized only for the brief moment in which
+Magnus captures each TUI-created thread ID. After that handoff, the agents run
+independently. Magnus also adapts its full onboarding philosophy for Codex:
+named identity, first-person memory, coordination claims and discoveries,
+attention etiquette, debriefing, and candid `[thinking]`/`[response]`
+engineering journals. New Codex threads receive this as a visible first-turn
+onboarding message so it persists in their history across resurrection.
+Claude's established prompt remains unchanged.
 
 ### Agent Coordination
 Agents communicate through a shared `.magnus-coord.md` file:
