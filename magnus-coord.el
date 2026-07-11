@@ -23,7 +23,6 @@
 (declare-function vterm-send-string "vterm")
 (declare-function project-root "project")
 (declare-function vterm-send-return "vterm")
-(declare-function magnus-process-running-p "magnus-process")
 
 (defvar magnus-claude-executable)
 (declare-function magnus--headless-command "magnus")
@@ -196,6 +195,17 @@ This prevents partial reads when agents write concurrently."
     (message "Magnus: %s" entry)
     nil))
 
+(defun magnus-coord--instance-running-p (instance)
+  "Return non-nil when INSTANCE can currently receive a nudge.
+This intentionally avoids requiring `magnus-process', which itself requires
+this module and would create a load-order cycle for standalone callers."
+  (if (magnus-provider-external-p instance)
+      (magnus-provider-call instance 'running-p)
+    (when-let ((buffer (magnus-instance-buffer instance)))
+      (and (buffer-live-p buffer)
+           (get-buffer-process buffer)
+           (process-live-p (get-buffer-process buffer))))))
+
 (defun magnus-coord-nudge-agent (instance message &optional source)
   "Nudge INSTANCE by sending MESSAGE through its provider.
 When SOURCE is non-nil, prepend \"[From SOURCE]:\" to distinguish
@@ -212,7 +222,7 @@ are debounced per `magnus-coord-nudge-debounce'."
                       (format "[From %s]: %s" source message)
                     message)))
         (condition-case err
-            (if (not (magnus-process-running-p instance))
+            (if (not (magnus-coord--instance-running-p instance))
                 (magnus-coord--log-undelivered-nudge
                  instance text "not running")
               (if (magnus-provider-external-p instance)

@@ -2,6 +2,7 @@
 
 (require 'ert)
 (require 'cl-lib)
+(require 'magnus)
 (require 'magnus-instances)
 (require 'magnus-provider)
 (require 'magnus-provider-codex)
@@ -20,10 +21,8 @@
                  (make-hash-table :test #'equal))
     (process-put process 'magnus-codex-approvals
                  (make-hash-table :test #'equal))
-    (process-put process 'magnus-codex-input-queue nil)
     (process-put process 'magnus-codex-turn-starting nil)
-    (puthash (magnus-instance-id instance) process
-             magnus-codex--connections)
+    (magnus-codex--register-connection instance process)
     process))
 
 (defun magnus-test--codex-tui (instance)
@@ -60,6 +59,11 @@
                      :directory "/tmp" :status stopped))))
     (should (eq (magnus-instance-provider instance) 'claude))
     (should-not (magnus-provider-external-p instance))))
+
+(ert-deftest magnus-upgrade-requires-restart-before-reinitialization ()
+  (let ((magnus--restart-required t)
+        (magnus--initialized nil))
+    (should-error (magnus--ensure-initialized) :type 'user-error)))
 
 (ert-deftest magnus-provider-round-trips-codex-state ()
   (let* ((instance (magnus-instances-create "/tmp" "codex-user" 'codex))
@@ -158,15 +162,16 @@
 
 (ert-deftest magnus-codex-new-thread-onboarding-is-durable-user-input ()
   (let* ((instance (magnus-instances-create "/tmp" "named-codex" 'codex))
-         (prompt (magnus-codex--onboarding-prompt instance "Fix the parser"))
-         (command (magnus-codex--tui-command instance prompt)))
+         (prompt (magnus-codex--onboarding-prompt instance "Fix the parser")))
     (should (string-match-p "You are named-codex" prompt))
     (should (string-match-p "Initial task from the user" prompt))
     (should (string-match-p "Fix the parser" prompt))
     (should (string-match-p "\\[thinking\\]" prompt))
-    (should (string-match-p "exec codex --remote" command))
-    (should-not (string-match-p "codex resume" command))
-    (should-not (string-match-p "developer_instructions=" command))))
+    (magnus-instances-update instance :session-id "observer-owned-thread")
+    (let ((command (magnus-codex--tui-command instance prompt)))
+      (should (string-match-p "exec codex resume" command))
+      (should (string-match-p "observer-owned-thread" command))
+      (should-not (string-match-p "developer_instructions=" command)))))
 
 (ert-deftest magnus-codex-command-approval-keeps-v2-response-shape ()
   (let* ((magnus-codex--connections (make-hash-table :test #'equal))
@@ -187,6 +192,29 @@
             (magnus-codex-respond-approval instance request-id "accept"))
           (should (equal (alist-get 'result sent)
                          '((decision . "accept")))))
+      (delete-process process))))
+
+(ert-deftest magnus-codex-command-approval-allows-policy-amendment ()
+  (let* ((magnus-codex--connections (make-hash-table :test #'equal))
+         (instance (magnus-instances-create "/tmp" "policy-codex" 'codex))
+         (process (magnus-test--codex-process instance))
+         (decision
+          '((acceptWithExecpolicyAmendment
+             . ((execpolicy_amendment . ("git" "status"))))))
+         sent)
+    (unwind-protect
+        (progn
+          (puthash 12
+                   (list :instance instance :process process
+                         :method "item/commandExecution/requestApproval")
+                   (magnus-codex--approval-table process))
+          (cl-letf (((symbol-function 'magnus-codex--send-object)
+                     (lambda (_process object) (setq sent object)))
+                    ((symbol-function 'magnus-codex--insert)
+                     (lambda (&rest _arguments) nil)))
+            (magnus-codex-respond-approval instance 12 decision))
+          (should (equal (alist-get 'result sent)
+                         `((decision . ,decision)))))
       (delete-process process))))
 
 (ert-deftest magnus-codex-permission-approval-requires-profile ()
@@ -229,6 +257,8 @@
          (first-process (magnus-test--codex-process first))
          (second-process (magnus-test--codex-process second))
          sent)
+    (magnus-instances-update first :session-id "thread-first")
+    (magnus-instances-update second :session-id "thread-second")
     (unwind-protect
         (cl-letf (((symbol-function 'magnus-codex--insert)
                    (lambda (&rest _arguments) nil))
@@ -237,10 +267,10 @@
                      (push (cons process object) sent))))
           (magnus-codex--handle-server-request
            first-process 3 "item/commandExecution/requestApproval"
-           '((command . "git status")))
+           '((threadId . "thread-first") (command . "git status")))
           (magnus-codex--handle-server-request
            second-process 3 "item/fileChange/requestApproval"
-           '((reason . "edit file")))
+           '((threadId . "thread-second") (reason . "edit file")))
           (should (= 1 (hash-table-count
                         (magnus-codex--approval-table first-process))))
           (should (= 1 (hash-table-count
@@ -256,6 +286,43 @@
           (should (= 2 (length sent))))
       (delete-process first-process)
       (delete-process second-process))))
+
+(ert-deftest magnus-codex-stale-approval-cannot-answer-reused-id ()
+  (let* ((magnus-codex--connections (make-hash-table :test #'equal))
+         (magnus-codex--retired-approval-ids
+          (make-hash-table :test #'equal))
+         (instance (magnus-instances-create "/tmp" "reconnected" 'codex))
+         (first-process (magnus-test--codex-process instance))
+         second-process old-token current-token sent)
+    (magnus-instances-update instance :session-id "thread-reconnected")
+    (unwind-protect
+        (cl-letf (((symbol-function 'magnus-codex--insert)
+                   (lambda (&rest _arguments) nil))
+                  ((symbol-function 'magnus-codex--send-object)
+                   (lambda (_process object) (setq sent object))))
+          (magnus-codex--handle-server-request
+           first-process 3 "item/commandExecution/requestApproval"
+           '((threadId . "thread-reconnected") (command . "old")))
+          (setq old-token (magnus-codex-approval-token instance 3))
+          (delete-process first-process)
+          (setq second-process (magnus-test--codex-process instance))
+          (magnus-codex--handle-server-request
+           second-process 3 "item/commandExecution/requestApproval"
+           '((threadId . "thread-reconnected") (command . "new")))
+          (setq current-token (magnus-codex-approval-token instance 3))
+          (should-error
+           (magnus-codex-respond-approval instance 3 "accept")
+           :type 'user-error)
+          (should-error
+           (magnus-codex-respond-approval instance 3 "accept" old-token)
+           :type 'user-error)
+          (magnus-codex-respond-approval
+           instance 3 "accept" current-token)
+          (should (equal (alist-get 'result sent)
+                         '((decision . "accept")))))
+      (when (process-live-p first-process) (delete-process first-process))
+      (when (and second-process (process-live-p second-process))
+        (delete-process second-process)))))
 
 (ert-deftest magnus-codex-approval-summary-accepts-argv-arrays ()
   (should
@@ -282,15 +349,20 @@
                command)))))
 
 (ert-deftest magnus-codex-messages-use-tui-as-sole-writer ()
-  (let* ((instance (magnus-instances-create "/tmp" "tui-codex" 'codex))
+  (let* ((magnus-codex--input-queues (make-hash-table :test #'equal))
+         (magnus-codex--input-busy (make-hash-table :test #'equal))
+         (magnus-codex--input-retry (make-hash-table :test #'equal))
+         (magnus-codex--tui-ready (make-hash-table :test #'equal))
+         (instance (magnus-instances-create "/tmp" "tui-codex" 'codex))
          (terminal (magnus-test--codex-tui instance))
          sent return-sent)
+    (puthash (magnus-instance-id instance) t magnus-codex--tui-ready)
     (unwind-protect
         (cl-letf (((symbol-function 'magnus-codex--request)
-                   (lambda (&rest _arguments)
+                  (lambda (&rest _arguments)
                      (ert-fail "observer attempted an interactive request")))
                   ((symbol-function 'vterm-send-string)
-                   (lambda (text) (setq sent text)))
+                   (lambda (text &optional _paste-p) (setq sent text)))
                   ((symbol-function 'vterm-send-return)
                    (lambda () (setq return-sent t)))
                   ((symbol-function 'run-with-timer)
@@ -301,6 +373,107 @@
           (should return-sent))
       (delete-process (cdr terminal))
       (kill-buffer (car terminal)))))
+
+(ert-deftest magnus-codex-concurrent-tui-messages-are-serialized ()
+  (let* ((magnus-codex--input-queues (make-hash-table :test #'equal))
+         (magnus-codex--input-busy (make-hash-table :test #'equal))
+         (magnus-codex--input-retry (make-hash-table :test #'equal))
+         (magnus-codex--tui-ready (make-hash-table :test #'equal))
+         (instance (magnus-instances-create "/tmp" "queued-codex" 'codex))
+         (terminal (magnus-test--codex-tui instance))
+         timers events)
+    (puthash (magnus-instance-id instance) t magnus-codex--tui-ready)
+    (unwind-protect
+        (cl-letf (((symbol-function 'vterm-send-string)
+                   (lambda (text &optional _paste-p)
+                     (setq events (append events (list text)))))
+                  ((symbol-function 'vterm-send-return)
+                   (lambda () (setq events (append events '(return)))))
+                  ((symbol-function 'run-with-timer)
+                   (lambda (_seconds _repeat function &rest arguments)
+                     (setq timers
+                           (append timers (list (cons function arguments)))))))
+          (magnus-codex-send instance "first")
+          (magnus-codex-send instance "second")
+          (should (equal events '("first" return)))
+          (while timers
+            (let ((timer (pop timers)))
+              (apply (car timer) (cdr timer))))
+          (should (equal events '("first" return "second" return))))
+      (delete-process (cdr terminal))
+      (kill-buffer (car terminal)))))
+
+(ert-deftest magnus-codex-remote-endpoint-is-unix-only ()
+  (let ((magnus-codex-remote "ws://127.0.0.1:9000"))
+    (should-error (magnus-codex--remote-socket) :type 'user-error))
+  (let ((magnus-codex-remote "unix:///tmp/custom-codex.sock"))
+    (should (equal (magnus-codex--remote-socket)
+                   "/tmp/custom-codex.sock"))))
+
+(ert-deftest magnus-codex-stop-interrupts-active-daemon-turn ()
+  (let* ((magnus-codex--connections (make-hash-table :test #'equal))
+         (magnus-codex--active-turns (make-hash-table :test #'equal))
+         (instance (magnus-instances-create "/tmp" "interruptible" 'codex))
+         (observer (magnus-test--codex-process instance))
+         (terminal (magnus-test--codex-tui instance))
+         requested)
+    (magnus-instances-update instance :session-id "thread-stop")
+    (puthash (magnus-instance-id instance) "turn-stop"
+             magnus-codex--active-turns)
+    (unwind-protect
+        (cl-letf (((symbol-function 'magnus-codex--request)
+                   (lambda (_process method params callback)
+                     (setq requested (cons method params))
+                     (funcall callback '() nil)))
+                  ((symbol-function 'run-with-timer)
+                   (lambda (&rest _arguments) nil)))
+          (magnus-codex-stop instance)
+          (should (equal (car requested) "turn/interrupt"))
+          (should (equal (alist-get 'threadId (cdr requested)) "thread-stop"))
+          (should (equal (alist-get 'turnId (cdr requested)) "turn-stop"))
+          (should (eq (magnus-instance-status instance) 'stopped)))
+      (when (process-live-p observer) (delete-process observer))
+      (when (process-live-p (cdr terminal)) (delete-process (cdr terminal)))
+      (when (buffer-live-p (car terminal)) (kill-buffer (car terminal))))))
+
+(ert-deftest magnus-codex-stop-falls-back-to-tui-after-observer-loss ()
+  (let* ((magnus-codex--connections (make-hash-table :test #'equal))
+         (instance (magnus-instances-create "/tmp" "fallback-stop" 'codex))
+         (terminal (magnus-test--codex-tui instance))
+         sent-key)
+    (unwind-protect
+        (cl-letf (((symbol-function 'vterm-send-key)
+                   (lambda (key &rest _arguments) (setq sent-key key)))
+                  ((symbol-function 'run-with-timer)
+                   (lambda (_seconds _repeat function &rest arguments)
+                     (apply function arguments))))
+          (magnus-codex-stop instance)
+          (should (equal sent-key "C-c"))
+          (should (eq (magnus-instance-status instance) 'stopped))
+          (should-not (magnus-instance-buffer instance)))
+      (when (process-live-p (cdr terminal)) (delete-process (cdr terminal)))
+      (when (buffer-live-p (car terminal)) (kill-buffer (car terminal))))))
+
+(ert-deftest magnus-codex-stop-falls-back-before-turn-id-arrives ()
+  (let* ((magnus-codex--connections (make-hash-table :test #'equal))
+         (magnus-codex--active-turns (make-hash-table :test #'equal))
+         (instance (magnus-instances-create "/tmp" "early-stop" 'codex))
+         (observer (magnus-test--codex-process instance))
+         (terminal (magnus-test--codex-tui instance))
+         sent-key)
+    (magnus-instances-update instance :session-id "thread-early")
+    (unwind-protect
+        (cl-letf (((symbol-function 'vterm-send-key)
+                   (lambda (key &rest _arguments) (setq sent-key key)))
+                  ((symbol-function 'run-with-timer)
+                   (lambda (_seconds _repeat function &rest arguments)
+                     (apply function arguments))))
+          (magnus-codex-stop instance)
+          (should (equal sent-key "C-c"))
+          (should (eq (magnus-instance-status instance) 'stopped)))
+      (when (process-live-p observer) (delete-process observer))
+      (when (process-live-p (cdr terminal)) (delete-process (cdr terminal)))
+      (when (buffer-live-p (car terminal)) (kill-buffer (car terminal))))))
 
 (ert-deftest magnus-codex-running-state-follows-tui-not-observer ()
   (let* ((magnus-codex--connections (make-hash-table :test #'equal))
@@ -350,17 +523,43 @@
                                   (and new-terminal (car new-terminal)))))
         (when (buffer-live-p buffer) (kill-buffer buffer))))))
 
+(ert-deftest magnus-codex-stale-observer-exit-preserves-replacement-turn ()
+  (let* ((magnus-codex--connections (make-hash-table :test #'equal))
+         (magnus-codex--active-turns (make-hash-table :test #'equal))
+         (instance (magnus-instances-create "/tmp" "observer-race" 'codex))
+         (old-observer (magnus-test--codex-process instance))
+         new-observer)
+    (unwind-protect
+        (progn
+          (delete-process old-observer)
+          (setq new-observer (magnus-test--codex-process instance))
+          (puthash (magnus-instance-id instance) "replacement-turn"
+                   magnus-codex--active-turns)
+          (magnus-codex--sentinel old-observer "exited")
+          (should (eq (magnus-codex--connection instance) new-observer))
+          (should (equal
+                   (gethash (magnus-instance-id instance)
+                            magnus-codex--active-turns)
+                   "replacement-turn")))
+      (when (process-live-p old-observer) (delete-process old-observer))
+      (when (and new-observer (process-live-p new-observer))
+        (delete-process new-observer)))))
+
 (ert-deftest magnus-codex-existing-thread-goes-straight-to-tui ()
   (let* ((instance (magnus-instances-create "/tmp" "handoff-codex" 'codex))
          (process (magnus-test--codex-process instance))
-         spawned notified)
+         spawned notified methods)
     (magnus-instances-update instance :session-id "thread-existing")
     (unwind-protect
         (cl-letf (((symbol-function 'magnus-codex--request)
-                   (lambda (_process method params callback)
-                     (should (equal method "initialize"))
+                  (lambda (_process method params callback)
+                     (push method methods)
                      (should params)
-                     (funcall callback '((userAgent . "test")) nil)))
+                     (funcall callback
+                              (if (equal method "initialize")
+                                  '((userAgent . "test"))
+                                '((thread . ((id . "thread-existing")))))
+                              nil)))
                   ((symbol-function 'magnus-codex--notify)
                    (lambda (_process method &optional _params)
                      (setq notified method)))
@@ -371,35 +570,41 @@
           (should (equal (magnus-instance-session-id instance)
                          "thread-existing"))
           (should (equal notified "initialized"))
+          (should (equal (nreverse methods)
+                         '("initialize" "thread/resume")))
           (should (eq (car spawned) instance))
           (should (equal (cadr spawned) "first task")))
       (delete-process process))))
 
-(ert-deftest magnus-codex-new-tui-handoffs-are-serialized ()
-  (let* ((magnus-codex--new-thread-owner nil)
-         (magnus-codex--new-thread-queue nil)
-         (first (magnus-instances-create "/tmp" "first-tui" 'codex))
+(ert-deftest magnus-codex-new-threads-are-owned-by-their-observers ()
+  (let* ((first (magnus-instances-create "/tmp" "first-tui" 'codex))
          (second (magnus-instances-create "/tmp" "second-tui" 'codex))
          (first-process (magnus-test--codex-process first))
          (second-process (magnus-test--codex-process second))
-         spawned)
+         requests spawned)
     (unwind-protect
-        (cl-letf (((symbol-function 'magnus-codex--spawn-tui)
+        (cl-letf (((symbol-function 'magnus-codex--request)
+                   (lambda (process method params callback)
+                     (push (list process method params callback) requests)))
+                  ((symbol-function 'magnus-codex--spawn-tui)
                    (lambda (instance message)
                      (setq spawned
                            (append spawned
                                    (list (list instance message)))))))
-          (magnus-codex--start-new-thread first-process first "first")
-          (magnus-codex--start-new-thread second-process second "second")
-          (should (equal (mapcar #'car spawned) (list first)))
-          (should (= (length magnus-codex--new-thread-queue) 1))
-          (magnus-codex--handle-notification
-           first-process "thread/started"
-           '((thread . ((id . "thread-first") (cwd . "/tmp")))))
+          (magnus-codex--create-observer-thread first-process first "first")
+          (magnus-codex--create-observer-thread second-process second "second")
+          (should (= (length requests) 2))
+          (let* ((second-request (car requests))
+                 (first-request (cadr requests)))
+            (should (eq (car second-request) second-process))
+            (should (equal (cadr second-request) "thread/start"))
+            (funcall (nth 3 second-request)
+                     '((thread . ((id . "thread-second")))) nil)
+            (funcall (nth 3 first-request)
+                     '((thread . ((id . "thread-first")))) nil))
           (should (equal (magnus-instance-session-id first) "thread-first"))
-          (should (equal (mapcar #'car spawned) (list first second)))
-          (should (equal magnus-codex--new-thread-owner
-                         (magnus-instance-id second))))
+          (should (equal (magnus-instance-session-id second) "thread-second"))
+          (should (equal (mapcar #'car spawned) (list second first))))
       (delete-process first-process)
       (delete-process second-process))))
 
@@ -408,8 +613,7 @@
          (instance (magnus-instances-create directory "stopped-codex" 'codex))
          (magnus-coord-nudge-debounce nil))
     (unwind-protect
-        (cl-letf (((symbol-function 'magnus-process-running-p)
-                   (lambda (_instance) nil)))
+        (progn
           (should-not
            (magnus-coord-nudge-agent
             instance "Please tell @bold-wren later" "Magnus"))
@@ -420,6 +624,18 @@
             (should (string-match-p "Undelivered nudge" log))
             (should (string-match-p "(at) bold-wren" log))))
       (delete-directory directory t))))
+
+(ert-deftest magnus-coord-legacy-running-check-needs-no-process-module-call ()
+  (let* ((instance (magnus-instances-create "/tmp" "legacy-live" 'claude))
+         (buffer (generate-new-buffer " *magnus-legacy-live*"))
+         (process (make-pipe-process
+                   :name (generate-new-buffer-name "magnus-legacy-live")
+                   :buffer buffer :noquery t)))
+    (magnus-instances-update instance :buffer buffer :status 'running)
+    (unwind-protect
+        (should (magnus-coord--instance-running-p instance))
+      (delete-process process)
+      (kill-buffer buffer))))
 
 (ert-deftest magnus-health-check-supports-codex-output-buffers ()
   (let* ((magnus-codex--connections (make-hash-table :test #'equal))

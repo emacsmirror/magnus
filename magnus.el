@@ -157,6 +157,9 @@ Takes the working directory as argument and returns a string."
 (defvar magnus--initialized nil
   "Non-nil if magnus has been initialized.")
 
+(defvar magnus--restart-required nil
+  "Non-nil after an in-session Magnus reinstall requires an Emacs restart.")
+
 (defvar magnus--agents-index nil
   "In-memory agent expertise index.
 Alist of (DIRECTORY . ((NAME . TAGS-STRING) ...)).")
@@ -520,6 +523,9 @@ them now; new agents populate once their memory file exists."
 
 (defun magnus--ensure-initialized ()
   "Ensure magnus is initialized."
+  (when magnus--restart-required
+    (user-error
+     "Magnus was upgraded in this Emacs session; restart Emacs before use"))
   (unless magnus--initialized
     (require 'magnus-instances)
     (require 'magnus-persistence)
@@ -597,7 +603,9 @@ The agent runs to completion and exits."
   (setq magnus--initialized nil))
 
 (defun magnus--upgrade-execute ()
-  "Archive all agents, save state, and reinstall Magnus."
+  "Archive all agents, save state, and reinstall Magnus.
+The user must restart Emacs afterward so loaded struct and function definitions
+cannot be mixed across package versions."
   (let ((active (magnus-instances-active-list)))
     (when active
       (dolist (instance active)
@@ -608,13 +616,16 @@ The agent runs to completion and exits."
   (magnus-persistence-save)
   (magnus--shutdown)
   (package-reinstall 'magnus)
-  (message "Magnus upgraded. Run M-x magnus to resurrect your agents."))
+  (setq magnus--restart-required t)
+  (message
+   "Magnus upgraded. Restart Emacs, then run M-x magnus to resurrect agents."))
 
 ;;;###autoload
 (defun magnus-upgrade ()
   "Upgrade Magnus gracefully.
 Warns active agents, gives them 120 seconds to save their work,
-archives them, saves state, and reinstalls the package."
+archives them, saves state, and reinstalls the package.  Restart Emacs after
+the reinstall so live data structures are not mixed across package versions."
   (interactive)
   (magnus--ensure-initialized)
   (let ((active (magnus-instances-active-list)))
@@ -624,7 +635,8 @@ archives them, saves state, and reinstalls the package."
           (magnus-persistence-save)
           (magnus--shutdown)
           (package-reinstall 'magnus)
-          (message "Magnus upgraded. Run M-x magnus to start."))
+          (setq magnus--restart-required t)
+          (message "Magnus upgraded. Restart Emacs, then run M-x magnus."))
       ;; Warn agents
       (dolist (instance active)
         (magnus-coord-nudge-agent

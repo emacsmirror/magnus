@@ -39,7 +39,11 @@
   "Optional function called for each Codex approval request.
 The function receives INSTANCE, REQUEST-ID, METHOD, and PARAMS.  It may call
 `magnus-codex-respond-approval' immediately or later.  When nil, the request
-remains pending and is displayed in the instance buffer."
+remains pending in the hidden observer log; normal interactive approvals are
+displayed and answered by the native TUI.  Fallback observer approvals can be
+answered with `M-x magnus-codex-answer-approval'.  A delayed handler should
+capture `magnus-codex-current-approval-token' during this callback and pass it
+when responding."
   :type '(choice (const :tag "Queue for manual handling" nil)
                  (function :tag "Handler function"))
   :group 'magnus)
@@ -51,9 +55,23 @@ Magnus always supplies a small provider-neutral coordination preamble."
   :group 'magnus)
 
 (defcustom magnus-codex-remote "unix://"
-  "Remote endpoint passed to the Codex TUI.
-The default selects the managed App Server daemon's standard Unix socket."
+  "Unix-socket endpoint shared by the Codex TUI and Magnus observer.
+The default `unix://' selects the managed App Server daemon's standard socket.
+A custom local socket may be written as `unix:///absolute/path'.
+Network WebSocket endpoints are not supported by the observer."
   :type 'string
+  :group 'magnus)
+
+(defcustom magnus-codex-startup-timeout 15
+  "Seconds before an incomplete Codex observer startup is abandoned."
+  :type 'number
+  :group 'magnus)
+
+(defcustom magnus-codex-tui-ready-delay 1.0
+  "Seconds after launching the Codex command before queued input may be sent.
+This protects the login shell command from coordination messages arriving
+during startup."
+  :type 'number
   :group 'magnus)
 
 (defvar magnus-codex-event-hook nil
@@ -65,6 +83,11 @@ Functions receive INSTANCE, METHOD, and PARAMS.")
 Functions receive INSTANCE, REQUEST-ID, METHOD, and PARAMS.  Use
 `magnus-codex-respond-approval' to answer the request.")
 
+(defvar magnus-codex-current-approval-token nil
+  "Generation token dynamically bound while approval callbacks run.
+Delayed approval handlers should retain this value and pass it to
+`magnus-codex-respond-approval'.")
+
 (defvar magnus-codex--connections (make-hash-table :test #'equal)
   "Instance ID to App Server observer proxy map.")
 
@@ -74,11 +97,20 @@ Functions receive INSTANCE, REQUEST-ID, METHOD, and PARAMS.  Use
 (defvar magnus-codex--show-on-ready (make-hash-table :test #'equal)
   "Instance IDs whose TUI should be displayed after asynchronous startup.")
 
-(defvar magnus-codex--new-thread-owner nil
-  "Instance ID currently waiting for its TUI-created thread ID.")
+(defvar magnus-codex--retired-approval-ids (make-hash-table :test #'equal)
+  "Instance/request IDs retired while a delayed answer may still exist.")
 
-(defvar magnus-codex--new-thread-queue nil
-  "FIFO of (PROCESS INSTANCE INITIAL-MESSAGE) waiting to create TUI threads.")
+(defvar magnus-codex--input-queues (make-hash-table :test #'equal)
+  "Instance ID to FIFO of text waiting for serialized TUI submission.")
+
+(defvar magnus-codex--input-busy (make-hash-table :test #'equal)
+  "Instance IDs with an automated TUI submission in flight.")
+
+(defvar magnus-codex--input-retry (make-hash-table :test #'equal)
+  "Instance IDs waiting for the user to leave their TUI buffer.")
+
+(defvar magnus-codex--tui-ready (make-hash-table :test #'equal)
+  "Instance IDs whose TUI launch command has been submitted.")
 
 (defvar-local magnus-codex--instance nil
   "Magnus instance represented by the current Codex TUI buffer.")
@@ -378,22 +410,42 @@ CALLBACK receives RESULT and ERROR, exactly one of which is non-nil."
 
 (defun magnus-codex--handle-server-request (process id method params)
   "Handle server request ID METHOD PARAMS from PROCESS."
-  (let ((instance (process-get process 'magnus-codex-instance)))
-    (if (magnus-codex--approval-method-p method)
+  (let* ((instance (process-get process 'magnus-codex-instance))
+         (thread-id (alist-get 'threadId params))
+         (owned-thread (magnus-instance-session-id instance)))
+    (if (and (magnus-codex--approval-method-p method)
+             owned-thread
+             (equal thread-id owned-thread))
         (progn
-          (puthash id (list :instance instance :process process
-                            :method method :params params)
+          (let* ((key (cons (magnus-instance-id instance) id))
+                 (token (secure-hash
+                         'sha256
+                         (format "%s:%s:%s:%s" (car key) id
+                                 (float-time) (random)))))
+            (puthash id (list :instance instance :process process
+                              :method method :params params :token token
+                              :requires-token
+                              (gethash key magnus-codex--retired-approval-ids))
                    (magnus-codex--approval-table process))
+            (remhash key magnus-codex--retired-approval-ids))
           (magnus-codex--insert
            instance
            (format "\n[approval pending] %s\n%s\n"
                    method (magnus-codex--approval-summary params))
            'warning)
-          (run-hook-with-args 'magnus-codex-approval-request-hook
-                              instance id method params)
-          (when magnus-codex-approval-handler
-            (run-at-time 0 nil magnus-codex-approval-handler
-                         instance id method params)))
+          (let ((token (plist-get
+                        (gethash id (magnus-codex--approval-table process))
+                        :token)))
+            (let ((magnus-codex-current-approval-token token))
+              (run-hook-with-args 'magnus-codex-approval-request-hook
+                                  instance id method params))
+            (when magnus-codex-approval-handler
+              (let ((handler magnus-codex-approval-handler))
+                (run-at-time
+                 0 nil
+                 (lambda ()
+                   (let ((magnus-codex-current-approval-token token))
+                     (funcall handler instance id method params))))))))
       (magnus-codex--insert instance
                             (format "\n[unsupported server request] %s\n"
                                     method)
@@ -401,7 +453,7 @@ CALLBACK receives RESULT and ERROR, exactly one of which is non-nil."
       (magnus-codex--send-object
        process `((jsonrpc . "2.0") (id . ,id)
                  (error . ((code . -32601)
-                           (message . "Unsupported server request"))))))))
+                           (message . "Unsupported or misrouted server request"))))))))
 
 (defun magnus-codex--approval-summary (params)
   "Return a readable summary of approval PARAMS."
@@ -420,10 +472,30 @@ CALLBACK receives RESULT and ERROR, exactly one of which is non-nil."
                (when-let ((reason (alist-get 'reason params))) reason)))
    "\n"))
 
-(defun magnus-codex-respond-approval (instance request-id decision)
+(defun magnus-codex-approval-token (instance request-id)
+  "Return the generation token for INSTANCE's pending REQUEST-ID.
+Custom handlers that retain an approval for later should retain this token and
+pass it back to `magnus-codex-respond-approval'."
+  (when-let* ((process (magnus-codex--connection instance))
+              (entry (gethash request-id
+                              (magnus-codex--approval-table process))))
+    (plist-get entry :token)))
+
+(defun magnus-codex--command-approval-decision-p (decision)
+  "Return non-nil when DECISION has a current command approval shape."
+  (or (member decision '("accept" "acceptForSession" "decline" "cancel"))
+      (and (listp decision)
+           (or (alist-get 'acceptWithExecpolicyAmendment decision)
+               (alist-get 'applyNetworkPolicyAmendment decision)))))
+
+(defun magnus-codex-respond-approval (instance request-id decision
+                                               &optional generation-token)
   "Respond to INSTANCE approval REQUEST-ID with DECISION.
-DECISION is normally accept, acceptForSession, decline, or cancel.  A
-permission-profile request instead requires its complete response alist."
+DECISION is normally accept, acceptForSession, decline, cancel, or one of the
+structured policy-amendment decisions advertised by App Server.  A permission-
+profile request instead requires its complete response alist.
+Delayed handlers should also supply GENERATION-TOKEN, obtained from
+`magnus-codex-approval-token', so a reconnect cannot redirect their answer."
   (let* ((process (magnus-codex--connection instance))
          (table (and process (magnus-codex--approval-table process)))
          (entry (and table (gethash request-id table)))
@@ -434,13 +506,20 @@ permission-profile request instead requires its complete response alist."
                    `((decision . ,decision)))))
     (unless (and entry (eq owner instance))
       (user-error "No pending Codex approval %s for this instance" request-id))
+    (when (and (plist-get entry :requires-token)
+               (not (equal generation-token (plist-get entry :token))))
+      (user-error
+       "Approval %s was reused after reconnect; a generation token is required"
+       request-id))
+    (when (and generation-token
+               (not (equal generation-token (plist-get entry :token))))
+      (user-error "Stale Codex approval %s for this connection" request-id))
     (when (and (equal method "item/permissions/requestApproval")
                (not (and (listp decision)
                          (alist-get 'permissions decision))))
       (user-error "Permission approval requires a response alist with permissions"))
     (when (and (not (equal method "item/permissions/requestApproval"))
-               (not (member decision
-                            '("accept" "acceptForSession" "decline" "cancel"))))
+               (not (magnus-codex--command-approval-decision-p decision)))
       (user-error "Unsupported Codex approval decision: %s" decision))
     (magnus-codex--send-object
      process `((jsonrpc . "2.0") (id . ,request-id)
@@ -461,17 +540,11 @@ permission-profile request instead requires its complete response alist."
       ("item/agentMessage/delta"
        (magnus-codex--insert instance (or (alist-get 'delta params) "")))
       ("thread/started"
-       (when (and (process-get process 'magnus-codex-awaiting-tui-thread)
-                  (equal magnus-codex--new-thread-owner
-                         (magnus-instance-id instance)))
-         (when-let ((thread-id
-                     (alist-get 'id (alist-get 'thread params))))
-           (process-put process 'magnus-codex-awaiting-tui-thread nil)
-           (magnus-instances-update instance :session-id thread-id)
+       (when-let ((thread-id (alist-get 'id (alist-get 'thread params))))
+         (when (equal thread-id (magnus-instance-session-id instance))
            (magnus-codex--insert
-            instance (format "[TUI thread started: %s]\n" thread-id)
-            'font-lock-comment-face)
-           (magnus-codex--release-new-thread-owner instance))))
+            instance (format "[observer subscribed to thread: %s]\n" thread-id)
+            'font-lock-comment-face))))
       ("turn/plan/updated"
        (magnus-codex--insert instance
                              (magnus-codex--format-plan params)
@@ -525,22 +598,22 @@ permission-profile request instead requires its complete response alist."
   "Handle observer PROCESS termination EVENT."
   (unless (process-live-p process)
     (when-let ((instance (process-get process 'magnus-codex-instance)))
-      (when (process-get process 'magnus-codex-awaiting-tui-thread)
-        (process-put process 'magnus-codex-awaiting-tui-thread nil)
-        (when-let ((terminal (magnus-codex--tui-process instance)))
-          (set-process-query-on-exit-flag terminal nil)
-          (kill-process terminal))
-        (magnus-codex--release-new-thread-owner instance))
-      (when (eq process (gethash (magnus-instance-id instance)
-                                 magnus-codex--connections))
-        (remhash (magnus-instance-id instance) magnus-codex--connections))
-      (remhash (magnus-instance-id instance) magnus-codex--active-turns)
-      (magnus-codex--clear-approvals instance process)
-      ;; Once the TUI owns the thread, observer failure must not terminate or
-      ;; misreport the interactive session.  Before that handoff it is fatal.
-      (unless (or (magnus-codex--tui-process instance)
-                  (eq (magnus-instance-status instance) 'purged))
-        (magnus-instances-update instance :status 'stopped))
+      (magnus-codex--cancel-startup-timeout process)
+      (let ((current
+             (eq process (gethash (magnus-instance-id instance)
+                                  magnus-codex--connections))))
+        (when current
+          (remhash (magnus-instance-id instance) magnus-codex--connections)
+          (remhash (magnus-instance-id instance) magnus-codex--active-turns))
+        ;; Approval retirement is process-local and remains necessary even for
+        ;; a stale sentinel.  Instance-global lifecycle state is current-only.
+        (magnus-codex--clear-approvals instance process)
+        ;; Once the TUI owns the thread, observer failure must not terminate or
+        ;; misreport the interactive session.  Before that handoff it is fatal.
+        (when (and current
+                   (not (magnus-codex--tui-process instance))
+                   (not (eq (magnus-instance-status instance) 'purged)))
+          (magnus-instances-update instance :status 'stopped)))
       (unless (process-get process 'magnus-codex-intentional-stop)
         (magnus-codex--insert instance (format "\n[observer %s]" event)
                               'font-lock-comment-face))
@@ -549,40 +622,116 @@ permission-profile request instead requires its complete response alist."
         (magnus-status-refresh)))))
 
 (defun magnus-codex--clear-approvals (instance &optional process)
-  "Remove pending approvals owned by INSTANCE."
+  "Retire and remove pending approvals owned by INSTANCE."
   (when-let ((connection
               (or process
                   (gethash (magnus-instance-id instance)
                            magnus-codex--connections))))
-    (clrhash (magnus-codex--approval-table connection))))
+    (let ((table (magnus-codex--approval-table connection))
+          (instance-id (magnus-instance-id instance)))
+      (maphash
+       (lambda (request-id _entry)
+         (puthash (cons instance-id request-id) t
+                  magnus-codex--retired-approval-ids))
+       table)
+      (clrhash table))))
+
+(defun magnus-codex--default-socket ()
+  "Return the managed App Server daemon's standard Unix socket path."
+  (expand-file-name
+   "app-server-control/app-server-control.sock"
+   (or (getenv "CODEX_HOME") (expand-file-name ".codex" "~"))))
+
+(defun magnus-codex--remote-socket ()
+  "Return the Unix socket selected by `magnus-codex-remote'."
+  (cond
+   ((equal magnus-codex-remote "unix://")
+    (magnus-codex--default-socket))
+   ((string-match "\\`unix://\\(.+\\)\\'" magnus-codex-remote)
+    (let ((path (match-string 1 magnus-codex-remote)))
+      (unless (file-name-absolute-p path)
+        (user-error "Codex custom Unix socket must be absolute: %s" path))
+      path))
+   (t
+    (user-error "Magnus observer supports unix:// endpoints, not %s"
+                magnus-codex-remote))))
+
+(defun magnus-codex--socket-live-p (socket)
+  "Return non-nil when a local listener accepts connections at SOCKET."
+  (condition-case nil
+      (let ((probe (make-network-process
+                    :name "magnus-codex-socket-probe"
+                    :family 'local :service socket
+                    :coding 'binary :noquery t)))
+        (delete-process probe)
+        t)
+    (file-error nil)))
 
 (defun magnus-codex--ensure-daemon ()
-  "Ensure the managed local Codex App Server daemon is running."
+  "Ensure the selected local App Server endpoint is healthy.
+Return its Unix socket path."
   (unless (executable-find magnus-codex-executable)
     (user-error "Cannot find Codex executable: %s" magnus-codex-executable))
-  (let ((socket (expand-file-name
-                 "app-server-control/app-server-control.sock"
-                 (or (getenv "CODEX_HOME")
-                     (expand-file-name ".codex" "~")))))
-    ;; `daemon start' can wait on its management lock when invoked from a GUI
-    ;; Emacs even though the healthy daemon socket already exists.
-    (unless (file-exists-p socket)
-      (with-temp-buffer
-        (let ((status (process-file magnus-codex-executable nil t nil
-                                    "app-server" "daemon" "start")))
-          (unless (and (integerp status) (zerop status))
-            (user-error "Could not start Codex App Server daemon: %s"
-                        (string-trim (buffer-string)))))))))
+  (let ((socket (magnus-codex--remote-socket)))
+    (if (equal magnus-codex-remote "unix://")
+        (unless (magnus-codex--socket-live-p socket)
+          (with-temp-buffer
+            (let ((status (process-file magnus-codex-executable nil t nil
+                                        "app-server" "daemon" "start")))
+              (unless (and (integerp status) (zerop status)
+                           (magnus-codex--socket-live-p socket))
+                (user-error "Could not start Codex App Server daemon: %s"
+                            (string-trim (buffer-string)))))))
+      (unless (magnus-codex--socket-live-p socket)
+        (user-error "No Codex App Server is listening at %s" socket)))
+    socket))
 
-(defun magnus-codex--start-process (instance)
+(defun magnus-codex--cancel-startup-timeout (process)
+  "Cancel PROCESS's startup deadline, when present."
+  (when-let ((timer (process-get process 'magnus-codex-startup-timer)))
+    (cancel-timer timer)
+    (process-put process 'magnus-codex-startup-timer nil)))
+
+(defun magnus-codex--arm-startup-timeout (process instance)
+  "Fail PROCESS startup after the configured deadline for INSTANCE."
+  (process-put
+   process 'magnus-codex-startup-timer
+   (run-at-time
+    magnus-codex-startup-timeout nil
+    (lambda ()
+      (when (and (process-live-p process)
+                 (eq process (magnus-codex--connection instance))
+                 (not (magnus-codex--tui-process instance)))
+        (magnus-codex--insert
+         instance
+         (format "[startup timed out after %.1f seconds]\n"
+                 magnus-codex-startup-timeout)
+         'error)
+        (process-put process 'magnus-codex-intentional-stop t)
+        (delete-process process)
+        (unless (eq (magnus-instance-status instance) 'purged)
+          (magnus-instances-update instance :status 'stopped :buffer nil)))))))
+
+(defun magnus-codex--register-connection (instance process)
+  "Install PROCESS as INSTANCE's observer after retiring an older generation."
+  (let* ((id (magnus-instance-id instance))
+         (old (gethash id magnus-codex--connections)))
+    (when (and old (not (eq old process)))
+      (magnus-codex--clear-approvals instance old))
+    (puthash id process magnus-codex--connections)))
+
+(defun magnus-codex--start-process (instance socket)
   "Start INSTANCE's semantic observer proxy to the managed daemon."
   (let* ((name (format "magnus-codex-%s" (magnus-instance-id instance)))
          (stderr (get-buffer-create (format " *%s-stderr*" name)))
          (default-directory (magnus-instance-directory instance))
+         (command (append
+                   (list magnus-codex-executable "app-server" "proxy")
+                   (unless (equal socket (magnus-codex--default-socket))
+                     (list "--sock" socket))))
          (process (make-process
                    :name name
-                   :command (list magnus-codex-executable
-                                  "app-server" "proxy")
+                   :command command
                    :connection-type 'pipe
                    :coding 'binary
                    :noquery t
@@ -600,19 +749,20 @@ permission-profile request instead requires its complete response alist."
     (process-put process 'magnus-codex-frame-buffer
                  (magnus-codex--byte-string))
     (process-put process 'magnus-codex-websocket-ready nil)
-    (process-put process 'magnus-codex-input-queue nil)
     (process-put process 'magnus-codex-turn-starting nil)
-    (puthash (magnus-instance-id instance) process magnus-codex--connections)
+    (magnus-codex--register-connection instance process)
+    (magnus-codex--arm-startup-timeout process instance)
     process))
 
 (defun magnus-codex-start (instance &optional initial-message)
   "Start or resume Codex INSTANCE in a TUI.
 INITIAL-MESSAGE, when non-nil, is submitted by the TUI as its first prompt."
-  (when (magnus-codex--connection instance)
+  (when (or (magnus-codex--connection instance)
+            (magnus-codex--tui-process instance))
     (user-error "Codex instance `%s' is already running"
                 (magnus-instance-name instance)))
-  (magnus-codex--ensure-daemon)
-  (let ((process (magnus-codex--start-process instance)))
+  (let* ((socket (magnus-codex--ensure-daemon))
+         (process (magnus-codex--start-process instance socket)))
     (process-put process 'magnus-codex-on-open
                  (lambda ()
                    (magnus-codex--initialize
@@ -636,56 +786,66 @@ INITIAL-MESSAGE, when non-nil, is submitted by the TUI as its first prompt."
            (delete-process process))
        (magnus-codex--notify process "initialized")
        (if (magnus-instance-session-id instance)
-           (progn
-             (magnus-codex--insert
-              instance
-              (format "[handing saved thread to TUI: %s]\n"
-                      (magnus-instance-session-id instance))
-              'font-lock-comment-face)
-             (magnus-codex--spawn-tui instance initial-message))
-         (magnus-codex--start-new-thread
+           (magnus-codex--resume-observer-thread
+            process instance initial-message)
+         (magnus-codex--create-observer-thread
           process instance initial-message))))))
 
-(defun magnus-codex--start-new-thread (process instance initial-message)
-  "Launch a new TUI-owned thread, serializing its identity handoff."
-  (if magnus-codex--new-thread-owner
-      (setq magnus-codex--new-thread-queue
-            (append magnus-codex--new-thread-queue
-                    (list (list process instance initial-message))))
-    (setq magnus-codex--new-thread-owner (magnus-instance-id instance))
-    (process-put process 'magnus-codex-awaiting-tui-thread t)
-    (magnus-codex--spawn-tui
-     instance (magnus-codex--onboarding-prompt instance initial-message))))
+(defun magnus-codex--startup-failed (process instance phase error)
+  "Record startup ERROR during PHASE and stop observer PROCESS for INSTANCE."
+  (magnus-codex--insert instance (format "[%s failed] %s\n" phase error) 'error)
+  (when (process-live-p process)
+    (delete-process process)))
+
+(defun magnus-codex--create-observer-thread (process instance initial-message)
+  "Create and subscribe PROCESS to a new thread before opening INSTANCE's TUI."
+  (magnus-codex--request
+   process "thread/start"
+   `((cwd . ,(magnus-instance-directory instance))
+     (developerInstructions . ,(magnus-codex--instructions instance)))
+   (lambda (result error)
+     (cond
+      (error
+       (magnus-codex--startup-failed process instance "thread/start" error))
+      ((not (eq process (magnus-codex--connection instance))) nil)
+      (t
+       (let ((thread-id (alist-get 'id (alist-get 'thread result))))
+         (if (not thread-id)
+             (magnus-codex--startup-failed
+              process instance "thread/start" "response contained no thread ID")
+           (magnus-instances-update instance :session-id thread-id)
+           (magnus-codex--insert
+            instance (format "[observer created thread: %s]\n" thread-id)
+            'font-lock-comment-face)
+           (magnus-codex--spawn-tui
+            instance (magnus-codex--onboarding-prompt
+                      instance initial-message)))))))))
+
+(defun magnus-codex--resume-observer-thread (process instance initial-message)
+  "Subscribe PROCESS to INSTANCE's saved thread before opening its TUI."
+  (let ((thread-id (magnus-instance-session-id instance)))
+    (magnus-codex--request
+     process "thread/resume" `((threadId . ,thread-id))
+     (lambda (_result error)
+       (cond
+        (error
+         (magnus-codex--startup-failed process instance "thread/resume" error))
+        ((not (eq process (magnus-codex--connection instance))) nil)
+        (t
+         (magnus-codex--insert
+          instance (format "[observer resumed thread: %s]\n" thread-id)
+          'font-lock-comment-face)
+         (magnus-codex--spawn-tui instance initial-message)))))))
 
 (defun magnus-codex--onboarding-prompt (instance &optional initial-message)
   "Return durable first-turn onboarding for INSTANCE and INITIAL-MESSAGE.
-Remote TUI-created threads do not reliably honor CLI developer-instruction
-overrides, so the den contract is made visible and persistent in history."
+The den contract is also made visible and persistent in user history."
   (concat
    (magnus-codex--instructions instance)
    (if initial-message
        (concat "\n\nInitial task from the user:\n" initial-message)
      (concat "\n\nNo separate task was supplied. Complete your orientation, "
              "report that you are ready, and then wait for the user."))))
-
-(defun magnus-codex--release-new-thread-owner (instance)
-  "Release INSTANCE's new-thread handoff lock and start the next TUI."
-  (when (equal magnus-codex--new-thread-owner
-               (magnus-instance-id instance))
-    (setq magnus-codex--new-thread-owner nil)
-    (magnus-codex--start-next-new-thread)))
-
-(defun magnus-codex--start-next-new-thread ()
-  "Start the next valid queued new Codex TUI, if any."
-  (let (entry)
-    (while (and magnus-codex--new-thread-queue (not entry))
-      (let ((candidate (pop magnus-codex--new-thread-queue)))
-        (when (and (process-live-p (car candidate))
-                   (not (eq (magnus-instance-status (cadr candidate))
-                            'purged)))
-          (setq entry candidate))))
-    (when entry
-      (apply #'magnus-codex--start-new-thread entry))))
 
 (defun magnus-codex--tui-command (instance &optional initial-message)
   "Return the shell command used to run INSTANCE's new or resumed TUI.
@@ -707,6 +867,9 @@ INITIAL-MESSAGE becomes the optional initial prompt."
          (default-directory (magnus-instance-directory instance))
          (buffer (magnus-process--create-vterm-buffer buffer-name))
          (command (magnus-codex--tui-command instance initial-message)))
+    (when-let ((observer (magnus-codex--connection instance)))
+      (magnus-codex--cancel-startup-timeout observer))
+    (remhash (magnus-instance-id instance) magnus-codex--tui-ready)
     (with-current-buffer buffer
       (setq-local magnus-codex--instance instance))
     ;; A freshly created vterm may still be initializing its login shell.  Give
@@ -722,7 +885,16 @@ INITIAL-MESSAGE becomes the optional initial prompt."
      (lambda ()
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
-           (vterm-send-return)))))
+           (vterm-send-return))
+         (run-with-timer
+          magnus-codex-tui-ready-delay nil
+          (lambda ()
+            (when (and (buffer-live-p buffer)
+                       (eq buffer (magnus-instance-buffer instance))
+                       (magnus-codex--tui-process instance))
+              (puthash (magnus-instance-id instance) t
+                       magnus-codex--tui-ready)
+              (magnus-codex--drain-input-queue instance)))))))
     (magnus-instances-update instance :buffer buffer :status 'running)
     (magnus-codex--setup-tui-sentinel instance buffer)
     (when (gethash (magnus-instance-id instance) magnus-codex--show-on-ready)
@@ -753,10 +925,14 @@ INITIAL-MESSAGE becomes the optional initial prompt."
                     (eq terminal
                         (get-buffer-process
                          (magnus-instance-buffer instance))))
-           (when (and (null (magnus-instance-session-id instance))
-                      (equal magnus-codex--new-thread-owner
-                             (magnus-instance-id instance)))
-             (magnus-codex--release-new-thread-owner instance))
+           (remhash (magnus-instance-id instance) magnus-codex--tui-ready)
+           (remhash (magnus-instance-id instance) magnus-codex--input-busy)
+           (when-let ((timer
+                       (gethash (magnus-instance-id instance)
+                                magnus-codex--input-retry)))
+             (cancel-timer timer))
+           (remhash (magnus-instance-id instance) magnus-codex--input-retry)
+           (remhash (magnus-instance-id instance) magnus-codex--input-queues)
            (unless (eq (magnus-instance-status instance) 'purged)
              (magnus-instances-update instance :status 'stopped))
            (when (and (boundp 'magnus-buffer-name)
@@ -836,56 +1012,164 @@ INITIAL-MESSAGE becomes the optional initial prompt."
 
 (defun magnus-codex-send (instance text)
   "Submit TEXT through INSTANCE's Codex TUI.
-The semantic observer never starts or steers turns; this keeps the TUI as the
-only interactive writer and lets Codex apply its native input semantics."
+Messages are serialized so concurrent coordination deliveries cannot merge.
+The semantic observer never starts or steers turns; the TUI remains the only
+interactive writer and Codex applies its native input semantics."
   (let ((buffer (magnus-instance-buffer instance)))
     (unless (and (buffer-live-p buffer) (magnus-codex--tui-process instance))
       (user-error "Codex instance `%s' is not running"
                   (magnus-instance-name instance)))
-    (with-current-buffer buffer
-      (vterm-send-string text))
-    (run-with-timer
-     0.1 nil
-     (lambda ()
-       (when (and (buffer-live-p buffer)
-                  (process-live-p (get-buffer-process buffer)))
-         (with-current-buffer buffer
-           (vterm-send-return)))))))
+    (let* ((id (magnus-instance-id instance))
+           (queue (gethash id magnus-codex--input-queues)))
+      (puthash id (append queue (list text)) magnus-codex--input-queues)
+      (magnus-codex--drain-input-queue instance))))
+
+(defun magnus-codex--drain-input-queue (instance)
+  "Submit the next queued TUI message for INSTANCE, if it is safe to do so."
+  (let* ((id (magnus-instance-id instance))
+         (buffer (magnus-instance-buffer instance))
+         (queue (gethash id magnus-codex--input-queues)))
+    (when (and queue
+               (gethash id magnus-codex--tui-ready)
+               (not (gethash id magnus-codex--input-busy))
+               (buffer-live-p buffer)
+               (magnus-codex--tui-process instance))
+      (if (eq buffer (window-buffer (selected-window)))
+          ;; Never append to or submit a composer while the user is actively in
+          ;; that TUI.  Retry once they move away.
+          (unless (gethash id magnus-codex--input-retry)
+            (puthash
+             id
+             (run-with-timer
+              1.0 nil
+              (lambda ()
+                (remhash id magnus-codex--input-retry)
+                (magnus-codex--drain-input-queue instance)))
+             magnus-codex--input-retry))
+        (let ((text (car queue)))
+          (puthash id (cdr queue) magnus-codex--input-queues)
+          (puthash id t magnus-codex--input-busy)
+          ;; Bracketed paste and Return are emitted in one Emacs event, so user
+          ;; keystrokes cannot interleave two Magnus deliveries.
+          (with-current-buffer buffer
+            (vterm-send-string text t)
+            (vterm-send-return))
+          (run-with-timer
+           0.1 nil
+           (lambda ()
+             (remhash id magnus-codex--input-busy)
+             (magnus-codex--drain-input-queue instance))))))))
 
 (defun magnus-codex-steer (instance text &optional _expected-turn-id)
   "Submit TEXT through INSTANCE's TUI using Codex's native active-turn UI."
   (magnus-codex-send instance text))
 
 (defun magnus-codex-interrupt (instance)
-  "Interrupt the active turn through Codex INSTANCE's TUI."
-  (let ((buffer (magnus-instance-buffer instance)))
+  "Interrupt Codex INSTANCE semantically, falling back to its TUI."
+  (let* ((buffer (magnus-instance-buffer instance))
+         (process (magnus-codex--connection instance))
+         (thread-id (magnus-instance-session-id instance))
+         (turn-id (gethash (magnus-instance-id instance)
+                           magnus-codex--active-turns)))
     (unless (and (buffer-live-p buffer) (magnus-codex--tui-process instance))
       (user-error "Codex instance `%s' is not running"
                   (magnus-instance-name instance)))
-    (with-current-buffer buffer
-      (vterm-send-key "C-c"))))
+    (if (and process thread-id turn-id)
+        (magnus-codex--request
+         process "turn/interrupt"
+         `((threadId . ,thread-id) (turnId . ,turn-id))
+         (lambda (_result error)
+           (when error
+             (magnus-codex--insert
+              instance (format "[turn/interrupt failed] %s\n" error) 'error))))
+      (with-current-buffer buffer
+        (vterm-send-key "C-c")))))
+
+(defun magnus-codex--finalize-stop (instance observer buffer force)
+  "Close INSTANCE's captured OBSERVER and BUFFER after semantic shutdown.
+FORCE selects immediate process killing."
+  (when observer
+    ;; Retire request IDs before deleting or replacing this connection; its
+    ;; sentinel may run after a new observer has already received reused IDs.
+    (magnus-codex--clear-approvals instance observer)
+    (process-put observer 'magnus-codex-intentional-stop t)
+    (when (process-live-p observer)
+      (if force (kill-process observer) (delete-process observer))))
+  (when (buffer-live-p buffer)
+    (when-let ((terminal (get-buffer-process buffer)))
+      (set-process-query-on-exit-flag terminal nil)
+      (when (process-live-p terminal)
+        (if force (kill-process terminal) (delete-process terminal))))
+    (kill-buffer buffer))
+  (let* ((id (magnus-instance-id instance))
+         (current-observer (gethash id magnus-codex--connections))
+         (semantic-current
+          (or (null current-observer) (eq observer current-observer)))
+         (current-buffer (magnus-instance-buffer instance))
+         (ui-current (or (eq buffer current-buffer) (null current-buffer))))
+    (when semantic-current
+      (remhash id magnus-codex--connections))
+    (when semantic-current
+      (remhash id magnus-codex--active-turns))
+    (when ui-current
+      (remhash id magnus-codex--show-on-ready)
+      (remhash id magnus-codex--tui-ready)
+      (remhash id magnus-codex--input-busy)
+      (when-let ((timer (gethash id magnus-codex--input-retry)))
+        (cancel-timer timer))
+      (remhash id magnus-codex--input-retry)
+      (remhash id magnus-codex--input-queues))
+    (when (and semantic-current ui-current
+               (not (eq (magnus-instance-status instance) 'purged)))
+      (magnus-instances-update instance :status 'stopped :buffer nil))))
 
 (defun magnus-codex-stop (instance &optional force)
   "Stop Codex INSTANCE's TUI and observer, never the shared daemon.
-When FORCE is non-nil, kill subprocesses immediately."
-  (let ((buffer (magnus-instance-buffer instance)))
-    (when-let ((observer (magnus-codex--connection instance)))
-      (process-put observer 'magnus-codex-intentional-stop t)
-      (if force (kill-process observer) (delete-process observer)))
-    (when (buffer-live-p buffer)
-      (when-let ((terminal (get-buffer-process buffer)))
-        (set-process-query-on-exit-flag terminal nil)
-        (when (process-live-p terminal)
-          (if force (kill-process terminal) (delete-process terminal))))
-      (kill-buffer buffer)))
-  (remhash (magnus-instance-id instance) magnus-codex--connections)
-  (remhash (magnus-instance-id instance) magnus-codex--active-turns)
-  (remhash (magnus-instance-id instance) magnus-codex--show-on-ready)
-  (setq magnus-codex--new-thread-queue
-        (cl-remove-if (lambda (entry) (eq (cadr entry) instance))
-                      magnus-codex--new-thread-queue))
-  (magnus-codex--release-new-thread-owner instance)
-  (magnus-instances-update instance :status 'stopped :buffer nil))
+When a turn is active, request `turn/interrupt' before closing the clients.
+FORCE shortens the bounded grace period and kills local subprocesses."
+  (let* ((observer (magnus-codex--connection instance))
+         (buffer (magnus-instance-buffer instance))
+         (thread-id (magnus-instance-session-id instance))
+         (turn-id (gethash (magnus-instance-id instance)
+                           magnus-codex--active-turns))
+         (finished nil))
+    (unless (eq (magnus-instance-status instance) 'purged)
+      (magnus-instances-update instance :status 'stopped))
+    (cl-labels
+        ((finish ()
+           (unless finished
+             (setq finished t)
+             (magnus-codex--finalize-stop
+              instance observer buffer force)))
+         (tui-fallback ()
+           (if (and (buffer-live-p buffer)
+                    (magnus-codex--tui-process instance))
+               (progn
+                 (with-current-buffer buffer
+                   (vterm-send-key "C-c"))
+                 (run-with-timer (if force 0.1 0.5) nil #'finish))
+             (finish))))
+      (if (and observer thread-id turn-id)
+          (condition-case err
+              (progn
+                (magnus-codex--request
+                 observer "turn/interrupt"
+                 `((threadId . ,thread-id) (turnId . ,turn-id))
+                 (lambda (_result error)
+                   (when error
+                     (magnus-codex--insert
+                      instance (format "[turn/interrupt failed] %s\n" error)
+                      'error))
+                   (if error (tui-fallback) (finish))))
+                (run-with-timer (if force 0.1 0.75) nil #'finish))
+            (error
+             (magnus-codex--insert
+              instance
+              (format "[could not request turn interruption] %s\n"
+                      (error-message-string err))
+              'error)
+             (tui-fallback)))
+        (tui-fallback)))))
 
 (defun magnus-codex-running-p (instance)
   "Return non-nil when Codex INSTANCE has a live interactive TUI."
@@ -931,7 +1215,8 @@ Normal interactive approvals are owned and rendered by the TUI itself."
        magnus-codex--instance request-id
        (completing-read
         "Decision: "
-        '("accept" "acceptForSession" "decline" "cancel") nil t)))))
+        '("accept" "acceptForSession" "decline" "cancel") nil t)
+       (plist-get entry :token)))))
 
 (magnus-provider-register
  'codex
