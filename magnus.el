@@ -49,6 +49,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'magnus-instances)
 
 (declare-function magnus-persistence-load "magnus-persistence")
 (declare-function magnus-persistence--setup-autosave "magnus-persistence")
