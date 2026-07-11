@@ -173,12 +173,14 @@ When CLEAR-BUFFER is non-nil, also erase rendered content and overlays."
                 (setq magnus-trace--last-line-count 0))))))
       (let ((jsonl-file
              (when session-id
-               (if (and (equal session-id magnus-trace--session-id)
-                        magnus-trace--jsonl-file
-                        (file-exists-p magnus-trace--jsonl-file))
-                   magnus-trace--jsonl-file
-                 (if external
-                     (magnus-provider-call instance 'trace-file)
+               (if external
+                   ;; External providers may rotate files while preserving a
+                   ;; stable session ID, so let the provider resolve each time.
+                   (magnus-provider-call instance 'trace-file)
+                 (if (and (equal session-id magnus-trace--session-id)
+                          magnus-trace--jsonl-file
+                          (file-exists-p magnus-trace--jsonl-file))
+                     magnus-trace--jsonl-file
                    (magnus-process--session-jsonl-path
                     directory session-id))))))
         (if (and jsonl-file (file-exists-p jsonl-file))

@@ -33,11 +33,13 @@
       (kill-buffer (car terminal)))))
 
 (defun magnus-test--write-codex-rollout
-    (root id directory prompt &optional parent-thread-id padding)
+    (root id directory prompt &optional parent-thread-id padding session-id date)
   "Write a test Codex rollout under ROOT for ID, DIRECTORY, and PROMPT.
 PARENT-THREAD-ID marks the record as a subagent when non-nil.
-PADDING adds an unrelated record before the first user message."
-  (let* ((date-directory (expand-file-name "2026/07/11" root))
+PADDING adds an unrelated record before the first user message.
+SESSION-ID defaults to ID; a different value models a resumed rollout.
+DATE defaults to the original deterministic test fixture date."
+  (let* ((date-directory (expand-file-name (or date "2026/07/11") root))
          (file (expand-file-name (format "rollout-test-%s.jsonl" id)
                                  date-directory)))
     (make-directory date-directory t)
@@ -45,7 +47,8 @@ PADDING adds an unrelated record before the first user message."
       (insert
        (json-encode
         `((type . "session_meta")
-          (payload . ((id . ,id) (session_id . ,id)
+          (payload . ((id . ,id)
+                      (session_id . ,(or session-id id))
                       (parent_thread_id . ,parent-thread-id)
                       (cwd . ,directory)))))
        "\n"
@@ -205,7 +208,7 @@ PADDING adds an unrelated record before the first user message."
   (let* ((home (make-temp-file "magnus-codex-home-" t))
          (other-home (make-temp-file "magnus-codex-other-home-" t))
          (process-environment (copy-sequence process-environment))
-         (magnus-codex--session-file-cache (make-hash-table :test #'equal))
+         (magnus-codex--trace-file-cache (make-hash-table :test #'equal))
          (instance (magnus-instances-create "/tmp" "old-codex" 'codex))
          (session-id "019f-old-session")
          (directory (expand-file-name "sessions/2024/01/02" home))
@@ -231,6 +234,46 @@ PADDING adds an unrelated record before the first user message."
           (should (equal (magnus-codex-trace-file instance) other-file)))
       (delete-directory home t)
       (delete-directory other-home t))))
+
+(ert-deftest magnus-codex-trace-follows-resumed-rollout ()
+  (let* ((home (make-temp-file "magnus-codex-resumed-trace-" t))
+         (sessions-root (expand-file-name "sessions" home))
+         (process-environment (copy-sequence process-environment))
+         (magnus-codex--trace-file-cache (make-hash-table :test #'equal))
+         (instance (magnus-instances-create "/tmp/project" "winter-codex"
+                                            'codex))
+         (session-id "019f-stable-thread")
+         root-file continuation-file)
+    (unwind-protect
+        (progn
+          (setenv "CODEX_HOME" home)
+          (setq root-file
+                (magnus-test--write-codex-rollout
+                 sessions-root session-id "/tmp/project" "root turn"
+                 nil nil nil "2024/01/02"))
+          (magnus-instances-update instance :session-id session-id)
+          (with-temp-buffer
+            (magnus-trace-mode)
+            (setq magnus-trace--instance instance)
+            (magnus-trace-refresh)
+            (should (equal magnus-trace--jsonl-file root-file))
+            ;; A resume keeps SESSION-ID in metadata but gives the rollout a
+            ;; new filename ID.  The still-live root cache must not conceal it.
+            (let* ((recent-directory
+                    (car (magnus-codex--session-directories)))
+                   (recent-date
+                    (file-relative-name recent-directory sessions-root)))
+              (setq continuation-file
+                    (magnus-test--write-codex-rollout
+                     sessions-root "019f-continuation" "/tmp/project"
+                     "resumed turn" nil nil session-id recent-date)))
+            (set-file-times continuation-file
+                            (time-add (current-time) (seconds-to-time 5)))
+            (magnus-trace-refresh)
+            (should (equal magnus-trace--jsonl-file continuation-file))
+            (should (string-match-p "resumed turn" (buffer-string)))
+            (should-not (string-match-p "root turn" (buffer-string)))))
+      (delete-directory home t))))
 
 (ert-deftest magnus-codex-trace-normalizes-only-visible-events ()
   (let* ((instance (magnus-instances-create "/tmp" "trace-codex" 'codex))

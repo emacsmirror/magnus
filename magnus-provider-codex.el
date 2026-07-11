@@ -54,8 +54,14 @@ arriving during startup."
 (defconst magnus-codex--session-scan-limit (* 1024 1024)
   "Maximum rollout bytes inspected while identifying a new session.")
 
+(defconst magnus-codex--metadata-scan-limit (* 64 1024)
+  "Maximum rollout bytes inspected while reading session metadata.")
+
 (defvar magnus-codex--session-file-cache (make-hash-table :test #'equal)
-  "Codex session-root/session-ID keys to verified rollout file paths.")
+  "Codex session-root/session-ID keys to captured root rollout paths.")
+
+(defvar magnus-codex--trace-file-cache (make-hash-table :test #'equal)
+  "Codex session-root/session-ID keys to active trace rollout state.")
 
 (defvar-local magnus-codex--instance nil
   "Magnus instance represented by the current Codex TUI buffer.")
@@ -125,6 +131,44 @@ arriving during startup."
       (file-error
        (equal (directory-file-name (expand-file-name first))
               (directory-file-name (expand-file-name second)))))))
+
+(defun magnus-codex--rollout-session-id (file)
+  "Return the stable session ID from FILE's first metadata record."
+  (condition-case nil
+      (with-temp-buffer
+        (insert-file-contents file nil 0 magnus-codex--metadata-scan-limit)
+        (goto-char (point-min))
+        (let* ((metadata (magnus-codex--read-json-line))
+               (payload (and (equal (alist-get 'type metadata) "session_meta")
+                             (alist-get 'payload metadata))))
+          (alist-get 'session_id payload)))
+    (error
+     ;; A newly created continuation may not have a complete first line yet.
+     nil)))
+
+(defun magnus-codex--file-modification-time (file)
+  "Return FILE's modification time, or the epoch when FILE vanished."
+  (condition-case nil
+      (or (file-attribute-modification-time (file-attributes file))
+          (seconds-to-time 0))
+    (file-error (seconds-to-time 0))))
+
+(defun magnus-codex--scan-trace-rollouts (files session-id after)
+  "Scan FILES for the newest SESSION-ID rollout modified at or after AFTER.
+Return a cons of the matching file and the latest modification time seen."
+  (let (matching matching-time (latest-time after))
+    (dolist (file files)
+      (let ((modified (magnus-codex--file-modification-time file)))
+        (when (or (null latest-time) (time-less-p latest-time modified))
+          (setq latest-time modified))
+        (when (and (or (null after) (not (time-less-p modified after)))
+                   (equal (magnus-codex--rollout-session-id file) session-id)
+                   (or (null matching-time)
+                       (time-less-p matching-time modified)
+                       (and (not (time-less-p modified matching-time))
+                            (string> file matching))))
+          (setq matching file matching-time modified))))
+    (cons matching latest-time)))
 
 (defun magnus-codex--session-id-from-file (file directory prompt)
   "Return FILE's top-level Codex session ID for DIRECTORY and PROMPT.
@@ -494,24 +538,54 @@ FORCE kills the terminal immediately; otherwise interrupt before closing it."
   (pop-to-buffer (magnus-instance-buffer instance)))
 
 (defun magnus-codex-trace-file (instance)
-  "Return the rollout JSONL file for Codex INSTANCE, or nil."
+  "Return the newest rollout JSONL file for Codex INSTANCE, or nil.
+Root rollout filenames contain the stable session ID, but continuation
+filenames contain a new per-launch ID.  Continuations are therefore matched
+through their first `session_meta.session_id' record."
   (when-let ((session-id (magnus-instance-session-id instance)))
     (let* ((root (magnus-codex--session-root))
            (cache-key (cons root session-id))
-           (cached (gethash cache-key magnus-codex--session-file-cache)))
-      (if (and cached (file-exists-p cached))
-          cached
-        (remhash cache-key magnus-codex--session-file-cache)
-        (when (file-directory-p root)
-          (when-let ((file
-                      (car
-                       (directory-files-recursively
-                        root
-                        (concat "rollout-.*-"
-                                (regexp-quote session-id)
-                                "\\.jsonl\\'")))))
-            (puthash cache-key file magnus-codex--session-file-cache)
-            file))))))
+           (state (gethash cache-key magnus-codex--trace-file-cache))
+           (cached (plist-get state :file))
+           (scan-time (plist-get state :scan-time)))
+      (unless (and cached (file-exists-p cached))
+        (setq cached nil scan-time nil)
+        (remhash cache-key magnus-codex--trace-file-cache))
+      (when (file-directory-p root)
+        (let* ((files
+                (condition-case nil
+                    (if cached
+                        ;; A continuation is always created in a current date
+                        ;; directory.  Full traversal is only needed once.
+                        (magnus-codex--session-files)
+                      (directory-files-recursively
+                       root "rollout-.*\\.jsonl\\'"))
+                  (file-error nil)))
+               (root-pattern
+                (concat "-" (regexp-quote session-id) "\\.jsonl\\'"))
+               (filename-root
+                (and (not cached)
+                     (cl-find-if
+                      (lambda (file) (string-match-p root-pattern file))
+                      files)))
+               (fallback (or cached filename-root))
+               (threshold
+                (or scan-time
+                    (and fallback
+                         (magnus-codex--file-modification-time fallback))))
+               (scan (magnus-codex--scan-trace-rollouts
+                      files session-id threshold))
+               (matching (car scan))
+               (selected (or matching fallback))
+               (latest-time (cdr scan)))
+          (if selected
+              (progn
+                (puthash cache-key
+                         (list :file selected :scan-time latest-time)
+                         magnus-codex--trace-file-cache)
+                selected)
+            (remhash cache-key magnus-codex--trace-file-cache)
+            nil))))))
 
 (defun magnus-codex--canonical-trace-entry (role timestamp text)
   "Build a shared trace entry for ROLE, TIMESTAMP, and TEXT."
