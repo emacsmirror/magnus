@@ -208,6 +208,47 @@
           (should-not (process-get process 'magnus-codex-input-queue)))
       (delete-process process))))
 
+(ert-deftest magnus-codex-inline-input-preserves-draft-during-output ()
+  (let* ((instance (magnus-instances-create "/tmp" "inline-codex" 'codex))
+         (buffer (magnus-codex--buffer instance)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (goto-char (point-max))
+          (insert "unfinished draft")
+          (magnus-codex--insert instance "streamed output\n")
+          (should
+           (equal (buffer-substring-no-properties
+                   magnus-codex--input-marker (point-max))
+                  "unfinished draft"))
+          (should
+           (string-match-p
+            "streamed output"
+            (buffer-substring-no-properties
+             (point-min) magnus-codex--prompt-marker))))
+      (kill-buffer buffer))))
+
+(ert-deftest magnus-codex-inline-input-submits-with-return-command ()
+  (let* ((instance (magnus-instances-create "/tmp" "submit-codex" 'codex))
+         (buffer (magnus-codex--buffer instance))
+         sent)
+    (unwind-protect
+        (with-current-buffer buffer
+          (should (eq (key-binding (kbd "x"))
+                      'magnus-codex-self-insert))
+          (should (eq (key-binding (kbd "RET"))
+                      'magnus-codex-submit-input))
+          (goto-char (point-max))
+          (insert "hello wise-deer")
+          (cl-letf (((symbol-function 'magnus-codex-send)
+                     (lambda (_instance text) (setq sent text))))
+            (magnus-codex-submit-input))
+          (should (equal sent "hello wise-deer"))
+          (should
+           (string-empty-p
+            (buffer-substring-no-properties
+             magnus-codex--input-marker (point-max)))))
+      (kill-buffer buffer))))
+
 (ert-deftest magnus-coord-stopped-agent-nudge-is-logged-not-signaled ()
   (let* ((directory (make-temp-file "magnus-stopped-nudge-" t))
          (instance (magnus-instances-create directory "stopped-codex" 'codex))

@@ -49,8 +49,10 @@ This requires a `codex` executable with `codex app-server` support. Customize
 its path with `magnus-codex-executable`. App Server connections use stdio and
 are restarted transparently when a saved Codex thread is revisited.
 
-Inside a Codex buffer, press `m` to send, `a` to answer a pending command/file
-approval, and `C-c C-k` to interrupt the active turn. Messages received while
+Inside a Codex buffer, type directly at the `> ` prompt and press `RET` to
+send. Use `C-c a` to answer a pending command/file approval, `C-c m` for
+minibuffer-based message entry, and `C-c C-k` to interrupt the active turn.
+Messages received while
 a turn is active queue for the next turn by default, matching Claude/vterm
 behavior and preventing a casual coordination nudge from redirecting work in
 progress. Set `magnus-codex-active-turn-delivery` to `steer` for immediate

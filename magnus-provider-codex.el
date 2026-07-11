@@ -72,17 +72,61 @@ Functions receive INSTANCE, REQUEST-ID, METHOD, and PARAMS.  Use
 (defvar-local magnus-codex--instance nil
   "Codex instance represented by the current output buffer.")
 
-(define-derived-mode magnus-codex-mode special-mode "Magnus-Codex"
+(defvar-local magnus-codex--prompt-marker nil
+  "Marker at the beginning of the inline Codex prompt.")
+
+(defvar-local magnus-codex--input-marker nil
+  "Marker at the beginning of editable inline Codex input.")
+
+(defun magnus-codex-enable-inline-input ()
+  "Protect the current transcript and add an editable inline prompt."
+  (interactive)
+  (let ((inhibit-read-only t))
+    (setq buffer-read-only nil)
+    (unless (and (markerp magnus-codex--prompt-marker)
+                 (marker-position magnus-codex--prompt-marker)
+                 (markerp magnus-codex--input-marker)
+                 (marker-position magnus-codex--input-marker))
+      (add-text-properties
+       (point-min) (point-max)
+       '(read-only t rear-nonsticky (read-only face)))
+      (goto-char (point-max))
+      (unless (bolp)
+        (insert (propertize "\n" 'read-only t)))
+      (let ((prompt-start (point)))
+        (insert (propertize "> "
+                            'read-only t
+                            'face 'font-lock-keyword-face
+                            'front-sticky '(read-only face)
+                            'rear-nonsticky '(read-only face)))
+        (setq magnus-codex--prompt-marker
+              (copy-marker prompt-start t))
+        (setq magnus-codex--input-marker (copy-marker (point) nil))))
+    (goto-char (point-max))))
+
+(define-derived-mode magnus-codex-mode fundamental-mode "Magnus-Codex"
   "Major mode for streamed Codex App Server output."
   :group 'magnus
+  (setq buffer-read-only nil)
   (setq-local truncate-lines nil)
-  (setq-local word-wrap t))
+  (setq-local word-wrap t)
+  (magnus-codex-enable-inline-input))
 
 (let ((map magnus-codex-mode-map))
-  (define-key map (kbd "m") #'magnus-codex-send-message)
-  (define-key map (kbd "a") #'magnus-codex-answer-approval)
-  (define-key map (kbd "C-c C-c") #'magnus-codex-send-message)
-  (define-key map (kbd "C-c C-k") #'magnus-codex-interrupt-current))
+  ;; Older builds derived this mode from `special-mode'; reset the parent so
+  ;; reloading the provider makes printable keys self-insert immediately.
+  (set-keymap-parent map nil)
+  (define-key map (kbd "C-c m") #'magnus-codex-send-message)
+  (define-key map (kbd "C-c a") #'magnus-codex-answer-approval)
+  (define-key map (kbd "RET") #'magnus-codex-submit-input)
+  (define-key map (kbd "<return>") #'magnus-codex-submit-input)
+  (define-key map (kbd "C-c C-c") #'magnus-codex-submit-input)
+  (define-key map (kbd "C-c C-k") #'magnus-codex-interrupt-current)
+  (define-key map (kbd "DEL") #'magnus-codex-backward-delete)
+  (define-key map (kbd "<backspace>") #'magnus-codex-backward-delete)
+  (define-key map (kbd "C-a") #'magnus-codex-beginning-of-input)
+  (define-key map [remap self-insert-command] #'magnus-codex-self-insert)
+  (define-key map [remap yank] #'magnus-codex-yank))
 
 (defun magnus-codex--buffer (instance)
   "Create or return the output buffer for INSTANCE."
@@ -96,9 +140,16 @@ Functions receive INSTANCE, REQUEST-ID, METHOD, and PARAMS.  Use
         (setq-local magnus-codex--instance instance)
         (let ((inhibit-read-only t))
           (erase-buffer)
+          (when (markerp magnus-codex--prompt-marker)
+            (set-marker magnus-codex--prompt-marker nil))
+          (when (markerp magnus-codex--input-marker)
+            (set-marker magnus-codex--input-marker nil))
+          (setq magnus-codex--prompt-marker nil
+                magnus-codex--input-marker nil)
           (insert (format "Codex agent: %s\nDirectory: %s\n\n"
                           (magnus-instance-name instance)
-                          (magnus-instance-directory instance)))))
+                          (magnus-instance-directory instance))))
+        (magnus-codex-enable-inline-input))
       (magnus-instances-update instance :buffer buffer)
       buffer)))
 
@@ -107,11 +158,62 @@ Functions receive INSTANCE, REQUEST-ID, METHOD, and PARAMS.  Use
   (let ((buffer (magnus-codex--buffer instance)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
+        (unless (and (markerp magnus-codex--prompt-marker)
+                     (marker-position magnus-codex--prompt-marker))
+          (magnus-codex-enable-inline-input))
         (let ((inhibit-read-only t)
               (moving (= (point) (point-max))))
-          (goto-char (point-max))
-          (insert (if face (propertize text 'face face) text))
+          (goto-char magnus-codex--prompt-marker)
+          (let ((start (point)))
+            (insert text)
+            (add-text-properties
+             start (point)
+             (append '(read-only t rear-nonsticky (read-only face))
+                     (when face (list 'face face)))))
           (when moving (goto-char (point-max))))))))
+
+(defun magnus-codex-self-insert (count)
+  "Insert the typed character COUNT times in the inline input field."
+  (interactive "p")
+  (magnus-codex-enable-inline-input)
+  (goto-char (point-max))
+  (self-insert-command count))
+
+(defun magnus-codex-yank ()
+  "Yank at the end of the inline input field."
+  (interactive)
+  (magnus-codex-enable-inline-input)
+  (goto-char (point-max))
+  (call-interactively #'yank))
+
+(defun magnus-codex-beginning-of-input ()
+  "Move to the beginning of the editable inline input field."
+  (interactive)
+  (magnus-codex-enable-inline-input)
+  (goto-char magnus-codex--input-marker))
+
+(defun magnus-codex-backward-delete (count)
+  "Delete COUNT characters backward within the inline input field."
+  (interactive "p")
+  (magnus-codex-enable-inline-input)
+  (goto-char (point-max))
+  (let ((available (- (point) magnus-codex--input-marker)))
+    (when (> available 0)
+      (delete-region (- (point) (min count available)) (point)))))
+
+(defun magnus-codex-submit-input ()
+  "Submit editable inline input to the current Codex instance."
+  (interactive)
+  (unless magnus-codex--instance
+    (user-error "This is not a Magnus Codex buffer"))
+  (magnus-codex-enable-inline-input)
+  (let ((text (string-trim
+               (buffer-substring-no-properties
+                magnus-codex--input-marker (point-max)))))
+    (unless (string-empty-p text)
+      (let ((inhibit-read-only t))
+        (delete-region magnus-codex--input-marker (point-max)))
+      (magnus-codex-send magnus-codex--instance text))))
 
 (defun magnus-codex--connection (instance)
   "Return the live App Server process for INSTANCE, or nil."
