@@ -9,14 +9,14 @@
 
 ;;; Commentary:
 
-;; This module provides a JSONL session viewer for Claude Code thinking
-;; traces.  It reads the session JSONL files that Claude Code writes and
-;; renders user messages, thinking blocks, and assistant responses in a
-;; scrollable Emacs buffer with auto-refresh.
+;; This module provides a provider-aware JSONL session viewer.  Providers
+;; locate and normalize their records; this shared UI renders user messages,
+;; thinking blocks, and assistant responses with pagination and auto-refresh.
 
 ;;; Code:
 
 (require 'magnus-instances)
+(require 'magnus-provider)
 
 (declare-function magnus-process--list-sessions "magnus-process")
 (declare-function magnus-process--most-recent-session "magnus-process")
@@ -78,13 +78,19 @@ Beyond this limit, users should use grep or less on the raw JSONL file."
 (defvar-local magnus-trace--jsonl-file nil
   "Path to the JSONL file for this trace buffer.")
 
+(defvar-local magnus-trace--session-id nil
+  "Provider session ID associated with `magnus-trace--jsonl-file'.")
+
+(defvar-local magnus-trace--pending-text ""
+  "Incomplete trailing JSONL text retained for the next refresh.")
+
 (defvar magnus-trace--timer nil
   "Timer for auto-refreshing trace buffers.")
 
 ;;; Major mode
 
 (define-derived-mode magnus-trace-mode special-mode "Trace"
-  "Major mode for viewing Claude Code thinking trace.
+  "Major mode for viewing an agent's thinking trace.
 \\{magnus-trace-mode-map}"
   :group 'magnus
   (setq-local truncate-lines nil)
@@ -102,6 +108,21 @@ Beyond this limit, users should use grep or less on the raw JSONL file."
 
 ;;; Core functions
 
+(defun magnus-trace--reset-read-state (&optional clear-buffer)
+  "Reset JSONL reader state.
+When CLEAR-BUFFER is non-nil, also erase rendered content and overlays."
+  (setq magnus-trace--last-line-count 0
+        magnus-trace--rendered-count 0
+        magnus-trace--file-offset 0
+        magnus-trace--skip-count 0
+        magnus-trace--jsonl-file nil
+        magnus-trace--session-id nil
+        magnus-trace--pending-text "")
+  (when clear-buffer
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (remove-overlays))))
+
 (defun magnus-trace-open (instance)
   "Open the trace buffer for INSTANCE showing thinking and messages."
   (let* ((name (magnus-instance-name instance))
@@ -111,13 +132,7 @@ Beyond this limit, users should use grep or less on the raw JSONL file."
       (unless (derived-mode-p 'magnus-trace-mode)
         (magnus-trace-mode))
       (setq magnus-trace--instance instance)
-      (setq magnus-trace--last-line-count 0)
-      (setq magnus-trace--rendered-count 0)
-      (setq magnus-trace--file-offset 0)
-      (setq magnus-trace--skip-count 0)
-      (setq magnus-trace--jsonl-file nil)
-      (let ((inhibit-read-only t))
-        (erase-buffer))
+      (magnus-trace--reset-read-state t)
       (magnus-trace-refresh))
     (magnus-trace--ensure-timer)
     ;; Close any existing trace window before displaying the new one,
@@ -139,9 +154,11 @@ Beyond this limit, users should use grep or less on the raw JSONL file."
   (when magnus-trace--instance
     (let* ((instance magnus-trace--instance)
            (session-id (magnus-instance-session-id instance))
-           (directory (magnus-instance-directory instance)))
-      ;; Try to detect session-id if missing
-      (unless session-id
+           (directory (magnus-instance-directory instance))
+           (external (magnus-provider-external-p instance)))
+      ;; Claude predates providers and discovers its session asynchronously.
+      ;; Never run that heuristic for another provider in the same directory.
+      (unless (or session-id external)
         (let ((sessions (magnus-process--list-sessions directory)))
           (when sessions
             (setq session-id (if (= 1 (length sessions))
@@ -154,10 +171,23 @@ Beyond this limit, users should use grep or less on the raw JSONL file."
               (let ((inhibit-read-only t))
                 (erase-buffer)
                 (setq magnus-trace--last-line-count 0))))))
-      (let ((jsonl-file (when session-id
-                          (magnus-process--session-jsonl-path directory session-id))))
+      (let ((jsonl-file
+             (when session-id
+               (if (and (equal session-id magnus-trace--session-id)
+                        magnus-trace--jsonl-file
+                        (file-exists-p magnus-trace--jsonl-file))
+                   magnus-trace--jsonl-file
+                 (if external
+                     (magnus-provider-call instance 'trace-file)
+                   (magnus-process--session-jsonl-path
+                    directory session-id))))))
         (if (and jsonl-file (file-exists-p jsonl-file))
-            (magnus-trace--append-new-entries jsonl-file)
+            (progn
+              (unless (and (equal jsonl-file magnus-trace--jsonl-file)
+                           (equal session-id magnus-trace--session-id))
+                (magnus-trace--reset-read-state t))
+              (setq magnus-trace--session-id session-id)
+              (magnus-trace--append-new-entries jsonl-file))
           (let ((inhibit-read-only t))
             (goto-char (point-max))
             (unless (> (buffer-size) 0)
@@ -191,7 +221,8 @@ at the top.  Stops when all entries are loaded or the buffer exceeds
              magnus-trace-max-buffer-lines
              (abbreviate-file-name magnus-trace--jsonl-file)))
    (t
-    (let* ((all-lines (magnus-trace--read-lines magnus-trace--jsonl-file 0))
+    (let* ((all-lines (magnus-trace--read-snapshot-lines
+                       magnus-trace--jsonl-file))
            (batch-size (or magnus-trace-max-initial-entries 200))
            (new-skip (max 0 (- magnus-trace--skip-count batch-size)))
            (batch (seq-subseq all-lines new-skip magnus-trace--skip-count))
@@ -213,13 +244,9 @@ at the top.  Stops when all entries are loaded or the buffer exceeds
                    'face 'magnus-trace-separator
                    'magnus-trace-header t)))
         ;; Render batch entries at point (before existing content)
-        (catch 'partial-line
-          (dolist (line batch)
-            (condition-case nil
-                (let ((entry (json-parse-string line :object-type 'alist)))
-                  (magnus-trace--render-entry entry)
-                  (setq parsed-count (1+ parsed-count)))
-              (error (throw 'partial-line nil))))))
+        (dolist (line batch)
+          (when (magnus-trace--render-json-line line)
+            (setq parsed-count (1+ parsed-count)))))
       (setq magnus-trace--skip-count new-skip
             magnus-trace--rendered-count
             (+ magnus-trace--rendered-count parsed-count))
@@ -296,6 +323,12 @@ at the top.  Stops when all entries are loaded or the buffer exceeds
 
 ;;; Content parsing
 
+(defun magnus-trace--marker-match (regexp text start)
+  "Return REGEXP's (START . END) match in TEXT at or after START."
+  (save-match-data
+    (when (string-match regexp text start)
+      (cons (match-beginning 0) (match-end 0)))))
+
 (defun magnus-trace-parse-content (text)
   "Parse TEXT for thinking/response markers.
 Finds [thinking]...[end-thinking] and [response]...[end-response]
@@ -305,44 +338,58 @@ is `thinking' or `response'.  Unmarked text is treated as response."
         (pos 0)
         (len (length text)))
     (while (< pos len)
-      (let ((think-start (string-match "\\[thinking\\]\n?" text pos))
-            (resp-start (string-match "\\[response\\]\n?" text pos)))
+      (let* ((think-match
+              (magnus-trace--marker-match "\\[thinking\\]\n?" text pos))
+             (response-match
+              (magnus-trace--marker-match "\\[response\\]\n?" text pos))
+             (think-start (car-safe think-match))
+             (response-start (car-safe response-match)))
         (cond
          ;; Thinking block comes first (or is only one)
-         ((and think-start (or (null resp-start) (<= think-start resp-start)))
+         ((and think-start
+               (or (null response-start) (<= think-start response-start)))
           ;; Capture any text before the marker as response
           (when (> think-start pos)
             (let ((pre (string-trim (substring text pos think-start))))
               (when (not (string-empty-p pre))
                 (push (list :type 'response :text pre) segments))))
-          (let* ((content-start (match-end 0))
-                 (think-end (string-match "\\[end-thinking\\]\n?" text content-start)))
-            (if think-end
+          (let* ((content-start (cdr think-match))
+                 (end-match
+                  (magnus-trace--marker-match
+                   "\\[end-thinking\\]\n?" text content-start)))
+            (if end-match
                 (progn
-                  (let ((content (string-trim (substring text content-start think-end))))
+                  (let ((content
+                         (string-trim
+                          (substring text content-start (car end-match)))))
                     (when (not (string-empty-p content))
                       (push (list :type 'thinking :text content) segments)))
-                  (setq pos (match-end 0)))
+                  (setq pos (cdr end-match)))
               ;; No end marker — rest is thinking
               (let ((content (string-trim (substring text content-start))))
                 (when (not (string-empty-p content))
                   (push (list :type 'thinking :text content) segments)))
               (setq pos len))))
          ;; Response block comes first (or is only one)
-         ((and resp-start (or (null think-start) (< resp-start think-start)))
+         ((and response-start
+               (or (null think-start) (< response-start think-start)))
           ;; Capture any text before the marker as response
-          (when (> resp-start pos)
-            (let ((pre (string-trim (substring text pos resp-start))))
+          (when (> response-start pos)
+            (let ((pre (string-trim (substring text pos response-start))))
               (when (not (string-empty-p pre))
                 (push (list :type 'response :text pre) segments))))
-          (let* ((content-start (match-end 0))
-                 (resp-end (string-match "\\[end-response\\]\n?" text content-start)))
-            (if resp-end
+          (let* ((content-start (cdr response-match))
+                 (end-match
+                  (magnus-trace--marker-match
+                   "\\[end-response\\]\n?" text content-start)))
+            (if end-match
                 (progn
-                  (let ((content (string-trim (substring text content-start resp-end))))
+                  (let ((content
+                         (string-trim
+                          (substring text content-start (car end-match)))))
                     (when (not (string-empty-p content))
                       (push (list :type 'response :text content) segments)))
-                  (setq pos (match-end 0)))
+                  (setq pos (cdr end-match)))
               ;; No end marker — rest is response
               (let ((content (string-trim (substring text content-start))))
                 (when (not (string-empty-p content))
@@ -362,18 +409,97 @@ is `thinking' or `response'.  Unmarked text is treated as response."
 
 ;;; Internal helpers
 
+(defun magnus-trace--complete-json-p (text)
+  "Return non-nil when TEXT is one complete JSON value."
+  (condition-case nil
+      (progn
+        (ignore (json-parse-string text :object-type 'alist))
+        t)
+    (error
+     ;; A writer may not have finished the final JSONL record yet.
+     nil)))
+
+(defun magnus-trace--split-complete-lines (text)
+  "Split JSONL TEXT into complete lines and an incomplete trailing fragment.
+Return a cons whose car is the line list and whose cdr is the fragment.  A
+valid final JSON value is complete even when no newline has been written yet."
+  (let ((position 0)
+        lines)
+    (while (string-match "\n" text position)
+      (let ((line (substring text position (match-beginning 0))))
+        (unless (string-empty-p line)
+          (push line lines)))
+      (setq position (match-end 0)))
+    (let ((fragment (substring text position)))
+      (if (or (string-empty-p fragment)
+              (magnus-trace--complete-json-p fragment))
+          (progn
+            (unless (string-empty-p fragment)
+              (push fragment lines))
+            (cons (nreverse lines) ""))
+        (cons (nreverse lines) fragment)))))
+
+(defun magnus-trace--read-range (file start end)
+  "Read FILE bytes from START through measured END."
+  (with-temp-buffer
+    (insert-file-contents file nil start end)
+    (buffer-string)))
+
+(defun magnus-trace--read-snapshot (file)
+  "Return complete lines, trailing fragment, and size from one FILE snapshot."
+  (let* ((size (file-attribute-size (file-attributes file)))
+         (text (magnus-trace--read-range file 0 size))
+         (split (magnus-trace--split-complete-lines text)))
+    (list (car split) (cdr split) size)))
+
+(defun magnus-trace--read-snapshot-lines (file)
+  "Return complete JSONL lines from one bounded snapshot of FILE."
+  (car (magnus-trace--read-snapshot file)))
+
+(defun magnus-trace--normalize-entry (entry)
+  "Normalize provider JSONL ENTRY for the shared renderer, or return nil."
+  (let ((instance magnus-trace--instance))
+    (if (and instance
+             (magnus-provider-external-p instance)
+             (magnus-provider-operation-p instance 'trace-entry))
+        (magnus-provider-call instance 'trace-entry entry)
+      entry)))
+
+(defun magnus-trace--render-json-line (line)
+  "Parse and render one provider JSONL LINE.
+Return non-nil when LINE parsed, even when the provider ignores its record."
+  (condition-case err
+      (let* ((entry (json-parse-string line :object-type 'alist))
+             (normalized (magnus-trace--normalize-entry entry)))
+        (when normalized
+          (magnus-trace--render-entry normalized))
+        t)
+    (error
+     (message "Magnus: skipped malformed trace record: %s"
+              (error-message-string err))
+     nil)))
+
 (defun magnus-trace--append-new-entries (jsonl-file)
   "Append new entries from JSONL-FILE to the current trace buffer.
 On initial load, reads the full file but only renders the last
 `magnus-trace-max-initial-entries' entries.  On subsequent refreshes,
 reads only new bytes from the file offset."
-  (setq magnus-trace--jsonl-file jsonl-file)
   (let* ((file-size (file-attribute-size (file-attributes jsonl-file)))
          (at-end (eobp)))
+    (when (and magnus-trace--jsonl-file
+               (or (not (equal jsonl-file magnus-trace--jsonl-file))
+                   (< file-size magnus-trace--file-offset)))
+      (let ((session-id magnus-trace--session-id))
+        (magnus-trace--reset-read-state t)
+        (setq magnus-trace--session-id session-id)))
+    (setq magnus-trace--jsonl-file jsonl-file)
     (cond
      ;; Initial load: read full file, cap to last N entries
      ((zerop magnus-trace--file-offset)
-      (let* ((all-lines (magnus-trace--read-lines jsonl-file 0))
+      (let* ((snapshot (magnus-trace--read-range
+                        jsonl-file 0 file-size))
+             (split (magnus-trace--split-complete-lines snapshot))
+             (all-lines (car split))
              (total (length all-lines))
              (skip (if (and magnus-trace-max-initial-entries
                             (> total magnus-trace-max-initial-entries))
@@ -383,16 +509,21 @@ reads only new bytes from the file offset."
         (when lines-to-render
           (magnus-trace--render-lines lines-to-render skip))
         (setq magnus-trace--file-offset file-size
+              magnus-trace--pending-text (cdr split)
               magnus-trace--last-line-count total
               magnus-trace--skip-count skip)))
      ;; Incremental: read only new bytes
      ((> file-size magnus-trace--file-offset)
-      (let* ((new-text (magnus-trace--read-tail jsonl-file
-                                                magnus-trace--file-offset))
-             (new-lines (split-string new-text "\n" t)))
+      (let* ((new-text
+              (magnus-trace--read-range
+               jsonl-file magnus-trace--file-offset file-size))
+             (split (magnus-trace--split-complete-lines
+                     (concat magnus-trace--pending-text new-text)))
+             (new-lines (car split)))
         (when new-lines
           (magnus-trace--render-lines new-lines 0))
         (setq magnus-trace--file-offset file-size
+              magnus-trace--pending-text (cdr split)
               magnus-trace--last-line-count
               (+ magnus-trace--last-line-count (length new-lines))))))
     ;; Trim buffer if it has grown too large (2x cap)
@@ -420,19 +551,18 @@ SKIP is the number of earlier entries omitted (for the header)."
                          skip)
                  'face 'magnus-trace-separator
                  'magnus-trace-header t)))
-      (catch 'partial-line
-        (dolist (line lines)
-          (condition-case nil
-              (let ((entry (json-parse-string line :object-type 'alist)))
-                (magnus-trace--render-entry entry)
-                (setq parsed-count (1+ parsed-count)))
-            (error (throw 'partial-line nil))))))
+      (dolist (line lines)
+        (when (magnus-trace--render-json-line line)
+          (setq parsed-count (1+ parsed-count)))))
     (setq magnus-trace--rendered-count
           (+ magnus-trace--rendered-count parsed-count))))
 
 (defun magnus-trace--trim (jsonl-file)
   "Trim the current trace buffer to last N entries from JSONL-FILE."
-  (let* ((all-lines (magnus-trace--read-lines jsonl-file 0))
+  (let* ((snapshot (magnus-trace--read-snapshot jsonl-file))
+         (all-lines (nth 0 snapshot))
+         (pending (nth 1 snapshot))
+         (snapshot-size (nth 2 snapshot))
          (total (length all-lines))
          (keep magnus-trace-max-initial-entries)
          (skip (max 0 (- total keep)))
@@ -445,20 +575,8 @@ SKIP is the number of earlier entries omitted (for the header)."
       (magnus-trace--render-lines lines-to-render skip))
     (setq magnus-trace--last-line-count total
           magnus-trace--skip-count skip
-          magnus-trace--file-offset
-          (file-attribute-size (file-attributes jsonl-file)))))
-
-(defun magnus-trace--read-lines (file offset)
-  "Read all lines from FILE starting at byte OFFSET."
-  (with-temp-buffer
-    (insert-file-contents file nil offset)
-    (split-string (buffer-string) "\n" t)))
-
-(defun magnus-trace--read-tail (file offset)
-  "Read new bytes from FILE starting at byte OFFSET."
-  (with-temp-buffer
-    (insert-file-contents file nil offset)
-    (buffer-string)))
+          magnus-trace--file-offset snapshot-size
+          magnus-trace--pending-text pending)))
 
 (defun magnus-trace--render-entry (entry)
   "Render a JSONL ENTRY into the trace buffer."

@@ -54,6 +54,9 @@ arriving during startup."
 (defconst magnus-codex--session-scan-limit (* 1024 1024)
   "Maximum rollout bytes inspected while identifying a new session.")
 
+(defvar magnus-codex--session-file-cache (make-hash-table :test #'equal)
+  "Codex session-root/session-ID keys to verified rollout file paths.")
+
 (defvar-local magnus-codex--instance nil
   "Magnus instance represented by the current Codex TUI buffer.")
 
@@ -150,7 +153,10 @@ Only the initial metadata and first user message are examined."
                 (when (equal (alist-get 'type event) "user_message")
                   (setq user-message (alist-get 'message event))))
               (forward-line 1))
-            (and (equal user-message prompt) id))))
+            (when (equal user-message prompt)
+              (puthash (cons (magnus-codex--session-root) id) file
+                       magnus-codex--session-file-cache)
+              id))))
     (error
      ;; A concurrently written rollout is retried on the next bounded poll.
      nil)))
@@ -487,6 +493,53 @@ FORCE kills the terminal immediately; otherwise interrupt before closing it."
     (magnus-codex-start instance))
   (pop-to-buffer (magnus-instance-buffer instance)))
 
+(defun magnus-codex-trace-file (instance)
+  "Return the rollout JSONL file for Codex INSTANCE, or nil."
+  (when-let ((session-id (magnus-instance-session-id instance)))
+    (let* ((root (magnus-codex--session-root))
+           (cache-key (cons root session-id))
+           (cached (gethash cache-key magnus-codex--session-file-cache)))
+      (if (and cached (file-exists-p cached))
+          cached
+        (remhash cache-key magnus-codex--session-file-cache)
+        (when (file-directory-p root)
+          (when-let ((file
+                      (car
+                       (directory-files-recursively
+                        root
+                        (concat "rollout-.*-"
+                                (regexp-quote session-id)
+                                "\\.jsonl\\'")))))
+            (puthash cache-key file magnus-codex--session-file-cache)
+            file))))))
+
+(defun magnus-codex--canonical-trace-entry (role timestamp text)
+  "Build a shared trace entry for ROLE, TIMESTAMP, and TEXT."
+  (if (eq role 'user)
+      `((type . "user")
+        (timestamp . ,timestamp)
+        (message . ((content . ,text))))
+    `((type . "assistant")
+      (timestamp . ,timestamp)
+      (message . ((content . [((type . "text") (text . ,text))]))))))
+
+(defun magnus-codex-trace-entry (_instance entry)
+  "Normalize one visible Codex rollout ENTRY for the shared trace viewer.
+Codex `response_item' records are deliberately ignored: assistant output is
+duplicated in `event_msg' records, and raw reasoning content is encrypted."
+  (when (equal (alist-get 'type entry) "event_msg")
+    (let* ((payload (alist-get 'payload entry))
+           (event-type (alist-get 'type payload))
+           (text (alist-get 'message payload))
+           (timestamp (alist-get 'timestamp entry)))
+      (when (and (stringp text) (not (string-empty-p text)))
+        (pcase event-type
+          ("user_message"
+           (magnus-codex--canonical-trace-entry 'user timestamp text))
+          ("agent_message"
+           (magnus-codex--canonical-trace-entry
+            'assistant timestamp text)))))))
+
 (magnus-provider-register
  'codex
  '((start . magnus-codex-start)
@@ -495,7 +548,9 @@ FORCE kills the terminal immediately; otherwise interrupt before closing it."
    (interrupt . magnus-codex-interrupt)
    (stop . magnus-codex-stop)
    (running-p . magnus-codex-running-p)
-   (switch-to . magnus-codex-switch-to)))
+   (switch-to . magnus-codex-switch-to)
+   (trace-file . magnus-codex-trace-file)
+   (trace-entry . magnus-codex-trace-entry)))
 
 (provide 'magnus-provider-codex)
 ;;; magnus-provider-codex.el ends here

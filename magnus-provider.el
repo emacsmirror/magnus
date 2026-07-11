@@ -50,5 +50,13 @@ does not implement OPERATION."
       (user-error "Provider `%s' does not support `%s'" provider operation))
     (apply function instance arguments)))
 
+(defun magnus-provider-operation-p (instance operation)
+  "Return non-nil when INSTANCE's provider implements OPERATION."
+  (let* ((provider (or (magnus-instance-provider instance) 'claude))
+         (_loaded (magnus-provider--load provider)))
+    (and (alist-get operation
+                    (gethash provider magnus-provider--registry))
+         t)))
+
 (provide 'magnus-provider)
 ;;; magnus-provider.el ends here

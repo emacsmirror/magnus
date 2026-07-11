@@ -107,9 +107,12 @@ A per-project scratch buffer where you can paste notes, links, Confluence pages,
 - Persists across Emacs sessions (stored in `~/.emacs.d/magnus-context/`)
 
 ### Thinking Trace
-Press `t` on any instance to open a trace buffer that reads the session JSONL file directly. See the full thinking/reasoning that's normally collapsed in Claude Code, plus user messages and responses — in a regular scrollable Emacs buffer.
+Press `t` on any instance to open a trace buffer that reads its provider's
+session JSONL directly. Claude traces include its recorded thinking blocks;
+Codex traces include visible `[thinking]` engineering journals, user messages,
+and responses. Codex's encrypted internal reasoning is deliberately not shown.
 
-The trace auto-refreshes every 2 seconds so you can watch agents think in real-time.
+The trace auto-refreshes so you can watch agents work in real time.
 
 ### Direct Messaging
 Press `m` to send a message directly to an agent from the status buffer. The message appears in the agent's terminal as if you typed it — Claude acts on it immediately. Agents also receive periodic reminders (every 10 min) that rotate through different messages — nudging them to check the coordination file, share discoveries, and update their status.

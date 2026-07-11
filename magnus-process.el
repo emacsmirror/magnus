@@ -375,10 +375,12 @@ Maps \\`keyboard-quit' to send ESC, since Emacs intercepts the real ESC key."
 
 (defun magnus-process-trace (instance)
   "Open the trace buffer for INSTANCE showing thinking and messages."
-  (if (magnus-provider-external-p instance)
-      (magnus-provider-call instance 'switch-to)
-    (require 'magnus-trace)
-    (magnus-trace-open instance)))
+  (when (and (magnus-provider-external-p instance)
+             (not (magnus-provider-operation-p instance 'trace-file)))
+    (user-error "Provider `%s' does not support thinking traces"
+                (magnus-instance-provider instance)))
+  (require 'magnus-trace)
+  (magnus-trace-open instance))
 
 (defun magnus-process--session-jsonl-path (directory session-id)
   "Get the JSONL file path for SESSION-ID in DIRECTORY."
