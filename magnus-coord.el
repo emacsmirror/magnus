@@ -18,6 +18,7 @@
 ;;; Code:
 
 (require 'magnus-instances)
+(require 'magnus-provider)
 
 (declare-function vterm-send-string "vterm")
 (declare-function project-root "project")
@@ -177,32 +178,71 @@ This prevents partial reads when agents write concurrently."
 (defvar magnus-coord--last-nudge (make-hash-table :test 'equal)
   "Hash of instance-id → timestamp of last Magnus system nudge.")
 
+(defun magnus-coord--log-undelivered-nudge (instance text reason)
+  "Record that TEXT could not reach INSTANCE because of REASON."
+  (let* ((name (magnus-instance-name instance))
+         (directory (magnus-instance-directory instance))
+         (safe-text (replace-regexp-in-string
+                     "@" "(at) "
+                     (replace-regexp-in-string "[\n\r]+" " " text)))
+         (entry (format "Undelivered nudge to %s (%s): %s"
+                        name reason safe-text)))
+    (condition-case err
+        (magnus-coord-add-log directory "Magnus" entry)
+      (error
+       (message "Magnus: could not log undelivered nudge for %s: %s"
+                name (error-message-string err))))
+    (message "Magnus: %s" entry)
+    nil))
+
+(defun magnus-coord--instance-running-p (instance)
+  "Return non-nil when INSTANCE can currently receive a nudge.
+This intentionally avoids requiring `magnus-process', which itself requires
+this module and would create a load-order cycle for standalone callers."
+  (if (magnus-provider-external-p instance)
+      (magnus-provider-call instance 'running-p)
+    (when-let ((buffer (magnus-instance-buffer instance)))
+      (and (buffer-live-p buffer)
+           (get-buffer-process buffer)
+           (process-live-p (get-buffer-process buffer))))))
+
 (defun magnus-coord-nudge-agent (instance message &optional source)
-  "Nudge INSTANCE by sending MESSAGE to its vterm buffer.
+  "Nudge INSTANCE by sending MESSAGE through its provider.
 When SOURCE is non-nil, prepend \"[From SOURCE]:\" to distinguish
 system messages from user-typed input.  System messages from Magnus
 are debounced per `magnus-coord-nudge-debounce'."
   (catch 'magnus-debounced
-  (let ((id (magnus-instance-id instance)))
-    (when (and (string= source "Magnus")
-               magnus-coord-nudge-debounce)
-      (let ((last (gethash id magnus-coord--last-nudge 0)))
-        (when (< (- (float-time) last) magnus-coord-nudge-debounce)
-          (throw 'magnus-debounced nil))))
-    (when-let ((buffer (magnus-instance-buffer instance)))
-      (when (buffer-live-p buffer)
-        (let ((text (if source
-                        (format "[From %s]: %s" source message)
-                      message)))
-          (when (string= source "Magnus")
-            (puthash id (float-time) magnus-coord--last-nudge))
-          (with-current-buffer buffer
-            (vterm-send-string text)
-            (run-with-timer 0.1 nil
-                            (lambda ()
-                              (when (buffer-live-p buffer)
-                                (with-current-buffer buffer
-                                  (vterm-send-return))))))))))))
+    (let ((id (magnus-instance-id instance)))
+      (when (and (string= source "Magnus")
+                 magnus-coord-nudge-debounce)
+        (let ((last (gethash id magnus-coord--last-nudge 0)))
+          (when (< (- (float-time) last) magnus-coord-nudge-debounce)
+            (throw 'magnus-debounced nil))))
+      (let ((text (if source
+                      (format "[From %s]: %s" source message)
+                    message)))
+        (condition-case err
+            (if (not (magnus-coord--instance-running-p instance))
+                (magnus-coord--log-undelivered-nudge
+                 instance text "not running")
+              (if (magnus-provider-external-p instance)
+                  (magnus-provider-call instance 'send text)
+                (let ((buffer (magnus-instance-buffer instance)))
+                  (unless (buffer-live-p buffer)
+                    (error "agent buffer is not live"))
+                  (with-current-buffer buffer
+                    (vterm-send-string text)
+                    (run-with-timer
+                     0.1 nil
+                     (lambda ()
+                       (when (buffer-live-p buffer)
+                         (with-current-buffer buffer
+                           (vterm-send-return))))))))
+              (when (string= source "Magnus")
+                (puthash id (float-time) magnus-coord--last-nudge)))
+          (error
+           (magnus-coord--log-undelivered-nudge
+            instance text (error-message-string err))))))))
 
 
 ;;; Periodic reminders

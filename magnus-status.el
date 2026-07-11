@@ -209,6 +209,7 @@
   "Insert a line for INSTANCE."
   (let* ((name (magnus-instance-name instance))
          (directory (magnus-instance-directory instance))
+         (provider (or (magnus-instance-provider instance) 'claude))
          (status (magnus-instance-status instance))
          (suspended (eq status 'suspended))
          (finished (eq status 'finished))
@@ -229,6 +230,10 @@
          (age (magnus-status--format-age (magnus-instance-created-at instance))))
     (insert "  ")
     (insert (propertize name 'face 'magnus-status-instance-name))
+    (unless (eq provider 'claude)
+      (insert " ")
+      (insert (propertize (format "[%s]" provider)
+                          'face 'font-lock-type-face)))
     (insert " ")
     (insert (propertize (format "[%s]" status-str) 'face status-face))
     (when (magnus-coord-agent-busy-p instance)

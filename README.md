@@ -36,6 +36,31 @@ Magnus solves all of this.
 ### Instance Management
 Spawn, kill, suspend/resume, rename, and switch between Claude Code instances running in vterm buffers. Each instance gets a randomly generated name (like `swift-fox` or `keen-owl`) and runs in its own terminal. Change an instance's working directory with session resume — Claude keeps its full conversation history.
 
+### Optional Codex Instances
+
+Run `M-x magnus-create-codex` to create a Codex instance. Codex is strictly
+opt-in: existing commands, saved state, Claude behavior, and Claude storage
+paths remain unchanged. Each Codex instance runs the full native Codex TUI in
+a vterm buffer and is labeled `[codex]` in the status buffer. Only the `codex`
+executable is required; customize its path with `magnus-codex-executable`.
+
+Inside a Codex buffer, use the TUI exactly as you would in a terminal: type at
+its composer, answer approvals in its native UI, and use Magnus's `C-g`
+binding to send Escape. Direct messages and coordination nudges are typed into
+that same vterm through a serialized queue, making the TUI the only session
+owner. Magnus holds automated delivery while you are actively in that TUI to
+avoid interfering with its composer. Archiving interrupts and closes the TUI;
+revisiting the agent resumes its persisted session in a fresh one.
+
+For a new agent, Magnus correlates its unique onboarding prompt with the new
+local Codex rollout record and saves that session ID. Concurrent launches are
+matched by their prompt rather than by whichever file is newest. Capture is
+bounded and fail-safe: if Codex's local record cannot be identified, the live
+TUI remains usable, but that session cannot be resurrected automatically.
+Magnus's onboarding includes named identity, first-person memory, coordination
+etiquette, and candid `[thinking]`/`[response]` engineering journals. Claude's
+established prompt remains unchanged.
+
 ### Agent Coordination
 Agents communicate through a shared `.magnus-coord.md` file:
 
@@ -82,9 +107,12 @@ A per-project scratch buffer where you can paste notes, links, Confluence pages,
 - Persists across Emacs sessions (stored in `~/.emacs.d/magnus-context/`)
 
 ### Thinking Trace
-Press `t` on any instance to open a trace buffer that reads the session JSONL file directly. See the full thinking/reasoning that's normally collapsed in Claude Code, plus user messages and responses — in a regular scrollable Emacs buffer.
+Press `t` on any instance to open a trace buffer that reads its provider's
+session JSONL directly. Claude traces include its recorded thinking blocks;
+Codex traces include visible `[thinking]` engineering journals, user messages,
+and responses. Codex's encrypted internal reasoning is deliberately not shown.
 
-The trace auto-refreshes every 2 seconds so you can watch agents think in real-time.
+The trace auto-refreshes so you can watch agents work in real time.
 
 ### Direct Messaging
 Press `m` to send a message directly to an agent from the status buffer. The message appears in the agent's terminal as if you typed it — Claude acts on it immediately. Agents also receive periodic reminders (every 10 min) that rotate through different messages — nudging them to check the coordination file, share discoveries, and update their status.
@@ -138,6 +166,7 @@ Everything persists across Emacs sessions:
 - Emacs 28.1+
 - [vterm](https://github.com/akermu/emacs-libvterm)
 - [transient](https://github.com/magit/transient) (built into Emacs 28+)
+- Codex CLI (only for opt-in Codex instances)
 
 ## Installation
 
@@ -181,6 +210,13 @@ Or in your config:
 ```elisp
 (quelpa '(magnus :fetcher github :repo "hrishikeshs/magnus"))
 ```
+
+After upgrading Magnus in a running Emacs—through `M-x magnus-upgrade`,
+package-menu, package-vc, straight, or another package manager—restart Emacs
+before opening Magnus again. This prevents already-loaded functions and
+instance structures from being mixed with the newly installed package version.
+`magnus-upgrade` enforces this restart for upgrades initiated by versions that
+include the guard.
 
 ## Quick Start
 
@@ -330,6 +366,9 @@ Magnus avoids triggering interactive Helm/Projectile prompts when creating insta
 ;; Path to claude executable (default: "claude")
 (setq magnus-claude-executable "/path/to/claude")
 
+;; Path to codex executable for optional native TUI instances
+(setq magnus-codex-executable "/path/to/codex")
+
 ;; Default directory for new instances
 (setq magnus-default-directory "~/projects")
 
@@ -379,6 +418,8 @@ magnus/
 ├── magnus-instances.el    # Instance data structure and registry
 ├── magnus-persistence.el  # Save/restore state across sessions
 ├── magnus-process.el      # Process management (vterm + headless)
+├── magnus-provider.el     # Additive provider dispatch
+├── magnus-provider-codex.el # Optional native Codex TUI provider
 ├── magnus-trace.el        # Thinking trace JSONL viewer
 ├── magnus-status.el       # Status buffer UI
 ├── magnus-transient.el    # Transient popup menus

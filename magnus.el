@@ -49,6 +49,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'magnus-instances)
 
 (declare-function magnus-persistence-load "magnus-persistence")
 (declare-function magnus-persistence--setup-autosave "magnus-persistence")
@@ -57,6 +58,7 @@
 (declare-function magnus-coord-ensure-watchers "magnus-coord")
 (declare-function magnus-status "magnus-status")
 (declare-function magnus-process-create "magnus-process")
+(declare-function magnus-process-create-codex "magnus-process")
 (declare-function magnus-instances-list "magnus-instances")
 (declare-function magnus-instance-name "magnus-instances")
 (declare-function magnus-instance-directory "magnus-instances")
@@ -154,6 +156,9 @@ Takes the working directory as argument and returns a string."
 
 (defvar magnus--initialized nil
   "Non-nil if magnus has been initialized.")
+
+(defvar magnus--restart-required nil
+  "Non-nil after an in-session Magnus reinstall requires an Emacs restart.")
 
 (defvar magnus--agents-index nil
   "In-memory agent expertise index.
@@ -518,6 +523,9 @@ them now; new agents populate once their memory file exists."
 
 (defun magnus--ensure-initialized ()
   "Ensure magnus is initialized."
+  (when magnus--restart-required
+    (user-error
+     "Magnus was upgraded in this Emacs session; restart Emacs before use"))
   (unless magnus--initialized
     (require 'magnus-instances)
     (require 'magnus-persistence)
@@ -559,6 +567,18 @@ NAME is the instance name.  If nil, auto-generates one."
   (magnus-process-create directory name))
 
 ;;;###autoload
+(defun magnus-create-codex (&optional directory name initial-message)
+  "Create an opt-in Codex instance in its native TUI.
+DIRECTORY and NAME have the same meaning as in `magnus-create-instance'.
+When INITIAL-MESSAGE is non-nil, include it in the first turn."
+  (interactive
+   (list nil nil
+         (let ((message (read-string "Initial Codex task (RET to skip): ")))
+           (unless (string-empty-p message) message))))
+  (magnus--ensure-initialized)
+  (magnus-process-create-codex directory name initial-message))
+
+;;;###autoload
 (defun magnus-create-headless (prompt &optional directory name)
   "Create a headless Claude Code instance with PROMPT.
 DIRECTORY is the working directory.  If nil, prompts for one.
@@ -583,7 +603,9 @@ The agent runs to completion and exits."
   (setq magnus--initialized nil))
 
 (defun magnus--upgrade-execute ()
-  "Archive all agents, save state, and reinstall Magnus."
+  "Archive all agents, save state, and reinstall Magnus.
+The user must restart Emacs afterward so loaded struct and function definitions
+cannot be mixed across package versions."
   (let ((active (magnus-instances-active-list)))
     (when active
       (dolist (instance active)
@@ -594,13 +616,16 @@ The agent runs to completion and exits."
   (magnus-persistence-save)
   (magnus--shutdown)
   (package-reinstall 'magnus)
-  (message "Magnus upgraded. Run M-x magnus to resurrect your agents."))
+  (setq magnus--restart-required t)
+  (message
+   "Magnus upgraded. Restart Emacs, then run M-x magnus to resurrect agents."))
 
 ;;;###autoload
 (defun magnus-upgrade ()
   "Upgrade Magnus gracefully.
 Warns active agents, gives them 120 seconds to save their work,
-archives them, saves state, and reinstalls the package."
+archives them, saves state, and reinstalls the package.  Restart Emacs after
+the reinstall so live data structures are not mixed across package versions."
   (interactive)
   (magnus--ensure-initialized)
   (let ((active (magnus-instances-active-list)))
@@ -610,7 +635,8 @@ archives them, saves state, and reinstalls the package."
           (magnus-persistence-save)
           (magnus--shutdown)
           (package-reinstall 'magnus)
-          (message "Magnus upgraded. Run M-x magnus to start."))
+          (setq magnus--restart-required t)
+          (message "Magnus upgraded. Restart Emacs, then run M-x magnus."))
       ;; Warn agents
       (dolist (instance active)
         (magnus-coord-nudge-agent

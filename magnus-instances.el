@@ -10,7 +10,7 @@
 ;;; Commentary:
 
 ;; This module provides the data structures and functions for managing
-;; the registry of Claude Code instances.
+;; the registry of agent instances.
 
 ;;; Code:
 
@@ -20,14 +20,15 @@
 
 (cl-defstruct (magnus-instance (:constructor magnus-instance--create)
                                (:copier nil))
-  "A Claude Code instance."
+  "An agent instance managed by Magnus."
   (id nil :documentation "Unique identifier (UUID string).")
   (name nil :documentation "User-friendly name.")
   (directory nil :documentation "Working directory.")
-  (buffer nil :documentation "The vterm buffer running claude.")
+  (buffer nil :documentation "The display buffer running the agent.")
   (created-at nil :documentation "Creation timestamp.")
+  (provider 'claude :documentation "Agent provider symbol (defaults to `claude').")
   (status 'stopped :documentation "Status: running, stopped, suspended, purged.")
-  (session-id nil :documentation "Claude Code session ID for this instance.")
+  (session-id nil :documentation "Provider session ID for this instance.")
   (previous-session-id nil :documentation "Session ID before last directory change.")
   (purged-at nil :documentation "Timestamp when instance was archived (purged)."))
 
@@ -114,14 +115,15 @@ PROPERTIES is a plist of slot names and values."
         (:buffer (setf (magnus-instance-buffer instance) value))
         (:status (setf (magnus-instance-status instance) value))
         (:directory (setf (magnus-instance-directory instance) value))
+        (:provider (setf (magnus-instance-provider instance) value))
         (:session-id (setf (magnus-instance-session-id instance) value))
         (:previous-session-id (setf (magnus-instance-previous-session-id instance) value))
         (:purged-at (setf (magnus-instance-purged-at instance) value)))))
   (run-hooks 'magnus-instances-changed-hook)
   instance)
 
-(defun magnus-instances-create (directory name)
-  "Create a new instance for DIRECTORY with NAME.
+(defun magnus-instances-create (directory name &optional provider)
+  "Create a new instance for DIRECTORY with NAME and optional PROVIDER.
 Returns the new instance (not yet added to registry)."
   (magnus-instance--create
    :id (magnus-instances--generate-id)
@@ -129,6 +131,7 @@ Returns the new instance (not yet added to registry)."
    :directory (directory-file-name (expand-file-name directory))
    :buffer nil
    :created-at (current-time)
+   :provider (or provider 'claude)
    :status 'stopped))
 
 (defun magnus-instances-clear ()
@@ -149,6 +152,7 @@ Returns the new instance (not yet added to registry)."
         :name (magnus-instance-name instance)
         :directory (magnus-instance-directory instance)
         :created-at (magnus-instance-created-at instance)
+        :provider (or (magnus-instance-provider instance) 'claude)
         :session-id (magnus-instance-session-id instance)
         :previous-session-id (magnus-instance-previous-session-id instance)
         :status (magnus-instance-status instance)
@@ -162,6 +166,9 @@ Returns the new instance (not yet added to registry)."
    :directory (plist-get plist :directory)
    :buffer nil
    :created-at (plist-get plist :created-at)
+   ;; State written before provider support has no :provider key and must
+   ;; retain Magnus's original Claude Code behavior.
+   :provider (or (plist-get plist :provider) 'claude)
    :status (or (plist-get plist :status) 'stopped)
    :session-id (plist-get plist :session-id)
    :previous-session-id (plist-get plist :previous-session-id)

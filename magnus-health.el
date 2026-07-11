@@ -9,8 +9,8 @@
 
 ;;; Commentary:
 
-;; This module monitors the health of Claude Code instances by hashing
-;; buffer content and detecting stale, stuck, or dead agents.  Health
+;; This module monitors the health of provider-backed instances by hashing
+;; their display buffer and detecting stale, stuck, or dead agents.  Health
 ;; status is displayed in the magnus status buffer.
 
 ;;; Code:

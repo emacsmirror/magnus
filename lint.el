@@ -15,9 +15,10 @@
       (let ((arg (pop args)))
         (cond
          ((string= arg "--compile")
-          (setq lint-do-compile t)
+         (setq lint-do-compile t)
           ;; Initialize package.el so installed deps (vterm, transient)
           ;; are on the load-path for byte-compilation.
+          (setq load-prefer-newer t)
           (require 'package)
           (package-initialize))
          ((string-suffix-p ".el" arg) (push arg files)))))
