@@ -37,11 +37,12 @@
 
 ;;; Process creation
 
-(defun magnus-process-create (&optional directory name provider)
+(defun magnus-process-create (&optional directory name provider initial-message)
   "Create a new agent instance.
 DIRECTORY is the working directory.  If nil, prompts for one.
 NAME is the instance name.  If nil, auto-generates one.
-PROVIDER defaults to `claude', preserving the original vterm behavior."
+PROVIDER defaults to `claude', preserving the original vterm behavior.
+INITIAL-MESSAGE is passed to external providers when non-nil."
   (interactive)
   (let* ((dir (or directory
                   (magnus-process--get-directory)))
@@ -52,22 +53,17 @@ PROVIDER defaults to `claude', preserving the original vterm behavior."
     ;; Set up coordination files and register agent
     (magnus-coord-register-agent dir instance)
     (if (magnus-provider-external-p instance)
-        (magnus-provider-call instance 'start)
+        (if initial-message
+            (magnus-provider-call instance 'start initial-message)
+          (magnus-provider-call instance 'start))
       (magnus-process--spawn instance))
     instance))
 
 (defun magnus-process-create-codex (&optional directory name initial-message)
   "Create an opt-in Codex instance in DIRECTORY with NAME.
-When INITIAL-MESSAGE is non-nil, start a turn after the thread is ready."
+When INITIAL-MESSAGE is non-nil, include it in the native TUI's first turn."
   (interactive)
-  (let* ((dir (or directory (magnus-process--get-directory)))
-         (instance-name (or name
-                            (funcall magnus-instance-name-generator dir)))
-         (instance (magnus-instances-create dir instance-name 'codex)))
-    (magnus-instances-add instance)
-    (magnus-coord-register-agent dir instance)
-    (magnus-provider-call instance 'start initial-message)
-    instance))
+  (magnus-process-create directory name 'codex initial-message))
 
 (defun magnus-process--get-directory ()
   "Get directory for new instance, prompting user."
@@ -644,8 +640,8 @@ if a session ID exists, or spawn a fresh process."
   "Try to reconnect INSTANCE to an existing buffer/process."
   (if (magnus-provider-external-p instance)
       (progn
-        ;; The managed daemon may survive Emacs, but its observer connection and
-        ;; vterm cannot.  Preserve the thread ID; visiting resumes a fresh TUI.
+        ;; A provider's terminal cannot survive Emacs.  Preserve its session ID;
+        ;; visiting the instance will resume it in a fresh display buffer.
         (when (eq (magnus-instance-status instance) 'running)
           (magnus-instances-update instance :status 'stopped :buffer nil))
         nil)

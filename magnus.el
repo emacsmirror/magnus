@@ -568,9 +568,9 @@ NAME is the instance name.  If nil, auto-generates one."
 
 ;;;###autoload
 (defun magnus-create-codex (&optional directory name initial-message)
-  "Create an opt-in Codex instance managed through App Server.
+  "Create an opt-in Codex instance in its native TUI.
 DIRECTORY and NAME have the same meaning as in `magnus-create-instance'.
-When INITIAL-MESSAGE is non-nil, start the first turn after connecting."
+When INITIAL-MESSAGE is non-nil, include it in the first turn."
   (interactive
    (list nil nil
          (let ((message (read-string "Initial Codex task (RET to skip): ")))

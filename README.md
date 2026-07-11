@@ -38,42 +38,28 @@ Spawn, kill, suspend/resume, rename, and switch between Claude Code instances ru
 
 ### Optional Codex Instances
 
-Run `M-x magnus-create-codex` to create a Codex instance through Codex App
-Server. Codex is strictly opt-in: existing commands, saved state, Claude
-behavior, and Claude storage paths remain unchanged. Each Codex instance runs
-the full native Codex TUI in a vterm buffer and is labeled `[codex]` in the
-status buffer.
-
-This requires a `codex` executable with managed App Server support (`codex
-app-server daemon` and `codex app-server proxy`). Customize its path with
-`magnus-codex-executable`. Magnus starts or reuses one idle shared daemon. A
-small per-instance observer connects to that daemon through the local Unix
-socket. For a new agent, the observer creates and subscribes to the thread,
-persists the returned ID, and then launches the TUI to resume that exact thread
-with `--remote unix://`. Existing agents are subscribed by the observer before
-their TUI is resumed. This keeps identity, lifecycle events, interruption, and
-resurrection connection-scoped without making the observer an interactive
-writer. A custom `magnus-codex-remote` must be a local `unix://` endpoint so
-the observer and TUI cannot accidentally connect to different servers.
+Run `M-x magnus-create-codex` to create a Codex instance. Codex is strictly
+opt-in: existing commands, saved state, Claude behavior, and Claude storage
+paths remain unchanged. Each Codex instance runs the full native Codex TUI in
+a vterm buffer and is labeled `[codex]` in the status buffer. Only the `codex`
+executable is required; customize its path with `magnus-codex-executable`.
 
 Inside a Codex buffer, use the TUI exactly as you would in a terminal: type at
 its composer, answer approvals in its native UI, and use Magnus's `C-g`
 binding to send Escape. Direct messages and coordination nudges are typed into
-that same vterm through a FIFO, making the TUI the sole interactive writer;
-Codex therefore owns the semantics of input received during an active turn.
-Magnus holds automated delivery while you are actively in that TUI to avoid
-interfering with its composer. Archiving first requests interruption of any
-observed active turn, then stops the TUI and observer but not the shared daemon.
-Revisiting an archived agent resumes its persisted thread in a fresh TUI.
+that same vterm through a serialized queue, making the TUI the only session
+owner. Magnus holds automated delivery while you are actively in that TUI to
+avoid interfering with its composer. Archiving interrupts and closes the TUI;
+revisiting the agent resumes its persisted session in a fresh one.
 
-Codex observer startup has a bounded timeout, and different agents may launch
-independently because each observer receives its own `thread/start` response.
-Magnus also adapts its full onboarding philosophy for Codex:
-named identity, first-person memory, coordination claims and discoveries,
-attention etiquette, debriefing, and candid `[thinking]`/`[response]`
-engineering journals. New Codex threads receive this as a visible first-turn
-onboarding message so it persists in their history across resurrection.
-Claude's established prompt remains unchanged.
+For a new agent, Magnus correlates its unique onboarding prompt with the new
+local Codex rollout record and saves that session ID. Concurrent launches are
+matched by their prompt rather than by whichever file is newest. Capture is
+bounded and fail-safe: if Codex's local record cannot be identified, the live
+TUI remains usable, but that session cannot be resurrected automatically.
+Magnus's onboarding includes named identity, first-person memory, coordination
+etiquette, and candid `[thinking]`/`[response]` engineering journals. Claude's
+established prompt remains unchanged.
 
 ### Agent Coordination
 Agents communicate through a shared `.magnus-coord.md` file:
@@ -177,7 +163,7 @@ Everything persists across Emacs sessions:
 - Emacs 28.1+
 - [vterm](https://github.com/akermu/emacs-libvterm)
 - [transient](https://github.com/magit/transient) (built into Emacs 28+)
-- Codex CLI with App Server support (only for opt-in Codex instances)
+- Codex CLI (only for opt-in Codex instances)
 
 ## Installation
 
@@ -377,7 +363,7 @@ Magnus avoids triggering interactive Helm/Projectile prompts when creating insta
 ;; Path to claude executable (default: "claude")
 (setq magnus-claude-executable "/path/to/claude")
 
-;; Path to codex executable for optional App Server instances
+;; Path to codex executable for optional native TUI instances
 (setq magnus-codex-executable "/path/to/codex")
 
 ;; Default directory for new instances
@@ -430,7 +416,7 @@ magnus/
 ├── magnus-persistence.el  # Save/restore state across sessions
 ├── magnus-process.el      # Process management (vterm + headless)
 ├── magnus-provider.el     # Additive provider dispatch
-├── magnus-provider-codex.el # Optional Codex App Server provider
+├── magnus-provider-codex.el # Optional native Codex TUI provider
 ├── magnus-trace.el        # Thinking trace JSONL viewer
 ├── magnus-status.el       # Status buffer UI
 ├── magnus-transient.el    # Transient popup menus

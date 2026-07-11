@@ -24,11 +24,11 @@
   (id nil :documentation "Unique identifier (UUID string).")
   (name nil :documentation "User-friendly name.")
   (directory nil :documentation "Working directory.")
-  (buffer nil :documentation "The vterm buffer running claude.")
+  (buffer nil :documentation "The display buffer running the agent.")
   (created-at nil :documentation "Creation timestamp.")
   (provider 'claude :documentation "Agent provider symbol (defaults to `claude').")
   (status 'stopped :documentation "Status: running, stopped, suspended, purged.")
-  (session-id nil :documentation "Claude Code session ID for this instance.")
+  (session-id nil :documentation "Provider session ID for this instance.")
   (previous-session-id nil :documentation "Session ID before last directory change.")
   (purged-at nil :documentation "Timestamp when instance was archived (purged)."))
 
