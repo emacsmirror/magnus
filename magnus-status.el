@@ -15,6 +15,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'eldoc)
 (require 'seq)
 (require 'subr-x)
 (require 'magnus-instances)
@@ -132,6 +133,13 @@ Set this to nil to keep the textual review badge but disable its animation."
   :set #'magnus-status--set-review-animation-interval
   :group 'magnus)
 
+(defcustom magnus-status-show-context-hints t
+  "Whether the Magnus status buffer shows point-sensitive action hints.
+Hints use ElDoc's echo-area ownership, so they wait for ordinary command and
+asynchronous messages instead of replacing them."
+  :type 'boolean
+  :group 'magnus)
+
 (defconst magnus-status--review-animation-frames ["|" "/" "-" "\\"]
   "Fixed-width frames used by the active-review status badge.")
 
@@ -140,6 +148,80 @@ Set this to nil to keep the textual review badge but disable its animation."
 
 (defvar magnus-status--review-animation-frame 0
   "Index of the current active-review animation frame.")
+
+(defvar-local magnus-status--last-context-hint nil
+  "Last echo-area string displayed by Magnus's ElDoc backend.")
+
+(defun magnus-status--context-hint-message (format-string &rest args)
+  "Display an ElDoc message without replacing unrelated echo-area output.
+FORMAT-STRING and ARGS follow `message'.  Magnus may replace silence or its
+own prior hint; ordinary command, timer, and process messages retain ownership."
+  (let ((current (current-message)))
+    (if (or (null current)
+            (and magnus-status--last-context-hint
+                 (string=
+                  (substring-no-properties current)
+                  (substring-no-properties
+                   magnus-status--last-context-hint))))
+        (progn
+          (apply #'eldoc-minibuffer-message format-string args)
+          ;; Record the rendered message rather than the source hint: ElDoc can
+          ;; truncate it to the frame width before it reaches the echo area.
+          (setq magnus-status--last-context-hint
+                (and format-string (current-message))))
+      ;; ElDoc records a message before invoking its display function.  If we
+      ;; declined that display, forget both ownership records so a later
+      ;; pre-command refresh cannot resurrect the skipped hint.
+      (setq magnus-status--last-context-hint nil
+            eldoc-last-message nil))))
+
+(defun magnus-status--context-hint (_callback)
+  "Return an ElDoc action hint for the status entity at point.
+The displayed keys come from the active keymaps, so user rebindings remain
+truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
+  (when magnus-status-show-context-hints
+    (let* ((review (magnus-status--get-review-at-point))
+           (instance (and (not review)
+                          (magnus-status--get-instance-at-point)))
+           (hint
+            (cond
+              (review
+               (let* ((round (magnus-status--review-round-to-open review))
+                      (identity
+                       (if round
+                           (format "%s · round %d"
+                                   (or (magnus-review-reviewer-name review)
+                                       "Review")
+                                   (magnus-review-round-number round))
+                         (or (magnus-review-reviewer-name review) "Review"))))
+                 (concat
+                  identity " — "
+                  (when round "\\[magnus-status-visit] open · ")
+                  "\\[magnus-review-request-dispatch] review actions · "
+                  "\\[magnus-dispatch] all actions")))
+              (instance
+               (if (eq (magnus-instance-status instance) 'purged)
+                   (format
+                    (concat
+                     "%s (archived) — "
+                     "\\[magnus-status-resurrect-purged] resurrect · "
+                     "\\[magnus-dispatch] all actions")
+                    (magnus-instance-name instance))
+                 (format
+                  (concat
+                   "%s — \\[magnus-status-visit] visit · "
+                   "\\[magnus-status-send-message] message · "
+                   "\\[magnus-review-request-dispatch] request review · "
+                   "\\[magnus-status-trace] thinking trace · "
+                   "\\[magnus-dispatch] all actions")
+                  (magnus-instance-name instance))))
+              (t
+               (concat
+                "Magnus — \\[magnus-status-next]/"
+                "\\[magnus-status-previous] navigate · "
+               "\\[magnus-status-create] create agent · "
+               "\\[magnus-dispatch] all actions")))))
+      (substitute-command-keys hint))))
 
 ;;; Mode definition
 
@@ -179,6 +261,16 @@ Set this to nil to keep the textual review badge but disable its animation."
   :group 'magnus
   (setq-local revert-buffer-function #'magnus-status--revert)
   (setq-local truncate-lines t)
+  (when magnus-status-show-context-hints
+    (add-hook 'eldoc-documentation-functions
+              #'magnus-status--context-hint nil t)
+    (setq-local eldoc-message-function
+                #'magnus-status--context-hint-message)
+    (setq-local magnus-status--last-context-hint nil)
+    ;; ElDoc already recognizes ordinary cursor motion.  Magnus's semantic
+    ;; item motion uses package-specific command names, so register those too.
+    (eldoc-add-command 'magnus-status-next 'magnus-status-previous)
+    (eldoc-mode 1))
   (add-hook 'magnus-instances-changed-hook #'magnus-status--maybe-refresh)
   (add-hook 'kill-buffer-hook #'magnus-status-stop-review-animation nil t)
   (add-hook 'change-major-mode-hook

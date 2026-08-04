@@ -71,6 +71,9 @@ exact Git range, chooses a durable reviewer identity using the existing
 expertise index, and runs a headless reviewer from the opposite provider by
 default.
 Provider, model, and reasoning effort remain optional transient overrides.
+As point moves through `*magnus*`, the echo area shows context-sensitive key
+hints that follow your own key bindings. On an agent, `v` requests a review;
+on a review, the same key opens that review's actions.
 
 Reviews are durable work objects rather than terminal instances. Their exact
 base and head commits, attempts, provider session, findings, delivery state,
@@ -329,9 +332,9 @@ Press `?` in the status buffer to see all commands organized by category:
 **Independent Reviews**
 | Key | Action                       |
 |-----|------------------------------|
-| `v` | Review agent at point        |
+| `v` | Review agent / review actions |
 | `o` | Open review at point         |
-| `V` | Review actions               |
+| `V` | Review actions (alias)       |
 
 The shortest request is `v RET`; `? v RET` remains available from the full
 dispatcher. The popup names the selected agent and makes clear whether `RET`

@@ -30,6 +30,147 @@
   (should (eq (lookup-key magnus-status-mode-map (kbd "V"))
               'magnus-review-actions)))
 
+(ert-deftest magnus-status-context-hints-use-buffer-local-eldoc ()
+  (let ((magnus-status-show-context-hints t))
+    (with-temp-buffer
+      (magnus-status-mode)
+      (should eldoc-mode)
+      (should (eq eldoc-message-function
+                  #'magnus-status--context-hint-message))
+      (should (memq #'magnus-status--context-hint
+                    eldoc-documentation-functions))
+      (should (intern-soft "magnus-status-next" eldoc-message-commands))
+      (should (intern-soft "magnus-status-previous"
+                           eldoc-message-commands))))
+  (let ((magnus-status-show-context-hints nil))
+    (with-temp-buffer
+      (magnus-status-mode)
+      (should-not (memq #'magnus-status--context-hint
+                        eldoc-documentation-functions)))))
+
+(ert-deftest magnus-status-context-hints-preserve-unrelated-messages ()
+  (let ((echo "Review completed for quick-wren")
+        (eldoc-last-message "stale ElDoc hint")
+        (magnus-status--last-context-hint "old Magnus hint"))
+    (cl-letf (((symbol-function 'current-message) (lambda () echo))
+              ((symbol-function 'eldoc-minibuffer-message)
+               (lambda (format-string &rest args)
+                 (setq echo
+                       (and format-string
+                            (apply #'format-message format-string args))))))
+      ;; A timer or process notification owns the echo area, so a delayed hint
+      ;; neither replaces it nor leaves a stale ElDoc message to resurrect.
+      (magnus-status--context-hint-message "%s" "new Magnus hint")
+      (should (equal echo "Review completed for quick-wren"))
+      (should-not magnus-status--last-context-hint)
+      (should-not eldoc-last-message)
+      ;; Silence is available, and the exact rendered message becomes Magnus's
+      ;; ownership token for the next contextual update.
+      (setq echo nil)
+      (magnus-status--context-hint-message "%s" "new Magnus hint")
+      (should (equal echo "new Magnus hint"))
+      (should (equal magnus-status--last-context-hint "new Magnus hint"))
+      (magnus-status--context-hint-message "%s" "next Magnus hint")
+      (should (equal echo "next Magnus hint"))
+      (magnus-status--context-hint-message nil)
+      (should-not echo)
+      (should-not magnus-status--last-context-hint))))
+
+(ert-deftest magnus-status-context-hints-follow-review-lines-and-bindings ()
+  (let* ((round
+          (magnus-review-round--create
+           :number 1 :execution 'complete :verdict 'approve
+           :read-state 'unread))
+         (review
+          (magnus-review--create
+           :id "review-hint" :reviewer-name "keen-owl"
+           :author-name "quick-wren" :lifecycle 'open :execution 'complete
+           :read-state 'unread :created-at (float-time)
+           :updated-at (float-time) :rounds (list round)))
+         (waiting
+          (magnus-review--create
+           :id "review-waiting" :reviewer-name "swift-hare"
+           :author-name "bright-crow" :lifecycle 'open
+           :execution 'waiting-for-checkpoint :created-at (float-time)
+           :updated-at (float-time))))
+    (with-temp-buffer
+      (magnus-status-mode)
+      (let ((inhibit-read-only t))
+        (magnus-status--insert-review review))
+      (cl-letf (((symbol-function 'magnus-review-get)
+                 (lambda (id)
+                   (and (string= id "review-hint") review))))
+        (goto-char (point-min))
+        (search-forward "keen-owl")
+        (let ((reviewer-hint
+               (substring-no-properties
+                (magnus-status--context-hint nil))))
+          (search-forward "round 1")
+          (let ((round-hint
+                 (substring-no-properties
+                  (magnus-status--context-hint nil))))
+            (should (equal reviewer-hint round-hint))
+            (should (equal round-hint
+                           (concat "keen-owl · round 1 — RET open · "
+                                   "v review actions · ? all actions")))))
+        ;; Hints resolve command keys at display time, so user rebinding remains
+        ;; truthful instead of baking Magnus's default keys into prose.
+        (let ((map (copy-keymap magnus-status-mode-map)))
+          (define-key map (kbd "v") nil)
+          (define-key map (kbd "u") #'magnus-review-request-dispatch)
+          (use-local-map map)
+          (should
+           (string-match-p
+            "u review actions"
+            (substring-no-properties
+             (magnus-status--context-hint nil))))
+          (use-local-map magnus-status-mode-map)))
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (propertize "waiting" 'magnus-review-id "review-waiting")))
+      (goto-char (point-min))
+      (cl-letf (((symbol-function 'magnus-review-get)
+                 (lambda (id)
+                   (and (string= id "review-waiting") waiting))))
+        (let ((hint (substring-no-properties
+                     (magnus-status--context-hint nil))))
+          (should (string-match-p "v review actions" hint))
+          (should-not (string-match-p "RET open" hint)))))))
+
+(ert-deftest magnus-status-context-hints-distinguish-agent-lifecycle ()
+  (let ((active
+         (magnus-instance--create
+          :id "active" :name "quick-wren" :status 'running))
+        (purged
+         (magnus-instance--create
+          :id "purged" :name "wise-deer" :status 'purged)))
+    (with-temp-buffer
+      (magnus-status-mode)
+      (let ((inhibit-read-only t))
+        (insert (propertize "active" 'magnus-instance-id "active") "\n")
+        (insert (propertize "purged" 'magnus-instance-id "purged") "\n")
+        (insert "heading"))
+      (cl-letf (((symbol-function 'magnus-instances-get)
+                 (lambda (id)
+                   (cond ((string= id "active") active)
+                         ((string= id "purged") purged)))))
+        (goto-char (point-min))
+        (should
+         (equal
+          (substring-no-properties (magnus-status--context-hint nil))
+          (concat "quick-wren — RET visit · m message · v request review · "
+                  "t thinking trace · ? all actions")))
+        (forward-line 1)
+        (should
+         (equal
+          (substring-no-properties (magnus-status--context-hint nil))
+          "wise-deer (archived) — R resurrect · ? all actions"))
+        (forward-line 1)
+        (should
+         (equal
+          (substring-no-properties (magnus-status--context-hint nil))
+          "Magnus — n/p navigate · c create agent · ? all actions"))))))
+
 (ert-deftest magnus-review-transient-names-the-selected-operation ()
   (let* ((author
           (magnus-instance--create
@@ -66,6 +207,33 @@
                 'magnus-review-request-dispatch))
     (should (eq (plist-get (nth 2 request) :command)
                 'magnus-transient-request-review))))
+
+(ert-deftest magnus-review-direct-key-is-contextual-on-review-rows ()
+  (let ((review (magnus-review--create
+                 :id "contextual-review" :reviewer-name "keen-owl"))
+        (author (magnus-instance--create :id "author" :name "quick-wren"))
+        selected opened)
+    (cl-letf (((symbol-function 'magnus-status--get-review-at-point)
+               (lambda () review))
+              ((symbol-function 'magnus-review-actions)
+               (lambda (&optional candidate _round)
+                 (setq selected candidate))))
+      (magnus-review-request-dispatch))
+    (should (eq selected review))
+    (let ((magnus-transient--review-request-context nil))
+      (cl-letf (((symbol-function 'magnus-status--get-review-at-point)
+                 (lambda () nil))
+                ((symbol-function 'magnus-status--get-instance-at-point)
+                 (lambda () author))
+                ((symbol-function 'magnus-review-request-context)
+                 (lambda (candidate)
+                   (list :author candidate :action 'new)))
+                ((symbol-function 'transient-setup)
+                 (lambda (prefix &rest _args) (setq opened prefix))))
+        (magnus-review-request-dispatch))
+      (should (eq opened #'magnus-review-request-menu))
+      (should (eq (plist-get magnus-transient--review-request-context :author)
+                  author)))))
 
 (ert-deftest magnus-review-transient-setup-renders-the-request-menu ()
   (let* ((author

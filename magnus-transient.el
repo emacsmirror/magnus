@@ -43,9 +43,17 @@
 
 (defun magnus-transient--main-review-description ()
   "Describe the review request action for the current status row."
-  (if-let ((instance (magnus-status--get-instance-at-point)))
-      (format "Review %s's committed work…" (magnus-instance-name instance))
-    "Request review… (select an agent)"))
+  (let ((review (magnus-status--get-review-at-point))
+        (instance (magnus-status--get-instance-at-point)))
+    (cond
+     (review
+      (format "Actions for %s's review…"
+              (or (magnus-review-reviewer-name review)
+                  "selected reviewer")))
+     (instance
+      (format "Review %s's committed work…"
+              (magnus-instance-name instance)))
+     (t "Review… (select an agent or review)"))))
 
 (defun magnus-transient--current-review-request-context ()
   "Return the cached review request context, if any."
@@ -127,14 +135,18 @@
 
 ;;;###autoload
 (defun magnus-review-request-dispatch ()
-  "Open a contextual review request transient for the agent at point."
+  "Open the contextual review command for the status entity at point.
+On an agent, open its review request transient.  On a durable review, open its
+review actions."
   (interactive)
-  (let ((author (or (magnus-status--get-instance-at-point)
-                    (user-error
-                     "Put point on the agent whose work should be reviewed"))))
-    (setq magnus-transient--review-request-context
-          (magnus-review-request-context author))
-    (transient-setup #'magnus-review-request-menu)))
+  (if-let ((review (magnus-status--get-review-at-point)))
+      (magnus-review-actions review)
+    (let ((author
+           (or (magnus-status--get-instance-at-point)
+               (user-error "Put point on an agent or review first"))))
+      (setq magnus-transient--review-request-context
+            (magnus-review-request-context author))
+      (transient-setup #'magnus-review-request-menu))))
 
 ;;; Main dispatch
 
