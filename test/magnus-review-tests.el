@@ -212,6 +212,104 @@
       (magnus-test-review--git root "commit" "--quiet" "-m" "head")
       (list root base (magnus-test-review--git root "rev-parse" "HEAD")))))
 
+(defun magnus-test-review--publish-fixture-round (review round)
+  "Make ROUND a structurally complete published result in REVIEW."
+  (let* ((attempt (magnus-review-append-attempt review round))
+         (now (float-time)))
+    (setf (magnus-review-attempt-execution attempt) 'complete
+          (magnus-review-attempt-finished-at attempt) now
+          (magnus-review-round-execution round) 'complete
+          (magnus-review-round-verdict round) 'changes-requested
+          (magnus-review-round-completed-at round) now
+          (magnus-review-round-delivery-state round) 'pending
+          (magnus-review-round-read-state round) 'unread
+          (magnus-review-execution review) 'complete
+          (magnus-review-verdict review) 'changes-requested)
+    (magnus-review-save review)
+    round))
+
+(ert-deftest magnus-review-unchanged-checkpoint-waits-and-advances-durably ()
+  (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-unchanged-" t))
+               (magnus-review-directory-root storage)
+               (magnus-reviews nil)
+               (magnus-reviews-changed-hook nil)
+               (ready 0)
+               (magnus-review-ready-hook
+                (list (lambda (_review _round) (cl-incf ready)))))
+    (unwind-protect
+        (let* ((review
+                (magnus-review-create
+                 root "unchanged-author-id" "bright-crow"
+                 :id "unchanged-checkpoint"
+                 :task "Review an already committed checkpoint"
+                 :reviewer-name "swift-hare"
+                 :reviewer-provider 'codex))
+               (round
+                (magnus-review-append-round
+                 review base head
+                 :checkpoint-token (magnus-review-checkpoint-token review))))
+          (magnus-test-review--publish-fixture-round review round)
+          (let* ((token (magnus-review-await-checkpoint review))
+                 (marker (list :request-id (magnus-review-id review)
+                               :checkpoint-token token
+                               :base base :head head)))
+            ;; A fresh re-review token can legitimately name the exact latest
+            ;; completed evidence.  It spends no provider invocation and keeps
+            ;; this exact token waiting for a genuinely new commit.
+            (should (eq (magnus-review-handle-ready-marker root marker) round))
+            (should (eq (magnus-review-handle-ready-marker root marker) round))
+            (should (eq (magnus-review-execution review)
+                        'waiting-for-checkpoint))
+            (should (eq (magnus-review-verdict review) 'changes-requested))
+            (should (equal (magnus-review-checkpoint-token review) token))
+            (should (= (length (magnus-review-rounds review)) 1))
+            (should (= (length (magnus-review-checkpoint-acks review)) 1))
+            (should (= ready 0))
+            (should (equal (magnus-review-checkpoint-acks review)
+                           (list (cons token 1))))
+            (with-temp-file (expand-file-name "sample.el" root)
+              (insert "(defun sample ()\n  3)\n"))
+            (magnus-test-review--git root "add" "--" "sample.el")
+            (magnus-test-review--git root "commit" "--quiet" "-m" "advance")
+            (let* ((new-head
+                    (magnus-test-review--git root "rev-parse" "HEAD"))
+                   (new-marker
+                    (list :request-id (magnus-review-id review)
+                          :checkpoint-token token
+                          :base base :head new-head))
+                   (round-two
+                    (magnus-review-handle-ready-marker root new-marker)))
+              (should (= (magnus-review-round-number round-two) 2))
+              (should (equal (magnus-review-round-previous-head-oid round-two)
+                             head))
+              (should (= (length (magnus-review-rounds review)) 2))
+              (should (= ready 1))
+              ;; Once the token advances, neither its provisional nor canonical
+              ;; scope permits an unrelated third object.
+              (should-error
+               (magnus-review-handle-ready-marker
+                root (plist-put (copy-sequence new-marker) :head
+                                "cccccccccccccccccccccccccccccccccccccccc"))
+               :type 'magnus-review-error)
+              ;; Startup replays the whole coordination log.  Loading from disk
+              ;; in file order: provisional first, canonical second.  Both are
+              ;; benign, and only queued canonical recovery runs the hook.
+              (setq magnus-reviews nil)
+              (should (= (magnus-review-load-all) 1))
+              (let* ((loaded (magnus-review-get "unchanged-checkpoint"))
+                     (loaded-rounds (magnus-review-rounds loaded)))
+                (should (eq (magnus-review-handle-ready-marker root marker)
+                            (nth 0 loaded-rounds)))
+                (should (eq (magnus-review-handle-ready-marker root new-marker)
+                            (nth 1 loaded-rounds)))
+                (should (eq (magnus-review-execution loaded) 'queued))
+                (should (= (length loaded-rounds) 2))
+                (should (= (length (magnus-review-checkpoint-acks loaded)) 1))
+                (should (= ready 2))))))
+      (delete-directory root t)
+      (delete-directory storage t))))
+
 (defun magnus-test-review--raw-result (base head &optional path line)
   "Return valid structured output for BASE..HEAD, optionally anchored."
   `((schema_version . 1)

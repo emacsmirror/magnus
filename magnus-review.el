@@ -120,7 +120,8 @@ This bounds durable storage and accidental giant binary reviews."
   head-oid
   previous-head-oid
   rounds
-  metadata)
+  metadata
+  checkpoint-acks)
 
 (defvar magnus-reviews nil
   "All reviews loaded in this Emacs session.")
@@ -613,6 +614,12 @@ Evidence files are append-only, private, and remain after worktree cleanup."
   "Return REVIEW's latest round, or nil."
   (car (last (magnus-review-rounds review))))
 
+(defun magnus-review--checkpoint-ack-round-for-token (review token)
+  "Return REVIEW's acknowledged immutable round for TOKEN, or nil."
+  (when-let ((round-number
+              (cdr (assoc token (magnus-review-checkpoint-acks review)))))
+    (nth (1- round-number) (magnus-review-rounds review))))
+
 (defun magnus-review-latest-attempt (round)
   "Return ROUND's latest attempt, or nil."
   (car (last (magnus-review-round-attempts round))))
@@ -719,6 +726,36 @@ The initial request waits for an exact committed checkpoint."
         (magnus-review-updated-at review) (float-time))
   (magnus-review-save review)
   (magnus-review-checkpoint-token review))
+
+(defun magnus-review--acknowledge-unchanged-checkpoint
+    (review checkpoint-token base head)
+  "Durably acknowledge that REVIEW remained at exact BASE and HEAD.
+CHECKPOINT-TOKEN identifies the request whose author reported no new committed
+evidence.  The latest completed round and its verdict remain authoritative."
+  (let ((latest (magnus-review-latest-round review)))
+    (unless (and latest
+                 (eq (magnus-review-lifecycle review) 'open)
+                 (eq (magnus-review-execution review)
+                     'waiting-for-checkpoint)
+                 (eq (magnus-review-round-execution latest) 'complete)
+                 (string= base (magnus-review-round-base-oid latest))
+                 (string= head (magnus-review-round-head-oid latest)))
+      (magnus-review--signal
+       "Unchanged checkpoint does not match the latest completed round"))
+    (let ((now (float-time)))
+      (setf (magnus-review-checkpoint-acks review)
+            (append
+             (magnus-review-checkpoint-acks review)
+             (list (cons checkpoint-token
+                         (magnus-review-round-number latest))))
+            (magnus-review-updated-at review) now)
+      (magnus-review-save review)
+      (message
+       "Magnus: %s reported no new committed changes; review is still waiting after round %d (%s)"
+       (magnus-review-author-name review)
+       (magnus-review-round-number latest)
+       (magnus-review-round-verdict latest))
+      latest)))
 
 (cl-defun magnus-review-append-round
     (review base-revision head-revision
@@ -1179,6 +1216,10 @@ become arrays, while object keys remain strings, symbols, or keywords."
                     (magnus-review-read-state review)))
     (session_id . ,(magnus-review-session-id review))
     (checkpoint_token . ,(magnus-review-checkpoint-token review))
+    (checkpoint_acks
+     . ,(vconcat
+         (mapcar (lambda (ack) (vector (car ack) (cdr ack)))
+                 (magnus-review-checkpoint-acks review))))
     (created_at . ,(magnus-review-created-at review))
     (updated_at . ,(magnus-review-updated-at review))
     (closed_at . ,(magnus-review-closed-at review))
@@ -1222,6 +1263,22 @@ become arrays, while object keys remain strings, symbols, or keywords."
               (and allow-nil (null value)))
     (magnus-review--signal "Invalid %s in manifest: %S" kind value))
   (and value (downcase value)))
+
+(defun magnus-review--checkpoint-acks-from-json (object)
+  "Deserialize checkpoint token-to-round acknowledgement OBJECT."
+  (mapcar
+   (lambda (entry)
+     (pcase entry
+       (`(,token ,round-number)
+        (unless (and (magnus-review--valid-token-p token)
+                     (integerp round-number)
+                     (> round-number 0))
+          (magnus-review--signal
+           "Invalid checkpoint acknowledgement: %S" entry))
+        (cons token round-number))
+       (_ (magnus-review--signal
+           "Malformed checkpoint acknowledgement: %S" entry))))
+   object))
 
 (defun magnus-review--attempt-from-json (object expected-number)
   "Deserialize attempt OBJECT, requiring EXPECTED-NUMBER."
@@ -1349,6 +1406,9 @@ become arrays, while object keys remain strings, symbols, or keywords."
                   magnus-review--read-states "read")
      :session-id (alist-get 'session_id object)
      :checkpoint-token (alist-get 'checkpoint_token object)
+     :checkpoint-acks
+     (magnus-review--checkpoint-acks-from-json
+      (alist-get 'checkpoint_acks object))
      :created-at (magnus-review--require-number
                   (alist-get 'created_at object) "creation time")
      :updated-at (magnus-review--require-number
@@ -1470,6 +1530,41 @@ become arrays, while object keys remain strings, symbols, or keywords."
           (magnus-review--signal
            "Non-complete round %d contains published result state" round-number)))
       (setq previous-head (magnus-review-round-head-oid round)))
+    (let (round-checkpoints acknowledged-tokens)
+      (dolist (round (magnus-review-rounds review))
+        (when-let ((token (magnus-review-round-checkpoint-token round)))
+          (when (assoc token round-checkpoints)
+            (magnus-review--signal
+             "Checkpoint token identifies more than one review round"))
+          (push (cons token round) round-checkpoints)))
+      (dolist (ack (magnus-review-checkpoint-acks review))
+        (let* ((token (car-safe ack))
+               (round-number (cdr-safe ack))
+               (round (and (integerp round-number)
+                           (> round-number 0)
+                           (nth (1- round-number)
+                                (magnus-review-rounds review))))
+               (eventual-round (cdr (assoc token round-checkpoints))))
+          (unless (and (magnus-review--valid-token-p token)
+                       round
+                       (= round-number
+                          (magnus-review-round-number round)))
+            (magnus-review--signal
+             "Checkpoint acknowledgement has an invalid round: %S" ack))
+          (when (member token acknowledged-tokens)
+            (magnus-review--signal
+             "Checkpoint token has more than one acknowledgement"))
+          (when (and eventual-round
+                     (not
+                      (and
+                       (= (magnus-review-round-number eventual-round)
+                          (1+ round-number))
+                       (string=
+                        (magnus-review-round-previous-head-oid eventual-round)
+                        (magnus-review-round-head-oid round)))))
+            (magnus-review--signal
+             "Acknowledged checkpoint token advanced from the wrong round"))
+          (push token acknowledged-tokens))))
     (let ((latest (magnus-review-latest-round review)))
       (if latest
           (unless (and (string= (magnus-review-base-oid review)
@@ -1874,9 +1969,11 @@ Even with FORCE, cleanup never operates outside REVIEW's derived checkout."
   "Validate a coordination review-ready MARKER emitted in DIRECTORY.
 MARKER is a plist with :request-id, :checkpoint-token, :base, and :head strings.
 A new valid marker appends an immutable round and runs
-`magnus-review-ready-hook'.  Replayed markers never append a duplicate round,
-but a queued round re-runs the hook so startup recovery can continue launching
-it idempotently."
+`magnus-review-ready-hook'.  An unchanged re-review checkpoint is acknowledged
+without duplicating the round or launching a model, and its request keeps
+waiting for new committed evidence.  Replayed markers never append a duplicate
+round, but a queued round re-runs the hook so startup recovery can continue
+launching it idempotently."
   (let* ((request-id (plist-get marker :request-id))
          (token (plist-get marker :checkpoint-token))
          (base (plist-get marker :base))
@@ -1900,20 +1997,35 @@ it idempotently."
                (lambda (round)
                  (string= token
                           (or (magnus-review-round-checkpoint-token round) "")))
-               (magnus-review-rounds review))))
+               (magnus-review-rounds review)))
+             (acknowledged
+              (magnus-review--checkpoint-ack-round-for-token review token))
+             (persisted-match
+              (and persisted
+                   (string= base (magnus-review-round-base-oid persisted))
+                   (string= head (magnus-review-round-head-oid persisted))))
+             (acknowledged-match
+              (and acknowledged
+                   (string= base (magnus-review-round-base-oid acknowledged))
+                   (string= head (magnus-review-round-head-oid acknowledged)))))
         (cond
          ;; Startup replays the full coordination log.  Historical checkpoint
          ;; tokens remain immutable identities even after the review advances to
          ;; a newer current token, and their Git objects may since have been GC'd.
-         (persisted
-          (unless (and (string= base (magnus-review-round-base-oid persisted))
-                       (string= head (magnus-review-round-head-oid persisted)))
-            (magnus-review--signal
-             "Replayed review-ready marker changed its Git scope"))
+         (persisted-match
           (when (and (eq persisted latest)
                      (eq (magnus-review-round-execution persisted) 'queued))
             (run-hook-with-args 'magnus-review-ready-hook review persisted))
           persisted)
+         ;; A re-review request may legitimately produce no new commit.  Its
+         ;; fresh token remains a durable event identity so startup replay can
+         ;; accept it without manufacturing a duplicate round or model run.
+         (acknowledged-match acknowledged)
+         ;; Once the token binds to a real round, only that canonical scope or
+         ;; its earlier acknowledged no-progress scope may replay successfully.
+         (persisted
+          (magnus-review--signal
+           "Replayed review-ready marker changed its Git scope"))
          ((not (string= token
                         (or (magnus-review-checkpoint-token review) "")))
           (magnus-review--signal "Review-ready token does not match request %s"
@@ -1928,11 +2040,18 @@ it idempotently."
                          (string= resolved-head head))
               (magnus-review--signal
                "Review-ready values must be exact commit object IDs"))
-            (let ((round (magnus-review-append-round
-                          review resolved-base resolved-head
-                          :checkpoint-token token)))
-              (run-hook-with-args 'magnus-review-ready-hook review round)
-              round))))))))
+            (if (and latest
+                     (string= resolved-base
+                              (magnus-review-round-base-oid latest))
+                     (string= resolved-head
+                              (magnus-review-round-head-oid latest)))
+                (magnus-review--acknowledge-unchanged-checkpoint
+                 review token resolved-base resolved-head)
+              (let ((round (magnus-review-append-round
+                            review resolved-base resolved-head
+                            :checkpoint-token token)))
+                (run-hook-with-args 'magnus-review-ready-hook review round)
+                round)))))))))
 
 (defun magnus-review-setup-coordination ()
   "Register review-ready marker handling when coordination is available."
