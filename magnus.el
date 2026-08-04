@@ -43,6 +43,7 @@
 ;;   c   - Create new instance
 ;;   k   - Archive instance
 ;;   r   - Rename instance
+;;   v   - Request an independent review
 ;;   g   - Refresh status
 ;;   ?   - Show help menu
 
@@ -81,6 +82,7 @@
 (declare-function magnus-review-load-all "magnus-review")
 (declare-function magnus-review-controller-setup "magnus-review-controller")
 (declare-function magnus-review-controller-shutdown "magnus-review-controller")
+(declare-function magnus-status-stop-review-animation "magnus-status")
 
 (defvar magnus-context-directory)
 (defvar magnus-context-cache-directory)
@@ -668,6 +670,8 @@ The agent runs to completion and exits."
   "Stop all Magnus timers, watchers, and hooks."
   (when (fboundp 'magnus-review-controller-shutdown)
     (magnus-review-controller-shutdown))
+  (when (fboundp 'magnus-status-stop-review-animation)
+    (magnus-status-stop-review-animation))
   (magnus-coord-stop-reminders)
   (magnus-health-stop)
   (magnus-attention-stop)

@@ -65,10 +65,11 @@ established prompt remains unchanged.
 
 ### Durable Cross-Provider Reviews
 
-Put point on an agent in `*magnus*`, press `? v RET`, and Magnus handles the
-rest. It asks the author for a coherent committed checkpoint, infers the exact
-Git range, chooses a durable reviewer identity using the existing expertise
-index, and runs a headless reviewer from the opposite provider by default.
+Put point on an agent in `*magnus*`, press `v`, then `RET`, and Magnus handles
+the rest. It asks the author for a coherent committed checkpoint, infers the
+exact Git range, chooses a durable reviewer identity using the existing
+expertise index, and runs a headless reviewer from the opposite provider by
+default.
 Provider, model, and reasoning effort remain optional transient overrides.
 
 Reviews are durable work objects rather than terminal instances. Their exact
@@ -77,6 +78,10 @@ and read state survive Emacs restarts under `~/.magnus/reviews/`. Re-reviewing
 keeps the reviewer identity and provider session, gives prior findings stable
 IDs, and adds a new immutable round. Headless execution is serialized by
 default to keep laptop resource use modest.
+
+While a model is actively reviewing an agent, that agent's status row shows a
+small animated `[review /]` badge. Queued work and checkpoint waiting remain
+static so motion always means actual reviewer execution.
 
 Completed reviews appear in their own status section with an unread dot. Press
 `RET` to open a Magit-style diff reader: files and hunks fold with `TAB`, `n/p`
@@ -257,7 +262,7 @@ include the guard.
 4. Create more instances with `c`
 5. Switch between them with `RET`
 6. Watch them coordinate in the status buffer
-7. On an agent, press `? v RET` to request an independent review
+7. On an agent, press `v RET` to request an independent review
 
 ## Key Bindings
 
@@ -274,6 +279,8 @@ include the guard.
 | `d`   | Change directory             |
 | `m`   | Send message to agent        |
 | `t`   | Open thinking trace          |
+| `v`   | Request/configure review     |
+| `V`   | Actions for review at point  |
 | `x`   | Open context buffer          |
 | `C`   | Open coordination file       |
 | `a/A` | Next/show attention requests |
@@ -319,15 +326,19 @@ Press `?` in the status buffer to see all commands organized by category:
 | `C` | Open coordination file   |
 | `I` | Open agent instructions  |
 
-**Reviews**
+**Independent Reviews**
 | Key | Action                       |
 |-----|------------------------------|
-| `v` | Configure/request review     |
+| `v` | Review agent at point        |
 | `o` | Open review at point         |
 | `V` | Review actions               |
 
-The default request is `? v RET`. In the request popup, `p`, `m`, and `e`
-override provider, model, and reasoning effort respectively.
+The shortest request is `v RET`; `? v RET` remains available from the full
+dispatcher. The popup names the selected agent and makes clear whether `RET`
+will create a reviewer, request a new round, retry a failure, or do nothing
+because work is already pending. For a new durable reviewer, `p`, `m`, and `e`
+override provider, model, and reasoning effort respectively. Re-reviews and
+retries preserve the existing reviewer identity, provider, and session.
 
 The `? V` action popup (or `?` inside a review reader) provides:
 

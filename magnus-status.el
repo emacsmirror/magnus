@@ -23,9 +23,11 @@
 (require 'magnus-attention)
 (require 'magnus-health)
 (require 'magnus-review)
-(require 'magnus-review-ui)
 
 (declare-function magnus-dispatch "magnus-transient")
+(declare-function magnus-review-request-dispatch "magnus-transient")
+(declare-function magnus-review-actions "magnus-transient")
+(declare-function magnus-review-ui-open "magnus-review-ui")
 (declare-function magnus-coord-agent-busy-p "magnus-coord")
 (declare-function magnus-coord--neglected-p "magnus-coord")
 (declare-function magnus-retro "magnus-coord")
@@ -105,6 +107,40 @@
   "Face for durable reviewer identities."
   :group 'magnus)
 
+(defface magnus-status-reviewing
+  '((t :inherit font-lock-builtin-face :weight bold))
+  "Face for an active independent-review badge."
+  :group 'magnus)
+
+(defun magnus-status--set-review-animation-interval (symbol value)
+  "Set SYMBOL to VALUE and immediately normalize the visible status UI."
+  (set-default symbol value)
+  (when (fboundp 'magnus-status-stop-review-animation)
+    (magnus-status-stop-review-animation))
+  (when (and (boundp 'magnus-buffer-name)
+             (fboundp 'magnus-status-refresh))
+    (when-let ((buffer (get-buffer magnus-buffer-name)))
+      (with-current-buffer buffer
+        (when (derived-mode-p 'magnus-status-mode)
+          (magnus-status-refresh))))))
+
+(defcustom magnus-status-review-animation-interval 0.4
+  "Seconds between active-review animation frames.
+Set this to nil to keep the textual review badge but disable its animation."
+  :type '(choice (const :tag "Static badge" nil)
+                 (number :tag "Frame interval"))
+  :set #'magnus-status--set-review-animation-interval
+  :group 'magnus)
+
+(defconst magnus-status--review-animation-frames ["|" "/" "-" "\\"]
+  "Fixed-width frames used by the active-review status badge.")
+
+(defvar magnus-status--review-animation-timer nil
+  "Single presentation timer for active-review badges.")
+
+(defvar magnus-status--review-animation-frame 0
+  "Index of the current active-review animation frame.")
+
 ;;; Mode definition
 
 (defvar magnus-status-mode-map
@@ -119,6 +155,8 @@
     (define-key map (kbd "d") #'magnus-status-chdir)
     (define-key map (kbd "m") #'magnus-status-send-message)
     (define-key map (kbd "t") #'magnus-status-trace)
+    (define-key map (kbd "v") #'magnus-review-request-dispatch)
+    (define-key map (kbd "V") #'magnus-review-actions)
     (define-key map (kbd "g") #'magnus-status-refresh)
     (define-key map (kbd "x") #'magnus-status-context)
     (define-key map (kbd "C") #'magnus-status-coordination)
@@ -141,7 +179,12 @@
   :group 'magnus
   (setq-local revert-buffer-function #'magnus-status--revert)
   (setq-local truncate-lines t)
-  (add-hook 'magnus-instances-changed-hook #'magnus-status--maybe-refresh))
+  (add-hook 'magnus-instances-changed-hook #'magnus-status--maybe-refresh)
+  (add-hook 'kill-buffer-hook #'magnus-status-stop-review-animation nil t)
+  (add-hook 'change-major-mode-hook
+            #'magnus-status-stop-review-animation nil t)
+  (add-hook 'window-state-change-functions
+            #'magnus-status--window-state-change nil t))
 
 ;;; Buffer creation
 
@@ -153,7 +196,10 @@
       (unless (derived-mode-p 'magnus-status-mode)
         (magnus-status-mode))
       (magnus-status-refresh))
-    (switch-to-buffer buffer)))
+    (switch-to-buffer buffer)
+    ;; The initial render occurs before `switch-to-buffer', so synchronize once
+    ;; more now that a visible status buffer can own the presentation timer.
+    (magnus-status--sync-review-animation)))
 
 (defun magnus-status-refresh ()
   "Refresh the magnus status buffer."
@@ -187,7 +233,8 @@
          (t
           (goto-char (point-min))
           (forward-line (1- line))))
-        (magnus-status--goto-instance-line)))))
+        (magnus-status--goto-instance-line)
+        (magnus-status--sync-review-animation)))))
 
 (defun magnus-status--revert (_ignore-auto _noconfirm)
   "Revert function for status buffer."
@@ -196,8 +243,81 @@
 (defun magnus-status--maybe-refresh ()
   "Refresh if the status buffer is visible."
   (when-let ((buffer (get-buffer magnus-buffer-name)))
-    (when (get-buffer-window buffer)
+    (when (get-buffer-window buffer t)
       (magnus-status-refresh))))
+
+;;; Active review animation
+
+(defun magnus-status--review-animation-enabled-p ()
+  "Return non-nil when active-review animation is enabled."
+  (and (numberp magnus-status-review-animation-interval)
+       (> magnus-status-review-animation-interval 0)))
+
+(defun magnus-status-stop-review-animation ()
+  "Stop the global active-review presentation timer."
+  (when (timerp magnus-status--review-animation-timer)
+    (cancel-timer magnus-status--review-animation-timer))
+  (setq magnus-status--review-animation-timer nil
+        magnus-status--review-animation-frame 0))
+
+(defun magnus-status--review-animation-slot-p ()
+  "Return non-nil when the current buffer contains an animation slot."
+  (text-property-any (point-min) (point-max)
+                     'magnus-review-animation-slot t))
+
+(defun magnus-status--sync-review-animation ()
+  "Start or stop active-review animation for the current status buffer."
+  (let ((slot-p (and (derived-mode-p 'magnus-status-mode)
+                     (magnus-status--review-animation-slot-p))))
+    (cond
+     ;; A runtime motion opt-out must remove the stale frame as well as stop
+     ;; the timer.  Refresh renders the same accessible badge as `[review]'.
+     ((and slot-p (not (magnus-status--review-animation-enabled-p)))
+      (magnus-status-stop-review-animation)
+      (magnus-status-refresh))
+     ((and slot-p
+           (get-buffer-window (current-buffer) t))
+      (unless (timerp magnus-status--review-animation-timer)
+        (setq magnus-status--review-animation-timer
+              (run-with-timer magnus-status-review-animation-interval
+                              magnus-status-review-animation-interval
+                              #'magnus-status--review-animation-tick))))
+     (t
+      (magnus-status-stop-review-animation)))))
+
+(defun magnus-status--window-state-change (_window)
+  "Resynchronize review animation when the status buffer becomes visible."
+  (when (derived-mode-p 'magnus-status-mode)
+    (magnus-status--sync-review-animation)))
+
+(defun magnus-status--review-animation-tick ()
+  "Advance every visible active-review badge without rebuilding status."
+  (let ((buffer (and (boundp 'magnus-buffer-name)
+                     (get-buffer magnus-buffer-name))))
+    (if (and (buffer-live-p buffer)
+             (get-buffer-window buffer t))
+        (with-current-buffer buffer
+          (cond
+           ((not (magnus-status--review-animation-enabled-p))
+            (magnus-status--sync-review-animation))
+           ((not (magnus-status--review-animation-slot-p))
+            (magnus-status-stop-review-animation))
+           (t
+            (setq magnus-status--review-animation-frame
+                  (mod (1+ magnus-status--review-animation-frame)
+                       (length magnus-status--review-animation-frames)))
+            (let ((position (point-min))
+                  (frame
+                   (aref magnus-status--review-animation-frames
+                         magnus-status--review-animation-frame)))
+              (with-silent-modifications
+                (while (setq position
+                             (text-property-any
+                              position (point-max)
+                              'magnus-review-animation-slot t))
+                  (put-text-property position (1+ position) 'display frame)
+                  (setq position (1+ position))))))))
+      (magnus-status-stop-review-animation))))
 
 ;;; Buffer content
 
@@ -230,7 +350,9 @@
   (let ((instances (magnus-instances-active-list)))
     (if (and (null instances) (null (magnus-instances-purged-list)))
         (magnus-status--insert-empty-state)
-      (insert (propertize "Instances\n" 'face 'magnus-status-section-heading))
+      (insert (propertize "Instances" 'face 'magnus-status-section-heading))
+      (insert (propertize "  (RET visit · v review · ? actions)\n"
+                          'face 'magnus-status-empty-hint))
       (if (null instances)
           (progn
             (insert (propertize "  No active instances.\n"
@@ -273,7 +395,7 @@
               (magnus-status--insert-review review))))
       (insert
        (propertize
-        "  No reviews yet. On an instance, press '? v RET' to request one.\n"
+        "  No reviews yet. On an agent, press 'v', then RET, to request one.\n"
         'face 'magnus-status-empty-hint)))))
 
 (defun magnus-status--review-state-label (review round)
@@ -368,6 +490,45 @@
     (put-text-property start (point)
                        'magnus-review-id (magnus-review-id review))))
 
+(defun magnus-status--active-reviews-for-instance (instance)
+  "Return active durable reviews currently executing for INSTANCE."
+  (let ((instance-id (magnus-instance-id instance)))
+    (cl-remove-if-not
+     (lambda (review)
+       (and (eq (magnus-review-lifecycle review) 'open)
+            (string= (or (magnus-review-author-instance-id review) "")
+                     instance-id)
+            (memq (magnus-review-execution review) '(starting running))))
+     (magnus-review-list))))
+
+(defun magnus-status--insert-active-review-badge (reviews)
+  "Insert an accessible active-review badge for REVIEWS."
+  (let* ((count (length reviews))
+         (reviewers
+          (mapcar (lambda (review)
+                    (or (magnus-review-reviewer-name review) "reviewer"))
+                  reviews))
+         (help
+          (if (= count 1)
+              (format "%s is reviewing this agent's committed work"
+                      (car reviewers))
+            (format "%s are reviewing this agent's committed work"
+                    (string-join reviewers ", "))))
+         (start (point)))
+    (insert " [")
+    (insert (if (= count 1) "review" (format "%d reviews" count)))
+    (when (magnus-status--review-animation-enabled-p)
+      (insert " ")
+      (let ((slot (point)))
+        (insert (aref magnus-status--review-animation-frames
+                      magnus-status--review-animation-frame))
+        (put-text-property slot (point)
+                           'magnus-review-animation-slot t)))
+    (insert "]")
+    (add-text-properties
+     start (point)
+     `(face magnus-status-reviewing help-echo ,help))))
+
 (defun magnus-status--insert-instance (instance)
   "Insert a line for INSTANCE."
   (let* ((name (magnus-instance-name instance))
@@ -389,6 +550,7 @@
                             (errored 'magnus-status-errored)
                             (running 'magnus-status-running)
                             (t 'magnus-status-stopped)))
+         (active-reviews (magnus-status--active-reviews-for-instance instance))
          (health-ind (magnus-health-indicator instance))
          (age (magnus-status--format-age (magnus-instance-created-at instance))))
     (insert "  ")
@@ -399,6 +561,8 @@
                           'face 'font-lock-type-face)))
     (insert " ")
     (insert (propertize (format "[%s]" status-str) 'face status-face))
+    (when active-reviews
+      (magnus-status--insert-active-review-badge active-reviews))
     (when (magnus-coord-agent-busy-p instance)
       (insert " ")
       (insert (propertize "busy" 'face 'font-lock-warning-face)))
@@ -636,6 +800,7 @@
         (user-error "Review has no completed round yet (%s)"
                     (magnus-status--review-state-label
                      review (magnus-review-latest-round review))))
+      (require 'magnus-review-ui)
       (magnus-review-ui-open review round)))
    ((magnus-status--get-instance-at-point)
     (magnus-process-switch-to (magnus-status--get-instance-at-point)))

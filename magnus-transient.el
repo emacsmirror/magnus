@@ -19,7 +19,6 @@
 (require 'magnus-process)
 (require 'magnus-review)
 (require 'magnus-review-controller)
-(require 'magnus-review-ui)
 (require 'magnus-status)
 
 (declare-function magnus-context "magnus-context")
@@ -35,8 +34,107 @@
 (declare-function magnus-process-create-headless "magnus-process")
 (declare-function magnus-project-root "magnus")
 (declare-function magnus-status--get-review-at-point "magnus-status")
+(declare-function magnus-review-ui-open "magnus-review-ui")
 
 (defvar magnus-review-ui-action-function)
+
+(defvar magnus-transient--review-request-context nil
+  "Cached task-scoped context for the visible review request transient.")
+
+(defun magnus-transient--main-review-description ()
+  "Describe the review request action for the current status row."
+  (if-let ((instance (magnus-status--get-instance-at-point)))
+      (format "Review %s's committed work…" (magnus-instance-name instance))
+    "Request review… (select an agent)"))
+
+(defun magnus-transient--current-review-request-context ()
+  "Return the cached review request context, if any."
+  magnus-transient--review-request-context)
+
+(defun magnus-transient--review-request-context-signature (context)
+  "Return the user-visible operation identity for request CONTEXT."
+  (let ((author (plist-get context :author))
+        (review (plist-get context :review)))
+    (list (and author (magnus-instance-id author))
+          (plist-get context :root)
+          (plist-get context :task)
+          (and review (magnus-review-id review))
+          (and review (magnus-review-execution review))
+          (plist-get context :action))))
+
+(defun magnus-transient--validated-review-request-context (context)
+  "Return a fresh equivalent of CONTEXT or reject a stale popup."
+  (let* ((author (plist-get context :author))
+         (fresh (and author (magnus-review-request-context author))))
+    (unless (equal (magnus-transient--review-request-context-signature context)
+                   (magnus-transient--review-request-context-signature fresh))
+      (setq magnus-transient--review-request-context fresh)
+      (user-error "Review state changed; close this popup and press v again"))
+    fresh))
+
+(defun magnus-transient--review-request-new-p ()
+  "Return non-nil when the request transient would create a reviewer."
+  (eq (plist-get (magnus-transient--current-review-request-context) :action)
+      'new))
+
+(defun magnus-transient--review-request-busy-p ()
+  "Return non-nil when the selected review already has pending work."
+  (memq (plist-get (magnus-transient--current-review-request-context) :action)
+        '(waiting queued running)))
+
+(defun magnus-transient--review-request-heading ()
+  "Describe the exact task-scoped operation in the request transient."
+  (let* ((context (magnus-transient--current-review-request-context))
+         (author (plist-get context :author))
+         (review (plist-get context :review))
+         (action (plist-get context :action))
+         (author-name (and author (magnus-instance-name author)))
+         (reviewer-name (and review (magnus-review-reviewer-name review))))
+    (pcase action
+      ('new (format "Independent review of %s" author-name))
+      ('rereview (format "Re-review %s with %s (same reviewer session)"
+                         author-name reviewer-name))
+      ('retry (format "Retry %s's review of %s"
+                      reviewer-name author-name))
+      ('waiting (format "Review of %s — awaiting its committed checkpoint"
+                        author-name))
+      ('queued (format "%s's review of %s — queued"
+                       reviewer-name author-name))
+      ('running (format "%s is reviewing %s now"
+                        reviewer-name author-name))
+      (_ "Independent review"))))
+
+(defun magnus-transient--review-options-heading ()
+  "Describe defaults for a newly created durable reviewer."
+  (format "Optional settings (defaults: %s provider, default model, %s effort)"
+          (or magnus-review-default-provider 'opposite)
+          magnus-review-default-effort))
+
+(defun magnus-transient--review-request-action-description ()
+  "Describe what RET will do in the request transient."
+  (let* ((context (magnus-transient--current-review-request-context))
+         (review (plist-get context :review)))
+    (pcase (plist-get context :action)
+      ('new "Start independent review")
+      ('rereview "Request the next review round")
+      ('retry (if (eq (magnus-review-execution review) 'interrupted)
+                  "Retry interrupted review"
+                "Retry failed review"))
+      ('waiting "Already waiting for checkpoint")
+      ('queued "Review is queued")
+      ('running "Review is in progress")
+      (_ "Start review"))))
+
+;;;###autoload
+(defun magnus-review-request-dispatch ()
+  "Open a contextual review request transient for the agent at point."
+  (interactive)
+  (let ((author (or (magnus-status--get-instance-at-point)
+                    (user-error
+                     "Put point on the agent whose work should be reviewed"))))
+    (setq magnus-transient--review-request-context
+          (magnus-review-request-context author))
+    (transient-setup #'magnus-review-request-menu)))
 
 ;;; Main dispatch
 
@@ -54,6 +152,11 @@
    ("m" "Send message" magnus-status-send-message)
    ("t" "Thinking trace" magnus-status-trace)
    ("P" "Archive all instances" magnus-status-archive-all)]
+  ["Independent Reviews"
+   ("v" magnus-review-request-dispatch
+    :description magnus-transient--main-review-description)
+   ("o" "Open completed review at point" magnus-transient-review-open)
+   ("V" "Actions for review at point" magnus-review-actions)]
   ["Context (shared notes)"
    ("x" "Open context buffer" magnus-context)
    ("e" "Export to file" magnus-context-export-for-agent)
@@ -62,10 +165,6 @@
    ("C" "Open coordination file" magnus-status-coordination)
    ("I" "Open agent instructions" magnus-transient-open-instructions)
    ("F" "Session retrospective" magnus-retro)]
-  ["Reviews"
-   ("v" "Request review" magnus-review-request-dispatch)
-   ("o" "Open review" magnus-transient-review-open)
-   ("V" "Review actions" magnus-review-actions)]
   ["Attention (permission requests)"
    ("a" "Next in attention queue" magnus-attention-next)
    ("A" "Show attention queue" magnus-attention-show-queue)
@@ -82,24 +181,30 @@
 
 ;;; Durable reviews
 
-(transient-define-prefix magnus-review-request-dispatch ()
+(transient-define-prefix magnus-review-request-menu ()
   "Request a durable independent review for the instance at point."
-  ["Options (defaults: opposite provider, default model, high effort)"
+  [:description magnus-transient--review-request-heading
+   ("RET" magnus-transient-request-review
+    :description magnus-transient--review-request-action-description
+    :inapt-if magnus-transient--review-request-busy-p)]
+  [:description magnus-transient--review-options-heading
+   :if magnus-transient--review-request-new-p
    ("p" "Provider" "--provider="
     :choices ("opposite" "claude" "codex"))
    ("m" "Model" "--model=")
    ("e" "Effort" "--effort="
-    :choices ("low" "medium" "high" "xhigh" "max"))]
-  ["Request"
-   ("RET" "Request review" magnus-transient-request-review)])
+    :choices ("low" "medium" "high" "xhigh" "max"))])
 
 (defun magnus-transient-request-review ()
   "Request a review using the current review transient arguments."
   (interactive)
-  (let* ((author (or (magnus-status--get-instance-at-point)
+  (let* ((context (magnus-transient--current-review-request-context))
+         (author (or (plist-get context :author)
+                     (magnus-status--get-instance-at-point)
                      (user-error
                       "Put point on the agent whose work should be reviewed")))
-         (arguments (transient-args 'magnus-review-request-dispatch))
+         (context (magnus-transient--validated-review-request-context context))
+         (arguments (transient-args 'magnus-review-request-menu))
          (provider-name (transient-arg-value "--provider=" arguments))
          (model (transient-arg-value "--model=" arguments))
          (effort-name (transient-arg-value "--effort=" arguments))
@@ -110,7 +215,9 @@
     (magnus-review-request author
                            :provider provider
                            :model (and model (not (string-empty-p model)) model)
-                           :effort effort)
+                           :effort effort
+                           :context context)
+    (setq magnus-transient--review-request-context nil)
     (magnus-status-refresh)))
 
 (defvar magnus-transient--review nil

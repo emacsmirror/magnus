@@ -654,6 +654,38 @@
     (should (eq (magnus-review-controller--provider author 'opposite)
                 'claude))))
 
+(ert-deftest magnus-review-request-context-describes-the-exact-existing-action ()
+  (let ((author
+         (magnus-instance--create
+          :id "author" :name "quick-wren" :directory "/tmp/project")))
+    (cl-letf (((symbol-function 'magnus-review-git-root)
+               (lambda (_directory) "/tmp/project"))
+              ((symbol-function 'magnus-review-controller--task)
+               (lambda (_author _root) "Review transport")))
+      (dolist (case '((nil . new)
+                      (complete . rereview)
+                      (failed . retry)
+                      (interrupted . retry)
+                      (waiting-for-checkpoint . waiting)
+                      (queued . queued)
+                      (starting . running)
+                      (running . running)))
+        (let ((review
+               (and (car case)
+                    (magnus-review--create
+                     :id (symbol-name (car case))
+                     :author-instance-id "author"
+                     :lifecycle 'open :execution (car case)))))
+          (cl-letf (((symbol-function
+                      'magnus-review-controller--matching-open-review)
+                     (lambda (_author _root _task) review)))
+            (let ((context (magnus-review-request-context author)))
+              (should (eq (plist-get context :action) (cdr case)))
+              (should (eq (plist-get context :review) review))
+              (should (equal (plist-get context :root) "/tmp/project"))
+              (should (equal (plist-get context :task)
+                             "Review transport")))))))))
+
 (ert-deftest magnus-review-process-ready-isolates-delivery-failures ()
   (let* ((instance (magnus-instance--create
                     :id "author-id" :name "quick-wolf"))

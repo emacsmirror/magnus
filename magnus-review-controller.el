@@ -991,16 +991,41 @@ the message; callers include stable idempotency keys for replay."
           (string= (or (magnus-review-task review) "") task)))
    (magnus-review-list)))
 
-;;;###autoload
-(cl-defun magnus-review-request
-    (author &key provider model effort)
-  "Request an independent review of AUTHOR without prompting for Git objects."
-  (interactive (list (magnus-review-controller--author-at-point)))
+(defun magnus-review-request-context (author)
+  "Return the current task-scoped review context for AUTHOR.
+The returned plist contains :root, :task, :review, and :action.  ACTION is
+one of `new', `rereview', `retry', `waiting', `queued', or `running'.  This
+is intentionally read-only so status and transient UIs can describe the exact
+operation that `magnus-review-request' would perform without starting work."
   (let* ((root (magnus-review-git-root
                 (magnus-instance-directory author)))
          (task (magnus-review-controller--task author root))
-         (existing
-          (magnus-review-controller--matching-open-review author root task)))
+         (review
+          (magnus-review-controller--matching-open-review author root task))
+         (execution (and review (magnus-review-execution review)))
+         (action
+          (pcase execution
+            ('complete 'rereview)
+            ((or 'failed 'interrupted) 'retry)
+            ('waiting-for-checkpoint 'waiting)
+            ('queued 'queued)
+            ((or 'starting 'running) 'running)
+            (_ 'new))))
+    (list :author author :root root :task task :review review :action action)))
+
+;;;###autoload
+(cl-defun magnus-review-request
+    (author &key provider model effort context)
+  "Request an independent review of AUTHOR without prompting for Git objects.
+CONTEXT, when non-nil, must be a freshly validated value returned by
+`magnus-review-request-context'; interactive callers normally leave it nil."
+  (interactive (list (magnus-review-controller--author-at-point)))
+  (let* ((context (or context (magnus-review-request-context author)))
+         (root (plist-get context :root))
+         (task (plist-get context :task))
+         (existing (plist-get context :review)))
+    (unless (eq author (plist-get context :author))
+      (user-error "Review request context belongs to a different agent"))
     (if existing
         (pcase (magnus-review-execution existing)
           ('complete (magnus-review-rereview existing))
