@@ -2,9 +2,11 @@
 
 [![MELPA](https://melpa.org/packages/magnus-badge.svg)](https://melpa.org/#/magnus) [![CI](https://github.com/hrishikeshs/magnus/actions/workflows/ci.yml/badge.svg)](https://github.com/hrishikeshs/magnus/actions/workflows/ci.yml)
 
-A magit-inspired interface for managing multiple Claude Code instances within Emacs.
+A magit-inspired interface for managing Claude Code and Codex agents within Emacs.
 
-Run multiple AI agents in parallel, let them communicate to avoid conflicts, and handle their permission requests one at a time.
+Run multiple AI agents in parallel, let them communicate to avoid conflicts,
+handle their permission requests one at a time, and ask a fresh model to review
+committed work without leaving Emacs.
 
 ## Screenshots
 
@@ -60,6 +62,29 @@ TUI remains usable, but that session cannot be resurrected automatically.
 Magnus's onboarding includes named identity, first-person memory, coordination
 etiquette, and candid `[thinking]`/`[response]` engineering journals. Claude's
 established prompt remains unchanged.
+
+### Durable Cross-Provider Reviews
+
+Put point on an agent in `*magnus*`, press `? v RET`, and Magnus handles the
+rest. It asks the author for a coherent committed checkpoint, infers the exact
+Git range, chooses a durable reviewer identity using the existing expertise
+index, and runs a headless reviewer from the opposite provider by default.
+Provider, model, and reasoning effort remain optional transient overrides.
+
+Reviews are durable work objects rather than terminal instances. Their exact
+base and head commits, attempts, provider session, findings, delivery state,
+and read state survive Emacs restarts under `~/.magnus/reviews/`. Re-reviewing
+keeps the reviewer identity and provider session, gives prior findings stable
+IDs, and adds a new immutable round. Headless execution is serialized by
+default to keep laptop resource use modest.
+
+Completed reviews appear in their own status section with an unread dot. Press
+`RET` to open a Magit-style diff reader: files and hunks fold with `TAB`, `n/p`
+navigate sections, `N/P` jump between findings, `RET` opens source from the
+exact reviewed commit, and `e` opens the corresponding current worktree file.
+Use `[` and `]` to move between review rounds and `?` for re-review, retry,
+interrupt, delivery, and archive actions. Completion never steals focus;
+Magnus also delivers the durable report location back to the author agent.
 
 ### Agent Coordination
 Agents communicate through a shared `.magnus-coord.md` file:
@@ -160,13 +185,19 @@ Everything persists across Emacs sessions:
 - Running instances (reconnects if still alive)
 - Context buffers
 - Coordination state
+- Review checkpoints, reports, sessions, rounds, and unread state
 
 ## Requirements
 
 - Emacs 28.1+
 - [vterm](https://github.com/akermu/emacs-libvterm)
 - [transient](https://github.com/magit/transient) (built into Emacs 28+)
-- Codex CLI (only for opt-in Codex instances)
+- [magit-section](https://github.com/magit/magit) (for the review reader)
+- Claude Code CLI (for Claude instances or Claude-backed reviews)
+- Codex CLI (for Codex instances or Codex-backed reviews)
+
+The default opposite-provider review requires the other provider's CLI. For
+example, reviewing a Claude author with the default settings launches Codex.
 
 ## Installation
 
@@ -226,34 +257,36 @@ include the guard.
 4. Create more instances with `c`
 5. Switch between them with `RET`
 6. Watch them coordinate in the status buffer
+7. On an agent, press `? v RET` to request an independent review
 
 ## Key Bindings
 
 ### Status Buffer (`*magnus*`)
 
-| Key   | Action                     |
-|-------|----------------------------|
-| `c`   | Create new instance        |
-| `RET` | Switch to instance         |
-| `k`   | Kill instance              |
-| `K`   | Force kill instance        |
-| `r`   | Rename instance            |
-| `R`   | Restart instance           |
-| `s`   | Suspend instance           |
-| `S`   | Resume instance            |
-| `d`   | Change directory           |
-| `m`   | Send message to agent      |
-| `t`   | Open thinking trace        |
-| `x`   | Open context buffer        |
-| `C`   | Open coordination file     |
-| `a`   | Next in attention queue    |
-| `A`   | Show attention queue       |
-| `H`   | Toggle health monitoring   |
-| `P`   | Purge all instances        |
-| `n/p` | Navigate instances         |
-| `g`   | Refresh                    |
-| `?`   | Show transient help menu   |
-| `q`   | Quit                       |
+| Key   | Action                       |
+|-------|------------------------------|
+| `c`   | Create new instance          |
+| `RET` | Visit agent or review        |
+| `k`   | Archive instance             |
+| `R`   | Resurrect archived instance  |
+| `r`   | Rename instance              |
+| `s/S` | Suspend/resume instance      |
+| `d`   | Change directory             |
+| `m`   | Send message to agent        |
+| `t`   | Open thinking trace          |
+| `x`   | Open context buffer          |
+| `C`   | Open coordination file       |
+| `a/A` | Next/show attention requests |
+| `P`   | Archive all instances        |
+| `z`   | Toggle Do Not Disturb        |
+| `F`   | Session retrospective        |
+| `n/p` | Navigate agents and reviews  |
+| `g`   | Refresh                      |
+| `?`   | Show transient help menu     |
+| `q`   | Quit                         |
+
+Review rows use the same `n/p` navigation. `RET` opens the newest unread
+completed round (or the latest round when everything is read).
 
 ### Transient Menu (`?`)
 
@@ -263,16 +296,15 @@ Press `?` in the status buffer to see all commands organized by category:
 | Key | Action              |
 |-----|---------------------|
 | `c` | Create instance     |
-| `k` | Kill instance       |
-| `K` | Force kill instance |
+| `k` | Archive instance    |
+| `R` | Resurrect archived  |
 | `r` | Rename instance     |
-| `R` | Restart instance    |
 | `s` | Suspend instance    |
 | `S` | Resume instance     |
 | `d` | Change directory    |
 | `m` | Send message        |
 | `t` | Thinking trace      |
-| `P` | Purge all instances |
+| `P` | Archive all instances |
 
 **Context (shared notes)**
 | Key | Action                    |
@@ -287,6 +319,31 @@ Press `?` in the status buffer to see all commands organized by category:
 | `C` | Open coordination file   |
 | `I` | Open agent instructions  |
 
+**Reviews**
+| Key | Action                       |
+|-----|------------------------------|
+| `v` | Configure/request review     |
+| `o` | Open review at point         |
+| `V` | Review actions               |
+
+The default request is `? v RET`. In the request popup, `p`, `m`, and `e`
+override provider, model, and reasoning effort respectively.
+
+The `? V` action popup (or `?` inside a review reader) provides:
+
+| Key   | Action                                      |
+|-------|---------------------------------------------|
+| `RET` | Open the review                             |
+| `r`   | Request a re-review of the next checkpoint |
+| `t`   | Retry a failed or interrupted round        |
+| `i`   | Interrupt a running headless reviewer      |
+| `d`   | Retry delivery of review notes to author   |
+| `k`   | Archive the durable review                 |
+
+A manual interrupt remains stopped across Emacs restarts until you explicitly
+retry it. From a historical review round, delivery retry targets that round;
+from the status buffer it selects the newest completed undelivered round.
+
 **Attention & Health**
 | Key | Action                      |
 |-----|-----------------------------|
@@ -296,11 +353,11 @@ Press `?` in the status buffer to see all commands organized by category:
 | `H` | Toggle health monitoring    |
 
 **Navigation**
-| Key   | Action          |
-|-------|-----------------|
-| `RET` | Visit instance  |
-| `n`   | Next instance   |
-| `p`   | Previous instance |
+| Key   | Action                |
+|-------|-----------------------|
+| `RET` | Visit agent or review |
+| `n`   | Next item             |
+| `p`   | Previous item         |
 
 ### Trace Buffer (`*trace:<name>*`)
 
@@ -309,6 +366,20 @@ Press `?` in the status buffer to see all commands organized by category:
 | `g` | Refresh         |
 | `G` | Jump to end     |
 | `q` | Close           |
+
+### Review Buffer (`*magnus-review: ...*`)
+
+| Key   | Action                                      |
+|-------|---------------------------------------------|
+| `TAB` | Fold/unfold file, hunk, or finding section |
+| `n/p` | Next/previous visible section               |
+| `N/P` | Next/previous finding                       |
+| `RET` | Open the exact reviewed snapshot            |
+| `e`   | Open the file in the current worktree       |
+| `[/]` | Previous/next review round                  |
+| `?`   | Review actions                              |
+| `g`   | Refresh                                     |
+| `q`   | Close                                       |
 
 ### Context Buffer
 
@@ -372,8 +443,14 @@ Magnus avoids triggering interactive Helm/Projectile prompts when creating insta
 ;; Default directory for new instances
 (setq magnus-default-directory "~/projects")
 
-;; Where to store state (default: ~/.emacs.d/magnus-state.el)
-(setq magnus-state-file "~/.emacs.d/magnus-state.el")
+;; Where to store instance state (default: ~/.magnus/state.el)
+(setq magnus-state-file "~/.magnus/state.el")
+
+;; Durable review defaults
+(setq magnus-review-default-provider nil) ; opposite the author
+(setq magnus-review-default-effort 'high)
+(setq magnus-review-max-concurrent 1)     ; laptop-friendly serialization
+(setq magnus-review-directory-root "~/.magnus/reviews")
 
 ;; Attention check interval in seconds (default: 10)
 (setq magnus-attention-check-interval 10)
@@ -420,6 +497,11 @@ magnus/
 ├── magnus-process.el      # Process management (vterm + headless)
 ├── magnus-provider.el     # Additive provider dispatch
 ├── magnus-provider-codex.el # Optional native Codex TUI provider
+├── magnus-provider-claude.el # Read-only Claude review adapter
+├── magnus-headless.el     # Provider-neutral JSONL runner
+├── magnus-review.el       # Durable review records + Git evidence
+├── magnus-review-controller.el # Review execution + delivery
+├── magnus-review-ui.el    # Magit-style review reader
 ├── magnus-trace.el        # Thinking trace JSONL viewer
 ├── magnus-status.el       # Status buffer UI
 ├── magnus-transient.el    # Transient popup menus

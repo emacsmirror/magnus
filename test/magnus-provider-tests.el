@@ -513,6 +513,74 @@ DATE defaults to the original deterministic test fixture date."
           (should-not (process-get process 'magnus-codex-input-queue)))
       (magnus-test--delete-terminal terminal))))
 
+(ert-deftest magnus-codex-durable-receipt-waits-for-tui-submission ()
+  (let* ((instance (magnus-instances-create "/tmp" "receipt-codex" 'codex))
+         (terminal (magnus-test--codex-tui instance))
+         (process (cdr terminal))
+         (accepted 0)
+         sent)
+    ;; A not-yet-ready process is enough to exercise the crash window without
+    ;; depending on the selected window in a batch Emacs.
+    (process-put process 'magnus-codex-ready nil)
+    (unwind-protect
+        (cl-letf (((symbol-function 'vterm-send-string)
+                   (lambda (&rest _args) (setq sent t)))
+                  ((symbol-function 'vterm-send-return)
+                   (lambda () (setq sent t))))
+          (should
+           (eq (magnus-codex-send
+                instance "durable result"
+                (lambda () (cl-incf accepted)))
+               'queued))
+          (should (= accepted 0))
+          (should-not sent)
+          (should (process-get process 'magnus-codex-input-queue))
+          ;; Stopping before readiness loses only the process-local queue; the
+          ;; absent receipt leaves the review manifest pending for resurrection.
+          (delete-process process)
+          (should (= accepted 0)))
+      (magnus-test--delete-terminal terminal))))
+
+(ert-deftest magnus-codex-tui-send-error-retains-and-retries-entry ()
+  (let* ((instance (magnus-instances-create "/tmp" "retry-codex" 'codex))
+         (terminal (magnus-test--codex-tui instance))
+         (process (cdr terminal))
+         (attempts 0)
+         (accepted 0)
+         timers events)
+    (process-put process 'magnus-codex-ready t)
+    (unwind-protect
+        (cl-letf (((symbol-function 'vterm-send-string)
+                   (lambda (text &optional _paste-p)
+                     (cl-incf attempts)
+                     (if (= attempts 1)
+                         (error "temporary vterm failure")
+                       (push text events))))
+                  ((symbol-function 'vterm-send-return)
+                   (lambda () (push 'return events)))
+                  ((symbol-function 'run-with-timer)
+                   (lambda (_seconds _repeat function &rest arguments)
+                     (setq timers
+                           (append timers (list (cons function arguments))))
+                     'test-timer)))
+          (should
+           (eq (magnus-codex-send
+                instance "retry this"
+                (lambda () (cl-incf accepted)))
+               'queued))
+          (should (= accepted 0))
+          (should-not (process-get process 'magnus-codex-input-busy))
+          (should (process-get process 'magnus-codex-input-queue))
+          (while timers
+            (let ((timer (pop timers)))
+              (apply (car timer) (cdr timer))))
+          (should (= attempts 2))
+          (should (= accepted 1))
+          (should (equal (nreverse events) '("retry this" return)))
+          (should-not (process-get process 'magnus-codex-input-queue))
+          (should-not (process-get process 'magnus-codex-input-busy)))
+      (magnus-test--delete-terminal terminal))))
+
 (ert-deftest magnus-codex-concurrent-tui-messages-are-serialized ()
   (let* ((instance (magnus-instances-create "/tmp" "queued-codex" 'codex))
          (terminal (magnus-test--codex-tui instance))

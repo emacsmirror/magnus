@@ -1,5 +1,6 @@
 EMACS ?= emacs
 EL_FILES ?= $(wildcard *.el)
+TEST_FILES ?= $(wildcard test/*-tests.el)
 
 .PHONY: lint lint-compile test clean
 
@@ -12,7 +13,8 @@ lint-compile:
 test:
 	@$(EMACS) --batch -Q -L . -L test \
 		--eval "(setq load-prefer-newer t)" \
-		-l test/magnus-provider-tests.el -f ert-run-tests-batch-and-exit
+		$(foreach file,$(TEST_FILES),-l $(file)) \
+		-f ert-run-tests-batch-and-exit
 
 clean:
 	rm -f *.elc

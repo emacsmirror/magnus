@@ -35,6 +35,18 @@
 (defvar magnus-buffer-name)
 (defvar magnus--summon-context)
 
+(defvar magnus-process-ready-hook nil
+  "Hook run when an interactive agent can receive automated input.
+Functions are called with the ready `magnus-instance' as their sole argument.")
+
+(defun magnus-process--run-ready-hook (instance)
+  "Run `magnus-process-ready-hook' for INSTANCE when its terminal is live."
+  (when-let ((buffer (magnus-instance-buffer instance)))
+    (when (and (buffer-live-p buffer)
+               (get-buffer-process buffer)
+               (process-live-p (get-buffer-process buffer)))
+      (run-hook-with-args 'magnus-process-ready-hook instance))))
+
 ;;; Process creation
 
 (defun magnus-process-create (&optional directory name provider initial-message)
@@ -121,7 +133,8 @@ the full message text before submitting."
                         (lambda ()
                           (when (buffer-live-p buffer)
                             (with-current-buffer buffer
-                              (vterm-send-return)))))))))
+                              (vterm-send-return))
+                            (magnus-process--run-ready-hook instance))))))))
 
 (defun magnus-process--agent-memory-path (instance)
   "Return the memory file path for INSTANCE.
@@ -601,6 +614,10 @@ Replaces slashes, spaces, tildes, and underscores with hyphens."
                               (vterm-send-return))))))
       ;; Set up process sentinel
       (magnus-process--setup-sentinel instance buffer)
+      ;; Resumed Claude sessions have no onboarding callback to signal that
+      ;; their composer is ready.  Use the same conservative startup window as
+      ;; initial onboarding before releasing durable queued deliveries.
+      (run-with-timer 5 nil #'magnus-process--run-ready-hook instance)
       buffer)))
 
 ;;; Instance interaction

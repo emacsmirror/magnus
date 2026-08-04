@@ -9,16 +9,21 @@
 
 ;;; Commentary:
 
-;; This module provides the main status buffer showing all Claude Code
-;; instances with magit-style keybindings.
+;; This module provides the main status buffer showing interactive agents and
+;; durable reviews with magit-style keybindings.
 
 ;;; Code:
 
+(require 'cl-lib)
+(require 'seq)
+(require 'subr-x)
 (require 'magnus-instances)
 (require 'magnus-process)
 (require 'magnus-coord)
 (require 'magnus-attention)
 (require 'magnus-health)
+(require 'magnus-review)
+(require 'magnus-review-ui)
 
 (declare-function magnus-dispatch "magnus-transient")
 (declare-function magnus-coord-agent-busy-p "magnus-coord")
@@ -90,6 +95,16 @@
   "Face for expertise tags in status buffer."
   :group 'magnus)
 
+(defface magnus-status-review-unread
+  '((t :inherit warning :weight bold))
+  "Face for the unread marker on completed reviews."
+  :group 'magnus)
+
+(defface magnus-status-reviewer-name
+  '((t :inherit font-lock-constant-face :weight bold))
+  "Face for durable reviewer identities."
+  :group 'magnus)
+
 ;;; Mode definition
 
 (defvar magnus-status-mode-map
@@ -149,14 +164,29 @@
   (when-let ((buffer (get-buffer magnus-buffer-name)))
     (with-current-buffer buffer
       (let ((inhibit-read-only t)
-            (line (line-number-at-pos)))
+            (line (line-number-at-pos))
+            (instance-id (get-text-property (point) 'magnus-instance-id))
+            (review-id (get-text-property (point) 'magnus-review-id)))
         (erase-buffer)
         (magnus-status--insert-header)
         (magnus-status--insert-instances)
+        (magnus-status--insert-reviews)
         (magnus-status--insert-coordination)
         (magnus-status--insert-purged)
-        (goto-char (point-min))
-        (forward-line (1- line))
+        (cond
+         ((and review-id
+               (text-property-any (point-min) (point-max)
+                                  'magnus-review-id review-id))
+          (goto-char (text-property-any (point-min) (point-max)
+                                        'magnus-review-id review-id)))
+         ((and instance-id
+               (text-property-any (point-min) (point-max)
+                                  'magnus-instance-id instance-id))
+          (goto-char (text-property-any (point-min) (point-max)
+                                        'magnus-instance-id instance-id)))
+         (t
+          (goto-char (point-min))
+          (forward-line (1- line))))
         (magnus-status--goto-instance-line)))))
 
 (defun magnus-status--revert (_ignore-auto _noconfirm)
@@ -174,8 +204,19 @@
 (defun magnus-status--insert-header ()
   "Insert the status buffer header."
   (insert (propertize "Magnus" 'face 'magnus-status-section-heading))
-  (insert " - Claude Code Instance Manager\n")
+  (insert " - AI Agent Manager\n")
   (insert (format "Instances: %d" (length (magnus-instances-active-list))))
+  (let ((unread
+         (cl-count-if
+          (lambda (review)
+            (eq (magnus-review-read-state review) 'unread))
+          (magnus-review-list))))
+    (when (> unread 0)
+      (insert
+       (propertize
+        (format "  [%d unread review%s]" unread
+                (if (= unread 1) "" "s"))
+        'face 'magnus-status-review-unread))))
   (when magnus-coord--do-not-disturb
     (insert (propertize "  [DND]" 'face 'font-lock-warning-face)))
   (let ((attention-count (magnus-attention-pending-count)))
@@ -202,8 +243,130 @@
 (defun magnus-status--insert-empty-state ()
   "Insert the empty state message."
   (insert "\n")
-  (insert (propertize "  No Claude Code instances.\n" 'face 'magnus-status-empty-hint))
+  (insert (propertize "  No agent instances.\n"
+                      'face 'magnus-status-empty-hint))
   (insert (propertize "  Press 'c' to create one.\n" 'face 'magnus-status-empty-hint)))
+
+(defun magnus-status--insert-reviews ()
+  "Insert durable review work after the instance list."
+  (let* ((all (magnus-review-list))
+         (reviews
+          (cl-remove-if
+           (lambda (review)
+             (eq (magnus-review-lifecycle review) 'archived))
+           all))
+         (archived
+          (cl-remove-if-not
+           (lambda (review)
+             (eq (magnus-review-lifecycle review) 'archived))
+           all)))
+    (insert "\n")
+    (insert (propertize "Reviews\n" 'face 'magnus-status-section-heading))
+    (if (or reviews archived)
+        (progn
+          (dolist (review reviews)
+            (magnus-status--insert-review review))
+          (when archived
+            (insert (propertize "  Archived reviews\n"
+                                'face 'magnus-status-empty-hint))
+            (dolist (review archived)
+              (magnus-status--insert-review review))))
+      (insert
+       (propertize
+        "  No reviews yet. On an instance, press '? v RET' to request one.\n"
+        'face 'magnus-status-empty-hint)))))
+
+(defun magnus-status--review-state-label (review round)
+  "Return a concise state label for REVIEW and its latest ROUND."
+  (let* ((lifecycle (magnus-review-lifecycle review))
+         (execution (magnus-review-execution review))
+         (verdict (and (eq execution 'complete)
+                       round (magnus-review-round-verdict round))))
+    (replace-regexp-in-string
+     "-" " "
+     (symbol-name (if (eq lifecycle 'archived)
+                      'archived
+                    (or verdict execution 'pending))))))
+
+(defun magnus-status--review-state-face (review round)
+  "Return the status face for REVIEW and its latest ROUND."
+  (let* ((lifecycle (magnus-review-lifecycle review))
+         (execution (magnus-review-execution review))
+         (verdict (and (eq execution 'complete)
+                       round (magnus-review-round-verdict round))))
+    (cond
+     ((eq lifecycle 'archived) 'magnus-status-purged)
+     ((eq verdict 'approve) 'magnus-status-running)
+     ((eq verdict 'changes-requested) 'magnus-status-suspended)
+     ((memq execution '(failed interrupted)) 'magnus-status-errored)
+     ((eq execution 'complete) 'magnus-status-finished)
+     ((memq execution '(starting running)) 'magnus-status-running)
+     (t 'magnus-status-instance-dir))))
+
+(defun magnus-status--insert-review (review)
+  "Insert a two-line status row for durable REVIEW."
+  (let* ((start (point))
+         (round (magnus-review-latest-round review))
+         (unread (eq (magnus-review-read-state review) 'unread))
+         (provider (or (magnus-review-reviewer-provider review) 'unknown))
+         (effort (or (magnus-review-effort review) 'default))
+         (task
+          (replace-regexp-in-string
+           "[\n\r]+" " "
+           (string-trim (or (magnus-review-task review) ""))))
+         (round-number (and round (magnus-review-round-number round)))
+         ;; Aggregate state intentionally keeps an older undelivered round
+         ;; visible after a newer round succeeds.
+         (delivery (magnus-review-delivery-state review))
+         (finding-count
+          (and round
+               (alist-get 'finding_count
+                          (magnus-review-round-metadata round))))
+         (age (magnus-status--format-age
+               (or (magnus-review-updated-at review)
+                   (magnus-review-created-at review))))
+         (state (magnus-status--review-state-label review round)))
+    (insert "  ")
+    (insert (propertize (if unread "●" "·")
+                        'face (if unread
+                                  'magnus-status-review-unread
+                                'magnus-status-instance-dir)))
+    (insert " ")
+    (insert (propertize (or (magnus-review-reviewer-name review) "reviewer")
+                        'face 'magnus-status-reviewer-name))
+    (insert " ")
+    (insert (propertize (format "[%s/%s]" provider effort)
+                        'face 'font-lock-type-face))
+    (insert " → ")
+    (insert (propertize (or (magnus-review-author-name review) "unknown")
+                        'face 'magnus-status-instance-name))
+    (unless (string-empty-p task)
+      (insert " — ")
+      (insert (propertize
+               (if (> (length task) 42)
+                   (concat (substring task 0 39) "...")
+                 task)
+               'face 'magnus-status-instance-dir)))
+    (insert "\n    ")
+    (when round-number
+      (insert (format "round %d · " round-number)))
+    (insert (propertize state
+                        'face (magnus-status--review-state-face review round)))
+    (when (numberp finding-count)
+      (insert (format " · %d finding%s" finding-count
+                      (if (= finding-count 1) "" "s"))))
+    (when (memq delivery '(pending failed))
+      (insert " · ")
+      (insert
+       (propertize (format "delivery %s" delivery)
+                   'face (if (eq delivery 'failed)
+                             'magnus-status-errored
+                           'magnus-status-suspended))))
+    (insert " · ")
+    (insert (propertize age 'face 'magnus-status-instance-dir))
+    (insert "\n")
+    (put-text-property start (point)
+                       'magnus-review-id (magnus-review-id review))))
 
 (defun magnus-status--insert-instance (instance)
   "Insert a line for INSTANCE."
@@ -300,6 +463,8 @@
 
 (defun magnus-status--format-age (time)
   "Format TIME as a human-readable age."
+  (when (numberp time)
+    (setq time (seconds-to-time time)))
   (let* ((seconds (float-time (time-subtract (current-time) time)))
          (minutes (/ seconds 60))
          (hours (/ minutes 60))
@@ -377,60 +542,104 @@
   (when-let ((id (get-text-property (point) 'magnus-instance-id)))
     (magnus-instances-get id)))
 
+(defun magnus-status--get-review-at-point ()
+  "Get the durable review at point."
+  (when-let ((id (get-text-property (point) 'magnus-review-id)))
+    (magnus-review-get id)))
+
+(defun magnus-status--selection-key-at-point ()
+  "Return the stable status item key at point, or nil."
+  (cond
+   ((get-text-property (point) 'magnus-review-id)
+    (cons 'review (get-text-property (point) 'magnus-review-id)))
+   ((get-text-property (point) 'magnus-instance-id)
+    (cons 'instance (get-text-property (point) 'magnus-instance-id)))))
+
+(defun magnus-status--review-round-to-open (review)
+  "Return REVIEW's newest unread, or newest completed, round."
+  (let* ((completed
+          (cl-remove-if-not
+           (lambda (round)
+             (eq (magnus-review-round-execution round) 'complete))
+           (magnus-review-rounds review)))
+         (unread
+          (cl-remove-if-not
+           (lambda (round)
+             (eq (magnus-review-round-read-state round) 'unread))
+           completed)))
+    (car (last (or unread completed)))))
+
 (defun magnus-status--goto-instance-line ()
-  "Move point to the nearest instance line."
-  (unless (get-text-property (point) 'magnus-instance-id)
+  "Move point to the nearest selectable instance or review row."
+  (unless (magnus-status--selection-key-at-point)
     (or (magnus-status--find-instance-forward)
         (magnus-status--find-instance-backward))))
 
 (defun magnus-status--find-instance-forward ()
-  "Find next instance and move point there."
+  "Find the next selectable instance or review and move point there."
   (let ((start (point)))
     (while (and (not (eobp))
-                (not (get-text-property (point) 'magnus-instance-id)))
+                (not (magnus-status--selection-key-at-point)))
       (forward-line 1))
-    (if (get-text-property (point) 'magnus-instance-id)
+    (if (magnus-status--selection-key-at-point)
         t
       (goto-char start)
       nil)))
 
 (defun magnus-status--find-instance-backward ()
-  "Find previous instance and move point there."
+  "Find the previous selectable instance or review and move point there."
   (let ((start (point)))
     (while (and (not (bobp))
-                (not (get-text-property (point) 'magnus-instance-id)))
+                (not (magnus-status--selection-key-at-point)))
       (forward-line -1))
-    (if (get-text-property (point) 'magnus-instance-id)
+    (if (magnus-status--selection-key-at-point)
         t
       (goto-char start)
       nil)))
 
 (defun magnus-status-next ()
-  "Move to the next instance."
+  "Move to the next instance or review."
   (interactive)
-  (forward-line 1)
-  (while (and (not (eobp))
-              (not (get-text-property (point) 'magnus-instance-id)))
-    (forward-line 1))
-  (unless (get-text-property (point) 'magnus-instance-id)
-    (magnus-status--find-instance-backward)))
+  (let ((start (point))
+        (current (magnus-status--selection-key-at-point)))
+    (forward-line 1)
+    (while (and (not (eobp))
+                (let ((candidate (magnus-status--selection-key-at-point)))
+                  (or (null candidate) (equal candidate current))))
+      (forward-line 1))
+    (unless (magnus-status--selection-key-at-point)
+      (goto-char start))))
 
 (defun magnus-status-previous ()
-  "Move to the previous instance."
+  "Move to the previous instance or review."
   (interactive)
-  (forward-line -1)
-  (while (and (not (bobp))
-              (not (get-text-property (point) 'magnus-instance-id)))
-    (forward-line -1)))
+  (let ((start (point))
+        (current (magnus-status--selection-key-at-point)))
+    (forward-line -1)
+    (while (and (not (bobp))
+                (let ((candidate (magnus-status--selection-key-at-point)))
+                  (or (null candidate) (equal candidate current))))
+      (forward-line -1))
+    (unless (magnus-status--selection-key-at-point)
+      (goto-char start))))
 
 ;;; Commands
 
 (defun magnus-status-visit ()
-  "Switch to the instance at point."
+  "Visit the instance or durable review at point."
   (interactive)
-  (if-let ((instance (magnus-status--get-instance-at-point)))
-      (magnus-process-switch-to instance)
-    (user-error "No instance at point")))
+  (cond
+   ((magnus-status--get-review-at-point)
+    (let* ((review (magnus-status--get-review-at-point))
+           (round (magnus-status--review-round-to-open review)))
+      (unless round
+        (user-error "Review has no completed round yet (%s)"
+                    (magnus-status--review-state-label
+                     review (magnus-review-latest-round review))))
+      (magnus-review-ui-open review round)))
+   ((magnus-status--get-instance-at-point)
+    (magnus-process-switch-to (magnus-status--get-instance-at-point)))
+   (t (user-error "No instance or review at point"))))
 
 (defvar magnus--creation-task)
 

@@ -696,8 +696,29 @@ cache_read_input_tokens."
 (defvar magnus-coord--processed-summons nil
   "Alist of (directory . list-of-processed-summon-hashes) to avoid duplicates.")
 
+(defvar magnus-coord--processed-review-ready nil
+  "Alist of processed review-checkpoint marker hashes by directory.")
+
+(defvar magnus-coord-review-ready-hook nil
+  "Hook run when an agent publishes a new REVIEW-READY marker.
+Each function receives DIRECTORY and a plist containing `:request-id',
+`:checkpoint-token', `:base', and `:head'.")
+
+(defcustom magnus-coord-review-ready-retry-count 3
+  "Maximum bounded retries after a review checkpoint handler errors."
+  :type 'natnum
+  :group 'magnus)
+
+(defcustom magnus-coord-review-ready-retry-delay 2
+  "Seconds between review checkpoint handler retries."
+  :type 'number
+  :group 'magnus)
+
+(defvar magnus-coord--review-ready-retries (make-hash-table :test #'equal)
+  "Retry state keyed by (DIRECTORY . MARKER-HASH).")
+
 (defvar magnus-coord--poll-timer nil
-  "Timer for polling coordination files for mentions, DMs, and summons.")
+  "Timer for polling coordination files for messages and control markers.")
 
 (defun magnus-coord-ensure-watchers ()
   "Start polling for all directories with active instances.
@@ -722,7 +743,8 @@ instances restored from persistence."
       ;; Initialize processed state from current content
       (magnus-coord--init-processed-mentions directory)
       (magnus-coord--init-processed-dms directory)
-      (magnus-coord--init-processed-summons directory))))
+      (magnus-coord--init-processed-summons directory)
+      (magnus-coord--init-processed-review-ready directory))))
 
 (defun magnus-coord-stop-watching (directory)
   "Stop polling the coordination file in DIRECTORY."
@@ -734,7 +756,19 @@ instances restored from persistence."
   (setq magnus-coord--processed-dms
         (assoc-delete-all directory magnus-coord--processed-dms))
   (setq magnus-coord--processed-summons
-        (assoc-delete-all directory magnus-coord--processed-summons)))
+        (assoc-delete-all directory magnus-coord--processed-summons))
+  (setq magnus-coord--processed-review-ready
+        (assoc-delete-all directory magnus-coord--processed-review-ready))
+  (let (remove)
+    (maphash
+     (lambda (key state)
+       (when (equal (car key) directory)
+         (when-let ((timer (plist-get state :timer)))
+           (cancel-timer timer))
+         (push key remove)))
+     magnus-coord--review-ready-retries)
+    (dolist (key remove)
+      (remhash key magnus-coord--review-ready-retries))))
 
 (defun magnus-coord--start-poll-timer ()
   "Start the coordination file poll timer."
@@ -765,6 +799,7 @@ Also updates vterm buffer activity ticks for quiescence tracking."
                 (magnus-coord--check-new-mentions directory))
               (magnus-coord--check-new-dms directory)
               (magnus-coord--check-new-summons directory)
+              (magnus-coord--check-new-review-ready directory)
               ;; Trim logs every 3min when file is changing
               (let ((now (float-time)))
                 (when (> (- now magnus-coord--last-trim-time) 180)
@@ -783,7 +818,13 @@ Also updates vterm buffer activity ticks for quiescence tracking."
   (setq magnus-coord--file-mtimes nil)
   (setq magnus-coord--processed-mentions nil)
   (setq magnus-coord--processed-dms nil)
-  (setq magnus-coord--processed-summons nil))
+  (setq magnus-coord--processed-summons nil)
+  (setq magnus-coord--processed-review-ready nil)
+  (maphash (lambda (_key state)
+             (when-let ((timer (plist-get state :timer)))
+               (cancel-timer timer)))
+           magnus-coord--review-ready-retries)
+  (clrhash magnus-coord--review-ready-retries))
 
 (defun magnus-coord--init-processed-mentions (directory)
   "Initialize processed mentions for DIRECTORY from current file content."
@@ -993,6 +1034,135 @@ Returns list of (target sender reason) tuples."
                                #'magnus-coord--handle-summon directory summon)
           (push hash processed))))
     (setf (alist-get directory magnus-coord--processed-summons nil nil #'equal)
+          processed)))
+
+;;; Review checkpoint markers
+
+(defun magnus-coord--review-ready-field (name fields)
+  "Return NAME's value from whitespace-separated review marker FIELDS."
+  (when (string-match
+         (format "\\(?:\\`\\|[[:space:]]+\\)%s=\\([^[:space:]]+\\)"
+                 (regexp-quote name))
+         fields)
+    (match-string 1 fields)))
+
+(defun magnus-coord--extract-review-ready (content)
+  "Extract machine-readable REVIEW-READY markers from CONTENT.
+Return a list of plists.  A valid marker has this form:
+
+  [REVIEW-READY request=ID checkpoint=TOKEN base=OID head=OID]
+
+The review subsystem validates the request, attempt, and object IDs before
+launching any work."
+  (let (markers)
+    (with-temp-buffer
+      (insert content)
+      (goto-char (point-min))
+      (while (re-search-forward
+              "\\[REVIEW-READY[[:space:]]+\\([^]\n]+\\)\\]" nil t)
+        (let* ((fields (match-string-no-properties 1))
+               (request-id
+                (magnus-coord--review-ready-field "request" fields))
+               (checkpoint-token
+                (magnus-coord--review-ready-field "checkpoint" fields))
+               (base (magnus-coord--review-ready-field "base" fields))
+               (head (magnus-coord--review-ready-field "head" fields)))
+          (when (and request-id checkpoint-token base head
+                     (string-match-p
+                      "\\`[[:alnum:]_.:-]+\\'" request-id)
+                     (string-match-p
+                      "\\`[[:alnum:]_.:-]+\\'" checkpoint-token)
+                     (string-match-p
+                      "\\`[[:xdigit:]]\\{40,64\\}\\'" base)
+                     (string-match-p
+                      "\\`[[:xdigit:]]\\{40,64\\}\\'" head))
+            (push (list :request-id request-id
+                        :checkpoint-token checkpoint-token
+                        :base (downcase base)
+                        :head (downcase head))
+                  markers)))))
+    (nreverse markers)))
+
+(defun magnus-coord--review-ready-hash (marker)
+  "Return a stable deduplication hash for review checkpoint MARKER."
+  (secure-hash 'sha256 (prin1-to-string marker)))
+
+(defun magnus-coord--dispatch-review-ready (directory marker)
+  "Safely dispatch MARKER from DIRECTORY to review handlers.
+Return non-nil only when all handlers complete, so a failed durable transition
+is not recorded as processed merely because a timer observed it."
+  (condition-case err
+      (progn
+        (run-hook-with-args 'magnus-coord-review-ready-hook directory marker)
+        t)
+    (error
+     (message "Magnus: review checkpoint handler failed for %s: %s"
+              directory (error-message-string err))
+     nil)))
+
+(defun magnus-coord--clear-review-ready-retry (directory hash)
+  "Clear any pending retry for marker HASH in DIRECTORY."
+  (let* ((key (cons directory hash))
+         (state (gethash key magnus-coord--review-ready-retries)))
+    (when-let ((timer (plist-get state :timer)))
+      (cancel-timer timer))
+    (remhash key magnus-coord--review-ready-retries)))
+
+(defun magnus-coord--schedule-review-ready-retry (directory hash)
+  "Schedule a bounded retry for marker HASH in DIRECTORY."
+  (let* ((key (cons directory hash))
+         (state (gethash key magnus-coord--review-ready-retries))
+         (count (or (plist-get state :count) 0)))
+    (when (and (< count magnus-coord-review-ready-retry-count)
+               (null (plist-get state :timer)))
+      (setq state (plist-put state :count (1+ count)))
+      (setq state
+            (plist-put
+             state :timer
+             (run-with-timer
+              magnus-coord-review-ready-retry-delay nil
+              (lambda ()
+                (let ((current
+                       (gethash key magnus-coord--review-ready-retries)))
+                  (when current
+                    (puthash key (plist-put current :timer nil)
+                             magnus-coord--review-ready-retries))
+                  (magnus-coord--check-new-review-ready directory))))))
+      (puthash key state magnus-coord--review-ready-retries))))
+
+(defun magnus-coord--init-processed-review-ready (directory)
+  "Initialize checkpoint processing for DIRECTORY.
+Unlike conversational messages, checkpoint markers are safe to replay because
+the review lifecycle validates their request and attempt tokens.  Replaying
+them on startup lets a persisted awaiting-checkpoint review recover after an
+Emacs restart."
+  (setf (alist-get directory magnus-coord--processed-review-ready
+                   nil nil #'equal)
+        nil)
+  (when magnus-coord-review-ready-hook
+    (magnus-coord--check-new-review-ready directory)))
+
+(defun magnus-coord--check-new-review-ready (directory)
+  "Dispatch new REVIEW-READY markers found in DIRECTORY."
+  (let* ((file (magnus-coord-file-path directory))
+         (content (when (file-exists-p file)
+                    (with-temp-buffer
+                      (insert-file-contents file)
+                      (buffer-string))))
+         (markers (when content (magnus-coord--extract-review-ready content)))
+         (processed
+          (alist-get directory magnus-coord--processed-review-ready
+                     nil nil #'equal)))
+    (dolist (marker markers)
+      (let ((hash (magnus-coord--review-ready-hash marker)))
+        (unless (member hash processed)
+          (if (magnus-coord--dispatch-review-ready directory marker)
+              (progn
+                (magnus-coord--clear-review-ready-retry directory hash)
+                (push hash processed))
+            (magnus-coord--schedule-review-ready-retry directory hash)))))
+    (setf (alist-get directory magnus-coord--processed-review-ready
+                     nil nil #'equal)
           processed)))
 
 (defun magnus-coord--handle-summon (directory summon)

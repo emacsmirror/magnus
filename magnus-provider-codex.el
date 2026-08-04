@@ -414,6 +414,10 @@ When MARKER is non-nil, capture its new session against FILES-BEFORE."
              (when (magnus-codex--current-process-p process instance)
                (process-put process 'magnus-codex-ready-timer nil)
                (process-put process 'magnus-codex-ready t)
+               ;; Existing queued input predates durable ready-hook deliveries.
+               ;; Defer the hook until that queue has actually drained so a
+               ;; recovered review notice cannot jump ahead of user input.
+               (process-put process 'magnus-codex-ready-hook-pending t)
                (magnus-codex--drain-input-queue process))))))))
     (when (and (boundp 'magnus-buffer-name)
                (get-buffer magnus-buffer-name))
@@ -438,51 +442,117 @@ When MARKER is non-nil, capture its new session against FILES-BEFORE."
            (files-before (magnus-codex--session-files)))
       (magnus-codex--spawn-tui instance prompt marker files-before))))
 
-(defun magnus-codex-send (instance text)
-  "Queue TEXT for serialized delivery through INSTANCE's native TUI."
+(defun magnus-codex--input-text (entry)
+  "Return message text from current or legacy queue ENTRY."
+  (if (stringp entry) entry (plist-get entry :text)))
+
+(defun magnus-codex--input-accepted (entry)
+  "Return transport-acceptance callback from queue ENTRY, if any."
+  (and (listp entry) (plist-get entry :accepted)))
+
+(defun magnus-codex-send (instance text &optional accepted)
+  "Queue TEXT for serialized delivery through INSTANCE's native TUI.
+When ACCEPTED is non-nil, call it only after bracketed paste and Return have
+reached vterm.  Return `submitted' for immediate submission or `queued' while
+the message is waiting for readiness, serialization, or user TUI ownership."
   (let ((process (magnus-codex--tui-process instance)))
     (unless process
       (user-error "Codex instance `%s' is not running"
                   (magnus-instance-name instance)))
-    (process-put process 'magnus-codex-input-queue
-                 (append (process-get process 'magnus-codex-input-queue)
-                         (list text)))
+    (let ((queue (process-get process 'magnus-codex-input-queue)))
+      ;; Durable controller deliveries carry an idempotency key in TEXT.  If a
+      ;; process-ready replay arrives before the existing entry drains, retain
+      ;; the original callback and one queue position.
+      (unless (and accepted
+                   (seq-some
+                    (lambda (entry)
+                      (string= text (magnus-codex--input-text entry)))
+                    queue))
+        (process-put process 'magnus-codex-input-queue
+                     (append queue
+                             (list (list :text text :accepted accepted))))))
     (magnus-codex--drain-input-queue process)))
 
+(defun magnus-codex--schedule-input-retry (process)
+  "Schedule another safe attempt to drain PROCESS's input queue."
+  (unless (process-get process 'magnus-codex-input-retry-timer)
+    (process-put
+     process 'magnus-codex-input-retry-timer
+     (run-with-timer
+      1.0 nil
+      (lambda ()
+        (process-put process 'magnus-codex-input-retry-timer nil)
+        (magnus-codex--drain-input-queue process))))))
+
 (defun magnus-codex--drain-input-queue (process)
-  "Submit PROCESS's next queued TUI message when it is safe."
+  "Submit PROCESS's next queued TUI message when it is safe.
+Return `submitted', `queued', or nil to describe this invocation."
   (let* ((instance (process-get process 'magnus-codex-instance))
          (buffer (and instance (magnus-instance-buffer instance)))
-         (queue (process-get process 'magnus-codex-input-queue)))
-    (when (and queue
-               (process-get process 'magnus-codex-ready)
-               (not (process-get process 'magnus-codex-input-busy))
-               (magnus-codex--current-process-p process instance))
-      (if (eq buffer (window-buffer (selected-window)))
-          ;; Do not append to a composer while the user owns this TUI.
-          (unless (process-get process 'magnus-codex-input-retry-timer)
-            (process-put
-             process 'magnus-codex-input-retry-timer
-             (run-with-timer
-              1.0 nil
-              (lambda ()
-                (process-put process 'magnus-codex-input-retry-timer nil)
-                (magnus-codex--drain-input-queue process)))))
-        (process-put process 'magnus-codex-input-queue (cdr queue))
+         (queue (process-get process 'magnus-codex-input-queue))
+         outcome)
+    (cond
+     ((null queue) (setq outcome nil))
+     ((not (and (process-get process 'magnus-codex-ready)
+                (not (process-get process 'magnus-codex-input-busy))
+                (magnus-codex--current-process-p process instance)))
+      (setq outcome 'queued))
+     ((eq buffer (window-buffer (selected-window)))
+      ;; Do not append to a composer while the user owns this TUI.
+      (magnus-codex--schedule-input-retry process)
+      (setq outcome 'queued))
+     (t
+      (let* ((entry (car queue))
+             (text (magnus-codex--input-text entry))
+             (accepted (magnus-codex--input-accepted entry)))
         (process-put process 'magnus-codex-input-busy t)
-        ;; Bracketed paste and Return occur in one Emacs event, preventing two
-        ;; automated deliveries from interleaving.
-        (with-current-buffer buffer
-          (vterm-send-string (car queue) t)
-          (vterm-send-return))
-        (process-put
-         process 'magnus-codex-input-busy-timer
-         (run-with-timer
-          0.1 nil
-          (lambda ()
-            (process-put process 'magnus-codex-input-busy nil)
-            (process-put process 'magnus-codex-input-busy-timer nil)
-            (magnus-codex--drain-input-queue process))))))))
+        (condition-case err
+            (progn
+              ;; Bracketed paste and Return occur in one Emacs event, preventing
+              ;; two automated deliveries from interleaving.  Dequeue only after
+              ;; both calls succeed so an exception cannot poison or lose input.
+              (with-current-buffer buffer
+                (vterm-send-string text t)
+                (vterm-send-return))
+              (process-put process 'magnus-codex-input-queue (cdr queue))
+              (when accepted
+                (condition-case receipt-err
+                    (funcall accepted)
+                  (error
+                   (message "Magnus: Codex delivery receipt failed: %s"
+                            (error-message-string receipt-err)))))
+              (process-put
+               process 'magnus-codex-input-busy-timer
+               (run-with-timer
+                0.1 nil
+                (lambda ()
+                  (process-put process 'magnus-codex-input-busy nil)
+                  (process-put process 'magnus-codex-input-busy-timer nil)
+                  (magnus-codex--drain-input-queue process))))
+              (setq outcome 'submitted))
+          (error
+           (process-put process 'magnus-codex-input-busy nil)
+           (message "Magnus: Codex TUI delivery deferred after error: %s"
+                    (error-message-string err))
+           (magnus-codex--schedule-input-retry process)
+           (setq outcome 'queued))))))
+    (magnus-codex--maybe-run-ready-hook process instance)
+    outcome))
+
+(defun magnus-codex--maybe-run-ready-hook (process instance)
+  "Run PROCESS's deferred ready hook once earlier input has drained."
+  (when (and (process-get process 'magnus-codex-ready-hook-pending)
+             (process-get process 'magnus-codex-ready)
+             (null (process-get process 'magnus-codex-input-queue))
+             (not (process-get process 'magnus-codex-input-busy))
+             (magnus-codex--current-process-p process instance))
+    (process-put process 'magnus-codex-ready-hook-pending nil)
+    (condition-case err
+        (run-hook-with-args 'magnus-process-ready-hook instance)
+      (error
+       (message "Magnus: process-ready hook failed for %s: %s"
+                (magnus-instance-name instance)
+                (error-message-string err))))))
 
 (defun magnus-codex-interrupt (instance)
   "Interrupt Codex INSTANCE through its native TUI."
@@ -614,6 +684,113 @@ duplicated in `event_msg' records, and raw reasoning content is encrypted."
            (magnus-codex--canonical-trace-entry
             'assistant timestamp text)))))))
 
+(defun magnus-codex--headless-option-string (value)
+  "Return optional Codex CLI VALUE as a string."
+  (cond
+   ((null value) nil)
+   ((symbolp value) (symbol-name value))
+   ((stringp value) value)
+   (t (format "%s" value))))
+
+(defun magnus-codex-headless-review-spec (request)
+  "Return a Codex headless launch specification for REQUEST."
+  (let* ((session-id (plist-get request :session-id))
+         (base (plist-get request :base))
+         (schema-file (plist-get request :schema-file))
+         (directory (plist-get request :directory))
+         (prompt (plist-get request :prompt))
+         (model (magnus-codex--headless-option-string
+                 (plist-get request :model)))
+         (effort (magnus-codex--headless-option-string
+                  (plist-get request :effort)))
+         (title (magnus-codex--headless-option-string
+                 (plist-get request :title)))
+         (name (magnus-codex--headless-option-string
+                (plist-get request :name))))
+    (unless (and (stringp schema-file) (file-readable-p schema-file))
+      (user-error "Codex headless reviews require a JSON schema file"))
+    (if session-id
+        (unless (and (stringp session-id) (not (string-empty-p session-id)))
+          (user-error "Codex review session ID is invalid"))
+      (unless (and (stringp base) (not (string-empty-p base)))
+        (user-error "A fresh Codex review requires an exact base revision")))
+    (list
+     :command
+     (append
+      (list magnus-codex-executable "exec"
+            "--json"
+            "--color" "never"
+            "--sandbox" "read-only"
+            "--cd" (expand-file-name directory)
+            "--output-schema" schema-file)
+      (when model (list "--model" model))
+      (when effort
+        (list "--config"
+              (format "model_reasoning_effort=%S" effort)))
+      (if session-id
+          (list "resume" session-id prompt)
+        (append (list "review" "--base" base)
+                (when title (list "--title" title))
+                (list prompt))))
+     :decoder #'magnus-codex-headless-decode-event
+     :session-id session-id
+     :name (and name (format "magnus-codex-review-%s" name)))))
+
+(defun magnus-codex--parse-structured-result (text)
+  "Parse Codex structured result TEXT into alists and lists."
+  (json-parse-string text
+                     :object-type 'alist
+                     :array-type 'list
+                     :null-object nil
+                     :false-object nil))
+
+(defun magnus-codex-headless-decode-event (event request)
+  "Normalize one Codex exec JSONL EVENT for REQUEST."
+  (let* ((type (alist-get 'type event))
+         (item (alist-get 'item event))
+         (item-type (and (listp item) (alist-get 'type item)))
+         (text (and (equal item-type "agent_message")
+                    (alist-get 'text item)))
+         (canonical (list :type (or type "unknown")
+                          :provider 'codex
+                          :raw event)))
+    (when (equal type "thread.started")
+      (setq canonical
+            (plist-put canonical :session-id
+                       (or (alist-get 'thread_id event)
+                           (alist-get 'threadId event)))))
+    ;; With --output-schema, the final agent_message text is the constrained
+    ;; JSON value.  A malformed value is visible to both the raw-event callback
+    ;; and the explicit decode-error channel.
+    (when (and (equal type "item.completed")
+               (equal item-type "agent_message")
+               (plist-get request :schema-file))
+      (if (not (stringp text))
+          (setq canonical
+                (plist-put canonical :decode-error
+                           "Codex agent_message contains no text"))
+        (condition-case err
+            (setq canonical
+                  (plist-put canonical :structured-result
+                             (magnus-codex--parse-structured-result text)))
+          (error
+           (setq canonical
+                 (plist-put canonical :decode-error
+                            (format "Codex result is not schema JSON: %s"
+                                    (error-message-string err))))))))
+    (when (member type '("turn.completed" "turn.failed" "turn.cancelled"))
+      (setq canonical (plist-put canonical :terminal t)))
+    (when (member type '("error" "turn.failed" "turn.cancelled"))
+      (let* ((detail (alist-get 'error event))
+             (message (or (alist-get 'message event)
+                          (and (listp detail) (alist-get 'message detail))
+                          (and (stringp detail) detail)
+                          (format "Codex emitted %s" type))))
+        (setq canonical
+              (plist-put canonical :error
+                         (list :type type :message message :detail detail)))))
+    canonical))
+
 (magnus-provider-register
  'codex
  '((start . magnus-codex-start)
@@ -624,7 +801,8 @@ duplicated in `event_msg' records, and raw reasoning content is encrypted."
    (running-p . magnus-codex-running-p)
    (switch-to . magnus-codex-switch-to)
    (trace-file . magnus-codex-trace-file)
-   (trace-entry . magnus-codex-trace-entry)))
+   (trace-entry . magnus-codex-trace-entry)
+   (headless-review-spec . magnus-codex-headless-review-spec)))
 
 (provide 'magnus-provider-codex)
 ;;; magnus-provider-codex.el ends here
