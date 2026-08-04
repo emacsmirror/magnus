@@ -703,8 +703,6 @@ duplicated in `event_msg' records, and raw reasoning content is encrypted."
                  (plist-get request :model)))
          (effort (magnus-codex--headless-option-string
                   (plist-get request :effort)))
-         (title (magnus-codex--headless-option-string
-                 (plist-get request :title)))
          (name (magnus-codex--headless-option-string
                 (plist-get request :name))))
     (unless (and (stringp schema-file) (file-readable-p schema-file))
@@ -729,9 +727,14 @@ duplicated in `event_msg' records, and raw reasoning content is encrypted."
               (format "model_reasoning_effort=%S" effort)))
       (if session-id
           (list "resume" session-id prompt)
-        (append (list "review" "--base" base)
-                (when title (list "--title" title))
-                (list prompt))))
+        ;; Use an ordinary exec session so the documented `exec resume' path
+        ;; can preserve reviewer continuity.  The `exec review' subcommand
+        ;; treats a custom prompt as its sole target and rejects combining it
+        ;; with --base/--commit/--uncommitted; --title requires --commit.
+        ;; Magnus already pins the immutable base/head in the detached checkout
+        ;; and PROMPT, then validates the echoed object IDs, so the built-in
+        ;; review target machinery would be redundant.
+        (list prompt)))
      :decoder #'magnus-codex-headless-decode-event
      :session-id session-id
      :name (and name (format "magnus-codex-review-%s" name)))))

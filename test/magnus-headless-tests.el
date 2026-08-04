@@ -337,7 +337,7 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
                               (plist-get decoded :structured-result))
                    "approve"))))
 
-(ert-deftest magnus-codex-review-spec-pins-base-and-resumes-session ()
+(ert-deftest magnus-codex-review-spec-uses-resumable-exec-session ()
   (let ((schema-file (make-temp-file "magnus-codex-schema-")))
     (unwind-protect
         (let* ((request (list :directory default-directory
@@ -354,19 +354,31 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
                 (magnus-codex-headless-review-spec
                  (plist-put (copy-sequence request)
                             :session-id "thread-resume")))
-               (resumed-command (plist-get resumed :command)))
-          (should (member "--sandbox" fresh-command))
-          (should (member "read-only" fresh-command))
-          (should (member "--output-schema" fresh-command))
-          (should (member "model_reasoning_effort=\"high\"" fresh-command))
-          (should (< (cl-position "exec" fresh-command :test #'equal)
-                     (cl-position "review" fresh-command :test #'equal)))
-          (should (member "--base" fresh-command))
-          (should (member "base-oid" fresh-command))
-          (should (member "--title" fresh-command))
-          (should (member "resume" resumed-command))
-          (should (member "thread-resume" resumed-command))
+               (resumed-command (plist-get resumed :command))
+               (common
+                (list magnus-codex-executable "exec"
+                      "--json" "--color" "never"
+                      "--sandbox" "read-only"
+                      "--cd" (expand-file-name default-directory)
+                      "--output-schema" schema-file
+                      "--model" "codex-test"
+                      "--config" "model_reasoning_effort=\"high\"")))
+          (should (equal fresh-command (append common '("Review it"))))
+          (should (equal resumed-command
+                         (append common
+                                 '("resume" "thread-resume" "Review it"))))
+          (should-not (member "review" fresh-command))
+          (should-not (member "--base" fresh-command))
+          (should-not (member "--commit" fresh-command))
+          (should-not (member "--uncommitted" fresh-command))
+          (should-not (member "--title" fresh-command))
+          (should-not (member "--ephemeral" fresh-command))
           (should-not (member "review" resumed-command))
+          (should-not (member "--base" resumed-command))
+          (should-not (member "--commit" resumed-command))
+          (should-not (member "--uncommitted" resumed-command))
+          (should-not (member "--title" resumed-command))
+          (should-not (member "--ephemeral" resumed-command))
           (should (equal (plist-get resumed :session-id) "thread-resume")))
       (delete-file schema-file))))
 

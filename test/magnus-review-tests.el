@@ -16,6 +16,42 @@
   "Guard against accidentally nesting the update defun inside create."
   (should (fboundp 'magnus-review-worktree-update)))
 
+(ert-deftest magnus-review-prompt-pins-the-exact-committed-range ()
+  (let* ((review
+          (magnus-review--create
+           :id "prompt-scope"
+           :reviewer-name "keen-owl"
+           :task "Review the committed implementation"
+           :metadata nil))
+         (round
+          (magnus-review-round--create
+           :number 1
+           :base-oid magnus-test-review--base-oid
+           :head-oid magnus-test-review--head-oid))
+         prompt)
+    (cl-letf (((symbol-function 'magnus-review-controller--patch-path)
+               (lambda (_review _round) "/tmp/canonical-evidence.patch")))
+      (setq prompt
+            (magnus-review-controller--review-prompt review round)))
+    (should (string-match-p
+             (regexp-quote
+              (format "Exact base object: %s"
+                      magnus-test-review--base-oid))
+             prompt))
+    (should (string-match-p
+             (regexp-quote
+              (format "Exact head object: %s"
+                      magnus-test-review--head-oid))
+             prompt))
+    (should (string-match-p
+             (regexp-quote
+              (format "git diff --find-renames %s..%s --"
+                      magnus-test-review--base-oid
+                      magnus-test-review--head-oid))
+             prompt))
+    (should (string-match-p
+             (regexp-quote "/tmp/canonical-evidence.patch") prompt))))
+
 (ert-deftest magnus-review-ready-marker-parses-exact-checkpoint ()
   (let ((markers
          (magnus-coord--extract-review-ready
@@ -199,6 +235,24 @@
     (prior_findings . [])
     (strengths . ["Small committed scope"])
     (tests . ["Inspected the archived patch"])))
+
+(ert-deftest magnus-review-rejects-result-for-a-different-committed-range ()
+  (let* ((review (magnus-review--create :id "result-scope"))
+         (round
+          (magnus-review-round--create
+           :number 1
+           :base-oid magnus-test-review--base-oid
+           :head-oid magnus-test-review--head-oid))
+         (other-oid "cccccccccccccccccccccccccccccccccccccccc"))
+    (dolist (raw
+             (list
+              (magnus-test-review--raw-result
+               other-oid magnus-test-review--head-oid)
+              (magnus-test-review--raw-result
+               magnus-test-review--base-oid other-oid)))
+      (should-error
+       (magnus-review-controller-normalize-result review round raw)
+       :type 'error))))
 
 (ert-deftest magnus-review-recovers-tokened-result-before-model-retry ()
   (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
