@@ -991,6 +991,7 @@ the message; callers include stable idempotency keys for replay."
           (string= (or (magnus-review-task review) "") task)))
    (magnus-review-list)))
 
+;;;###autoload
 (cl-defun magnus-review-request
     (author &key provider model effort)
   "Request an independent review of AUTHOR without prompting for Git objects."
