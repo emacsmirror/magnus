@@ -32,6 +32,10 @@
 ;; :schema-file, the runner creates a private temporary schema file and removes
 ;; it after completion.
 ;;
+;; Headless commands receive their prompt through REQUEST/provider argv and do
+;; not receive streaming stdin.  The runner closes the subprocess input pipe
+;; after launch so CLIs that inspect piped stdin cannot wait forever for EOF.
+;;
 ;; A provider launch spec may return :candidate-session-id for a locally chosen
 ;; fresh ID.  Unlike :session-id, a candidate is diagnostic only and never
 ;; triggers :on-session until the provider confirms it in its event stream.
@@ -432,6 +436,14 @@ remains with the caller."
             (when-let ((candidate (plist-get spec :candidate-session-id)))
               (process-put process 'magnus-headless-candidate-session-id
                            candidate))
+            ;; `codex exec PROMPT' appends piped stdin as extra context.  An
+            ;; Emacs pipe remains writable until explicitly closed, so without
+            ;; this EOF Codex waits indefinitely after printing "Reading
+            ;; additional input from stdin...".  No headless provider accepts
+            ;; interactive input through this API; prompts are already in the
+            ;; provider command.
+            (when (process-live-p process)
+              (process-send-eof process))
             ;; Activation occurs on the next event-loop turn.  Until then the
             ;; bootstrap filters above retain output, which guarantees that a
             ;; very short-lived subprocess cannot outrun property installation
@@ -452,6 +464,8 @@ remains with the caller."
                   process (or pending-event "process finished")))))
             process))
       (error
+       (when (and process (process-live-p process))
+         (delete-process process))
        (when (and stderr-process (process-live-p stderr-process))
          (delete-process stderr-process))
        (magnus-headless--delete-owned-schema prepared)

@@ -59,6 +59,28 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
     (unless (funcall predicate)
       (ert-fail "Timed out waiting for fake headless provider"))))
 
+(ert-deftest magnus-headless-closes-stdin-after-launch ()
+  (let* ((result "{\"type\":\"result\",\"value\":{\"ok\":true}}")
+         ;; This fixture cannot produce its terminal event until the parent
+         ;; closes stdin.  It models `codex exec PROMPT', which otherwise waits
+         ;; forever to append Emacs's open input pipe as extra prompt context.
+         (command
+          (format "cat >/dev/null; %s"
+                  (magnus-test-headless--emit result)))
+         completion process)
+    (unwind-protect
+        (progn
+          (setq process
+                (magnus-headless-start
+                 'magnus-test-headless
+                 (magnus-test-headless--request command)
+                 (list :on-complete
+                       (lambda (_process value) (setq completion value)))))
+          (magnus-test-headless--wait (lambda () completion))
+          (should (plist-get completion :success-p)))
+      (when (and process (process-live-p process))
+        (magnus-headless-cancel process t)))))
+
 (ert-deftest magnus-headless-frames-partial-jsonl ()
   (let* ((first "{\"type\":\"sess")
          (second "ion\",\"session_id\":\"thread-1\"}")
