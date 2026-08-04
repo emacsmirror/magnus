@@ -132,6 +132,12 @@ This bounds durable storage and accidental giant binary reviews."
 (defvar magnus-review-ready-hook nil
   "Hook run with REVIEW and ROUND after a checkpoint becomes reviewable.")
 
+(defvar magnus-review-checkpoint-mismatch-hook nil
+  "Hook run after a known review emits a non-current checkpoint token.
+Each function receives REVIEW and the rejected MARKER.  The marker never
+changes review state; controller integrations may resend the durable current
+checkpoint request so an author can recover after context loss or compaction.")
+
 ;;; Small validation and path helpers
 
 (defun magnus-review--signal (format-string &rest args)
@@ -729,32 +735,41 @@ The initial request waits for an exact committed checkpoint."
 
 (defun magnus-review--acknowledge-unchanged-checkpoint
     (review checkpoint-token base head)
-  "Durably acknowledge that REVIEW remained at exact BASE and HEAD.
+  "Durably finish REVIEW's request that remained at exact BASE and HEAD.
 CHECKPOINT-TOKEN identifies the request whose author reported no new committed
-evidence.  The latest completed round and its verdict remain authoritative."
-  (let ((latest (magnus-review-latest-round review)))
+evidence.  The latest completed round and its verdict remain authoritative;
+a later re-review must allocate a fresh checkpoint token."
+  (let* ((latest (magnus-review-latest-round review))
+         (acknowledged
+          (magnus-review--checkpoint-ack-round-for-token
+           review checkpoint-token)))
     (unless (and latest
                  (eq (magnus-review-lifecycle review) 'open)
-                 (eq (magnus-review-execution review)
-                     'waiting-for-checkpoint)
                  (eq (magnus-review-round-execution latest) 'complete)
                  (string= base (magnus-review-round-base-oid latest))
-                 (string= head (magnus-review-round-head-oid latest)))
+                 (string= head (magnus-review-round-head-oid latest))
+                 (or (eq (magnus-review-execution review)
+                         'waiting-for-checkpoint)
+                     (eq acknowledged latest)))
       (magnus-review--signal
        "Unchanged checkpoint does not match the latest completed round"))
-    (let ((now (float-time)))
-      (setf (magnus-review-checkpoint-acks review)
-            (append
-             (magnus-review-checkpoint-acks review)
-             (list (cons checkpoint-token
-                         (magnus-review-round-number latest))))
-            (magnus-review-updated-at review) now)
-      (magnus-review-save review)
-      (message
-       "Magnus: %s reported no new committed changes; review is still waiting after round %d (%s)"
-       (magnus-review-author-name review)
-       (magnus-review-round-number latest)
-       (magnus-review-round-verdict latest))
+    (let ((changed (or (null acknowledged)
+                       (not (eq (magnus-review-execution review) 'complete)))))
+      (unless acknowledged
+        (setf (magnus-review-checkpoint-acks review)
+              (append
+               (magnus-review-checkpoint-acks review)
+               (list (cons checkpoint-token
+                           (magnus-review-round-number latest))))))
+      (when changed
+        (setf (magnus-review-execution review) 'complete
+              (magnus-review-updated-at review) (float-time))
+        (magnus-review-save review)
+        (message
+         "Magnus: %s reported no new committed changes; round %d remains %s"
+         (magnus-review-author-name review)
+         (magnus-review-round-number latest)
+         (magnus-review-round-verdict latest)))
       latest)))
 
 (cl-defun magnus-review-append-round
@@ -1660,7 +1675,7 @@ EXPECTED-ID and EXPECTED-HASH validate its managed storage path."
     review))
 
 (defun magnus-review--recover-one (review)
-  "Turn stale starting/running state in REVIEW into interrupted state."
+  "Recover stale active or already-acknowledged state in REVIEW."
   (let ((changed nil)
         (now (float-time)))
     (dolist (round (magnus-review-rounds review))
@@ -1680,6 +1695,22 @@ EXPECTED-ID and EXPECTED-HASH validate its managed storage path."
     (when (memq (magnus-review-execution review) '(starting running))
       (setf (magnus-review-execution review) 'interrupted)
       (setq changed t))
+    ;; Versions that first accepted an unchanged re-review checkpoint kept the
+    ;; aggregate waiting indefinitely.  The acknowledgement is durable proof
+    ;; that this specific request finished without new evidence, so normalize
+    ;; that legacy shape even if coordination-log trimming removed its marker.
+    (let* ((latest (magnus-review-latest-round review))
+           (acknowledged
+            (magnus-review--checkpoint-ack-round-for-token
+             review (magnus-review-checkpoint-token review))))
+      (when (and (eq (magnus-review-lifecycle review) 'open)
+                 (eq (magnus-review-execution review)
+                     'waiting-for-checkpoint)
+                 latest
+                 (eq latest acknowledged)
+                 (eq (magnus-review-round-execution latest) 'complete))
+        (setf (magnus-review-execution review) 'complete)
+        (setq changed t)))
     (when changed
       (setf (magnus-review-updated-at review) now)
       (magnus-review-save review))
@@ -1970,10 +2001,11 @@ Even with FORCE, cleanup never operates outside REVIEW's derived checkout."
 MARKER is a plist with :request-id, :checkpoint-token, :base, and :head strings.
 A new valid marker appends an immutable round and runs
 `magnus-review-ready-hook'.  An unchanged re-review checkpoint is acknowledged
-without duplicating the round or launching a model, and its request keeps
-waiting for new committed evidence.  Replayed markers never append a duplicate
-round, but a queued round re-runs the hook so startup recovery can continue
-launching it idempotently."
+without duplicating the round or launching a model, and finishes that pending
+request.  A known request with a non-current token never changes Git scope and
+triggers `magnus-review-checkpoint-mismatch-hook' for recovery.  Replayed
+markers never append a duplicate round, but a queued round re-runs the hook so
+startup recovery can continue launching it idempotently."
   (let* ((request-id (plist-get marker :request-id))
          (token (plist-get marker :checkpoint-token))
          (base (plist-get marker :base))
@@ -2020,7 +2052,11 @@ launching it idempotently."
          ;; A re-review request may legitimately produce no new commit.  Its
          ;; fresh token remains a durable event identity so startup replay can
          ;; accept it without manufacturing a duplicate round or model run.
-         (acknowledged-match acknowledged)
+         (acknowledged-match
+          (if (eq acknowledged latest)
+              (magnus-review--acknowledge-unchanged-checkpoint
+               review token base head)
+            acknowledged))
          ;; Once the token binds to a real round, only that canonical scope or
          ;; its earlier acknowledged no-progress scope may replay successfully.
          (persisted
@@ -2028,8 +2064,21 @@ launching it idempotently."
            "Replayed review-ready marker changed its Git scope"))
          ((not (string= token
                         (or (magnus-review-checkpoint-token review) "")))
-          (magnus-review--signal "Review-ready token does not match request %s"
-                                 request-id))
+          ;; Context compaction can make an otherwise healthy author invent or
+          ;; replay the wrong token.  Never trust that marker's Git scope, but
+          ;; consume it as a no-op for this watcher session and let the controller
+          ;; redeliver the canonical request.  Startup replay is still safe and
+          ;; may reissue that request once more if the bad marker remains.
+          (when (eq (magnus-review-execution review) 'waiting-for-checkpoint)
+            (run-hook-with-args
+             'magnus-review-checkpoint-mismatch-hook review marker))
+          (message
+           "Magnus: ignored non-current checkpoint token from %s%s"
+           (magnus-review-author-name review)
+           (if (eq (magnus-review-execution review) 'waiting-for-checkpoint)
+               "; retained the canonical request"
+             ""))
+          review)
          ((not (eq (magnus-review-execution review) 'waiting-for-checkpoint))
           (magnus-review--signal "Review %s is not waiting for a checkpoint"
                                  request-id))

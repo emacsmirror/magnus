@@ -88,7 +88,7 @@
 (defun magnus-transient--review-request-busy-p ()
   "Return non-nil when the selected review already has pending work."
   (memq (plist-get (magnus-transient--current-review-request-context) :action)
-        '(waiting queued running)))
+        '(queued running)))
 
 (defun magnus-transient--review-request-heading ()
   "Describe the exact task-scoped operation in the request transient."
@@ -128,7 +128,7 @@
       ('retry (if (eq (magnus-review-execution review) 'interrupted)
                   "Retry interrupted review"
                 "Retry failed review"))
-      ('waiting "Already waiting for checkpoint")
+      ('waiting "Resend current checkpoint request")
       ('queued "Review is queued")
       ('running "Review is in progress")
       (_ "Start review"))))
@@ -246,12 +246,21 @@ review actions."
               (magnus-review-author-name magnus-transient--review))
     "No review selected"))
 
+(defun magnus-transient--review-rereview-description ()
+  "Describe the selected review's checkpoint action."
+  (if (and magnus-transient--review
+           (eq (magnus-review-execution magnus-transient--review)
+               'waiting-for-checkpoint))
+      "Resend checkpoint request"
+    "Request re-review"))
+
 (transient-define-prefix magnus-review-actions-menu ()
   "Actions for one durable review."
   ["Review"
    :description magnus-transient--review-description
    ("RET" "Open" magnus-transient-review-open)
-   ("r" "Request re-review" magnus-transient-review-rereview)
+   ("r" magnus-transient-review-rereview
+    :description magnus-transient--review-rereview-description)
    ("t" "Retry failed round" magnus-transient-review-retry)
    ("i" "Interrupt running review" magnus-transient-review-interrupt)
    ("d" "Retry author delivery" magnus-transient-review-delivery)

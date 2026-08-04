@@ -197,8 +197,20 @@
           (should (equal (magnus-transient--review-request-action-description)
                          "Review is in progress"))
           (should-not (magnus-transient--review-request-new-p))
-          (should (magnus-transient--review-request-busy-p)))
-      (setq magnus-transient--review-request-context nil))))
+          (should (magnus-transient--review-request-busy-p))
+          (setf (magnus-review-execution review) 'waiting-for-checkpoint)
+          (setq magnus-transient--review-request-context
+                (list :author author :review review :action 'waiting))
+          (should
+           (equal (magnus-transient--review-request-action-description)
+                  "Resend current checkpoint request"))
+          (should-not (magnus-transient--review-request-busy-p))
+          (setq magnus-transient--review review)
+          (should
+           (equal (magnus-transient--review-rereview-description)
+                  "Resend checkpoint request")))
+      (setq magnus-transient--review-request-context nil
+            magnus-transient--review nil))))
 
 (ert-deftest magnus-review-transient-wires-the-direct-action ()
   (let ((main (transient-get-suffix 'magnus-dispatch "v"))

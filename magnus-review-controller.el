@@ -963,6 +963,9 @@ the message; callers include stable idempotency keys for replay."
       "using full object IDs (never abbreviations):\n"
       "[REVIEW-READY request=%s checkpoint=%s base=<FULL_BASE_OID> "
       "head=<FULL_HEAD_OID>]\n\n"
+      "The checkpoint token is an opaque Magnus correlation token: copy it "
+      "exactly. "
+      "Never generate, hash, derive, or replace it. "
       "This request is idempotent. If that exact checkpoint was already prepared, "
       "re-emit the same marker; do not create an empty or unrelated commit.")
      (magnus-review-id review)
@@ -979,6 +982,44 @@ the message; callers include stable idempotency keys for replay."
     (when-let ((author (magnus-review-controller--author-instance review)))
       (magnus-review-controller--send
        author (magnus-review-controller--checkpoint-message review)))))
+
+(defun magnus-review-controller--recover-checkpoint-token (review _marker)
+  "Redeliver REVIEW's canonical request after an author used a stale token."
+  (when (eq (magnus-review-execution review) 'waiting-for-checkpoint)
+    (magnus-review-controller--deliver-checkpoint review)))
+
+(defun magnus-review-resend-checkpoint (review)
+  "Resend REVIEW's current checkpoint request without rotating its token."
+  (interactive
+   (list (or (and (fboundp 'magnus-review-ui-current-review)
+                  (magnus-review-ui-current-review))
+             (user-error "No review selected"))))
+  (let* ((latest (magnus-review-latest-round review))
+         (acknowledged
+          (magnus-review--checkpoint-ack-round-for-token
+           review (magnus-review-checkpoint-token review))))
+    (cond
+     ;; Hot-loaded code has not passed through `magnus-review-load-all'.  Let
+     ;; the visible recovery action normalize the same durable legacy shape.
+     ((and (eq (magnus-review-execution review) 'waiting-for-checkpoint)
+           latest
+           (eq latest acknowledged))
+      (magnus-review--acknowledge-unchanged-checkpoint
+       review
+       (magnus-review-checkpoint-token review)
+       (magnus-review-round-base-oid latest)
+       (magnus-review-round-head-oid latest)))
+     ((not (eq (magnus-review-execution review) 'waiting-for-checkpoint))
+      (user-error "Review by %s is not waiting for a checkpoint"
+                  (magnus-review-reviewer-name review)))
+     ((magnus-review-controller--deliver-checkpoint review)
+      (message "Magnus: resent round %d checkpoint request to %s"
+               (1+ (length (magnus-review-rounds review)))
+               (magnus-review-author-name review)))
+     (t
+      (message "Magnus: checkpoint request will reach %s when it resumes"
+               (magnus-review-author-name review)))))
+  review)
 
 (defun magnus-review-controller--matching-open-review (author root task)
   "Find AUTHOR's open review for ROOT and TASK."
@@ -1029,6 +1070,8 @@ CONTEXT, when non-nil, must be a freshly validated value returned by
     (if existing
         (pcase (magnus-review-execution existing)
           ('complete (magnus-review-rereview existing))
+          ('waiting-for-checkpoint
+           (magnus-review-resend-checkpoint existing))
           ((or 'failed 'interrupted) (magnus-review-retry existing))
           (_ (user-error "Review by %s is already %s"
                          (magnus-review-reviewer-name existing)
@@ -1077,12 +1120,14 @@ CONTEXT, when non-nil, must be a freshly validated value returned by
    (list (or (and (fboundp 'magnus-review-ui-current-review)
                   (magnus-review-ui-current-review))
              (user-error "No review selected"))))
-  (magnus-review-await-checkpoint review)
-  (magnus-review-controller--deliver-checkpoint review)
-  (message "Magnus: requested round %d from %s"
-           (1+ (length (magnus-review-rounds review)))
-           (magnus-review-author-name review))
-  review)
+  (if (eq (magnus-review-execution review) 'waiting-for-checkpoint)
+      (magnus-review-resend-checkpoint review)
+    (magnus-review-await-checkpoint review)
+    (magnus-review-controller--deliver-checkpoint review)
+    (message "Magnus: requested round %d from %s"
+             (1+ (length (magnus-review-rounds review)))
+             (magnus-review-author-name review))
+    review))
 
 (defun magnus-review-retry (review)
   "Retry REVIEW's latest failed or interrupted exact round."
@@ -1888,6 +1933,8 @@ Return non-nil when publication was recovered."
         magnus-review-controller--queue nil)
   (magnus-review-setup-coordination)
   (add-hook 'magnus-review-ready-hook #'magnus-review-controller--ready)
+  (add-hook 'magnus-review-checkpoint-mismatch-hook
+            #'magnus-review-controller--recover-checkpoint-token)
   (add-hook 'magnus-process-ready-hook
             #'magnus-review-controller--process-ready)
   (add-hook 'magnus-reviews-changed-hook
@@ -2045,6 +2092,8 @@ Return non-nil when publication was recovered."
      magnus-review-controller--local-delivery-processes)
     (clrhash magnus-review-controller--local-delivery-processes)
     (remove-hook 'magnus-review-ready-hook #'magnus-review-controller--ready)
+    (remove-hook 'magnus-review-checkpoint-mismatch-hook
+                 #'magnus-review-controller--recover-checkpoint-token)
     (remove-hook 'magnus-process-ready-hook
                  #'magnus-review-controller--process-ready)
     (remove-hook 'magnus-reviews-changed-hook

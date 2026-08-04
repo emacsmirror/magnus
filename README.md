@@ -348,7 +348,7 @@ The `? V` action popup (or `?` inside a review reader) provides:
 | Key   | Action                                      |
 |-------|---------------------------------------------|
 | `RET` | Open the review                             |
-| `r`   | Request a re-review of the next checkpoint |
+| `r`   | Request or resend the next checkpoint      |
 | `t`   | Retry a failed or interrupted round        |
 | `i`   | Interrupt a running headless reviewer      |
 | `d`   | Retry delivery of review notes to author   |
@@ -357,6 +357,10 @@ The `? V` action popup (or `?` inside a review reader) provides:
 A manual interrupt remains stopped across Emacs restarts until you explicitly
 retry it. From a historical review round, delivery retry targets that round;
 from the status buffer it selects the newest completed undelivered round.
+While a review is waiting, `r` resends its existing opaque correlation token
+so an author can recover after compaction. If the author reports the already
+reviewed Git head, Magnus finishes that request as a no-op and preserves the
+existing verdict and findings; a later re-review allocates a fresh token.
 
 **Attention & Health**
 | Key | Action                      |
