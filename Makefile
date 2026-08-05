@@ -23,4 +23,4 @@ test:
 		-f ert-run-tests-batch-and-exit
 
 clean:
-	rm -f *.elc
+	rm -f *.elc test/*.elc

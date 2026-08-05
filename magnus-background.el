@@ -123,8 +123,8 @@ MESSAGE is the human-readable synthetic failure when FAILURE-KIND is non-nil."
         (setq value (plist-put value :timed-out-p t))))
     value))
 
-(defun magnus-background--failure-message (job result)
-  "Return a concise diagnostic for failed JOB RESULT."
+(defun magnus-background--failure-message (_job result)
+  "Return a concise diagnostic for failed RESULT."
   (or (plist-get result :error-message)
       (let ((stderr (string-trim (or (plist-get result :stderr) ""))))
         (unless (string-empty-p stderr) stderr))
