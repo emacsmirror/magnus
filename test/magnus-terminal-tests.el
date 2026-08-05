@@ -75,12 +75,76 @@
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
-(ert-deftest magnus-terminal-builds-provider-neutral-coordination-identity ()
-  (should
-   (equal
-    (magnus-terminal-coordination-environment "writer-uuid" "swift-hare")
-    '("MAGNUS_COORD_WRITER_ID=writer-uuid"
-      "MAGNUS_COORD_WRITER_NAME=swift-hare"))))
+(ert-deftest magnus-terminal-cancels-only-the-requested-delivery-scope ()
+  (let* ((buffer (generate-new-buffer " *magnus-terminal-scopes*"))
+         (process
+          (make-pipe-process :name "magnus-terminal-scopes"
+                             :buffer buffer :noquery t))
+         (instance
+          (magnus-instance--create
+           :id "scoped" :name "scoped" :buffer buffer :status 'running))
+         (magnus-terminal--delivery-processes
+          (make-hash-table :test #'eq))
+         timer events)
+    (unwind-protect
+        (cl-letf (((symbol-function 'vterm-send-string)
+                   (lambda (text &optional _paste-p) (push text events)))
+                  ((symbol-function 'vterm-send-return)
+                   (lambda () (push 'return events)))
+                  ((symbol-function 'run-with-timer)
+                   (lambda (_delay _repeat function &rest arguments)
+                     (setq timer (cons function arguments))
+                     'settle-timer)))
+          (should (eq (magnus-terminal-submit
+                       instance "review" nil :settle-delay 1
+                       :scope 'review-controller)
+                      'submitted))
+          (should (eq (magnus-terminal-submit
+                       instance "codex" nil :scope 'codex)
+                      'queued))
+          (magnus-terminal-cancel-scope 'review-controller)
+          ;; The review entry was already submitted and is only settling;
+          ;; cancelling its scope must retain both its timer and later Codex
+          ;; work on the same exact process.
+          (should timer)
+          (should
+           (equal (mapcar
+                   (lambda (entry) (plist-get entry :text))
+                   (process-get process 'magnus-terminal-delivery-queue))
+                  '("codex")))
+          (apply (car timer) (cdr timer))
+          (should (equal (nreverse events)
+                         '("review" return "codex" return)))
+          (should (magnus-terminal-delivery-idle-p process)))
+      (when (process-live-p process) (delete-process process))
+      (kill-buffer buffer))))
+
+(ert-deftest magnus-terminal-deduplication-is-scoped ()
+  (let* ((buffer (generate-new-buffer " *magnus-terminal-dedup-scope*"))
+         (process
+          (make-pipe-process :name "magnus-terminal-dedup-scope"
+                             :buffer buffer :noquery t))
+         (instance
+          (magnus-instance--create
+           :id "dedup" :name "dedup" :buffer buffer :status 'running))
+         (magnus-terminal--delivery-processes
+          (make-hash-table :test #'eq))
+         (not-ready (lambda (_process) nil)))
+    (unwind-protect
+        (progn
+          (magnus-terminal-submit
+           instance "same text" nil :ready-p not-ready
+           :scope 'review-controller :deduplicate t)
+          (magnus-terminal-submit
+           instance "same text" nil :scope 'codex :deduplicate t)
+          (should
+           (equal (mapcar
+                   (lambda (entry) (plist-get entry :scope))
+                   (process-get process 'magnus-terminal-delivery-queue))
+                  '(review-controller codex))))
+      (magnus-terminal-release-process process)
+      (when (process-live-p process) (delete-process process))
+      (kill-buffer buffer))))
 
 (provide 'magnus-terminal-tests)
 ;;; magnus-terminal-tests.el ends here

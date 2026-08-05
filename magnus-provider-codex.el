@@ -29,6 +29,7 @@
 (declare-function vterm-send-return "vterm" ())
 (declare-function vterm-send-string "vterm" (string &optional paste-p))
 (defvar magnus-buffer-name)
+(defvar magnus-process-ready-hook nil)
 (defvar magnus-process--transaction-runtime-buffer nil)
 
 (defcustom magnus-codex-executable "codex"
@@ -304,10 +305,9 @@ FILES-BEFORE contains rollout files that predate this launch."
      (lambda (terminal _event)
        (unless (process-live-p terminal)
          (dolist (property '(magnus-codex-capture-timer
-                             magnus-codex-ready-timer
-                             magnus-codex-input-retry-timer
-                             magnus-codex-input-busy-timer))
+                             magnus-codex-ready-timer))
            (magnus-codex--cancel-timer terminal property))
+         (magnus-terminal-release-process terminal)
          ;; A replaced vterm may report its exit after a new TUI is running.
          ;; Emacs normally detaches a dead process before its sentinel runs, so
          ;; nil still means this captured runtime exited normally.  A different
@@ -333,10 +333,10 @@ Never detach or kill a replacement process that has since claimed BUFFER."
       (cancel-timer timer)))
   (when (processp process)
     (dolist (property '(magnus-codex-capture-timer
-                        magnus-codex-ready-timer
-                        magnus-codex-input-retry-timer
-                        magnus-codex-input-busy-timer))
+                        magnus-codex-ready-timer))
       (ignore-errors (magnus-codex--cancel-timer process property))))
+  (when (processp process)
+    (magnus-terminal-release-process process))
   (let* ((current (and (buffer-live-p buffer)
                        (get-buffer-process buffer)))
          (owned (and (bufferp buffer)
@@ -431,7 +431,8 @@ When MARKER is non-nil, capture its new session against FILES-BEFORE."
                            ;; cannot jump ahead of user input.
                            (process-put
                             process 'magnus-codex-ready-hook-pending t)
-                           (magnus-codex--drain-input-queue process)))))))))
+                           (magnus-terminal-drain process)
+                           (magnus-codex--maybe-run-ready-hook process)))))))))
           (when (and (boundp 'magnus-buffer-name)
                      (get-buffer magnus-buffer-name))
             (magnus-status-refresh))
@@ -464,13 +465,9 @@ When MARKER is non-nil, capture its new session against FILES-BEFORE."
            (files-before (magnus-codex--session-files)))
       (magnus-codex--spawn-tui instance prompt marker files-before))))
 
-(defun magnus-codex--input-text (entry)
-  "Return message text from current or legacy queue ENTRY."
-  (if (stringp entry) entry (plist-get entry :text)))
-
-(defun magnus-codex--input-accepted (entry)
-  "Return transport-acceptance callback from queue ENTRY, if any."
-  (and (listp entry) (plist-get entry :accepted)))
+(defun magnus-codex--delivery-ready-p (process)
+  "Return non-nil when PROCESS's Codex composer accepts automation."
+  (process-get process 'magnus-codex-ready))
 
 (defun magnus-codex-send (instance text &optional accepted)
   "Queue TEXT for serialized delivery through INSTANCE's native TUI.
@@ -481,100 +478,27 @@ the message is waiting for readiness, serialization, or user TUI ownership."
     (unless process
       (user-error "Codex instance `%s' is not running"
                   (magnus-instance-name instance)))
-    (let ((queue (process-get process 'magnus-codex-input-queue)))
-      ;; Durable controller deliveries carry an idempotency key in TEXT.  If a
-      ;; process-ready replay arrives before the existing entry drains, retain
-      ;; the original callback and one queue position.
-      (unless (and accepted
-                   (seq-some
-                    (lambda (entry)
-                      (string= text (magnus-codex--input-text entry)))
-                    queue))
-        (process-put process 'magnus-codex-input-queue
-                     (append queue
-                             (list (list :text text :accepted accepted))))))
-    (magnus-codex--drain-input-queue process)))
+    (magnus-terminal-submit
+     instance text accepted
+     :ready-p #'magnus-codex--delivery-ready-p
+     :settle-delay 0.1
+     :idle #'magnus-codex--maybe-run-ready-hook
+     :scope 'codex)))
 
-(defun magnus-codex--schedule-input-retry (process)
-  "Schedule another safe attempt to drain PROCESS's input queue."
-  (unless (process-get process 'magnus-codex-input-retry-timer)
-    (process-put
-     process 'magnus-codex-input-retry-timer
-     (run-with-timer
-      1.0 nil
-      (lambda ()
-        (process-put process 'magnus-codex-input-retry-timer nil)
-        (magnus-codex--drain-input-queue process))))))
-
-(defun magnus-codex--drain-input-queue (process)
-  "Submit PROCESS's next queued TUI message when it is safe.
-Return `submitted', `queued', or nil to describe this invocation."
-  (let* ((instance (process-get process 'magnus-codex-instance))
-         (buffer (and instance (magnus-instance-buffer instance)))
-         (queue (process-get process 'magnus-codex-input-queue))
-         outcome)
-    (cond
-     ((null queue) (setq outcome nil))
-     ((not (and (process-get process 'magnus-codex-ready)
-                (not (process-get process 'magnus-codex-input-busy))
-                (magnus-codex--current-process-p process instance)))
-      (setq outcome 'queued))
-     ((eq buffer (window-buffer (selected-window)))
-      ;; Do not append to a composer while the user owns this TUI.
-      (magnus-codex--schedule-input-retry process)
-      (setq outcome 'queued))
-     (t
-      (let* ((entry (car queue))
-             (text (magnus-codex--input-text entry))
-             (accepted (magnus-codex--input-accepted entry)))
-        (process-put process 'magnus-codex-input-busy t)
-        (condition-case err
-            (progn
-              ;; Bracketed paste and Return occur in one Emacs event, preventing
-              ;; two automated deliveries from interleaving.  Dequeue only after
-              ;; both calls succeed so an exception cannot poison or lose input.
-              (with-current-buffer buffer
-                (vterm-send-string text t)
-                (vterm-send-return))
-              (process-put process 'magnus-codex-input-queue (cdr queue))
-              (when accepted
-                (condition-case receipt-err
-                    (funcall accepted)
-                  (error
-                   (message "Magnus: Codex delivery receipt failed: %s"
-                            (error-message-string receipt-err)))))
-              (process-put
-               process 'magnus-codex-input-busy-timer
-               (run-with-timer
-                0.1 nil
-                (lambda ()
-                  (process-put process 'magnus-codex-input-busy nil)
-                  (process-put process 'magnus-codex-input-busy-timer nil)
-                  (magnus-codex--drain-input-queue process))))
-              (setq outcome 'submitted))
-          (error
-           (process-put process 'magnus-codex-input-busy nil)
-           (message "Magnus: Codex TUI delivery deferred after error: %s"
-                    (error-message-string err))
-           (magnus-codex--schedule-input-retry process)
-           (setq outcome 'queued))))))
-    (magnus-codex--maybe-run-ready-hook process instance)
-    outcome))
-
-(defun magnus-codex--maybe-run-ready-hook (process instance)
+(defun magnus-codex--maybe-run-ready-hook (process)
   "Run PROCESS's deferred ready hook once earlier input has drained."
-  (when (and (process-get process 'magnus-codex-ready-hook-pending)
-             (process-get process 'magnus-codex-ready)
-             (null (process-get process 'magnus-codex-input-queue))
-             (not (process-get process 'magnus-codex-input-busy))
-             (magnus-codex--current-process-p process instance))
-    (process-put process 'magnus-codex-ready-hook-pending nil)
-    (condition-case err
-        (run-hook-with-args 'magnus-process-ready-hook instance)
-      (error
-       (message "Magnus: process-ready hook failed for %s: %s"
-                (magnus-instance-name instance)
-                (error-message-string err))))))
+  (let ((instance (process-get process 'magnus-codex-instance)))
+    (when (and (process-get process 'magnus-codex-ready-hook-pending)
+               (process-get process 'magnus-codex-ready)
+               (magnus-terminal-delivery-idle-p process)
+               (magnus-codex--current-process-p process instance))
+      (process-put process 'magnus-codex-ready-hook-pending nil)
+      (condition-case err
+          (run-hook-with-args 'magnus-process-ready-hook instance)
+        (error
+         (message "Magnus: process-ready hook failed for %s: %s"
+                  (magnus-instance-name instance)
+                  (error-message-string err)))))))
 
 (defun magnus-codex-interrupt (instance)
   "Interrupt Codex INSTANCE through its native TUI."

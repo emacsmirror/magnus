@@ -673,7 +673,8 @@ DATE defaults to the original deterministic test fixture date."
           (magnus-codex-send instance "read this next")
           (should (equal sent "read this next"))
           (should return-sent)
-          (should-not (process-get process 'magnus-codex-input-queue)))
+          (should-not
+           (process-get process 'magnus-terminal-delivery-queue)))
       (magnus-test--delete-terminal terminal))))
 
 (ert-deftest magnus-codex-durable-receipt-waits-for-tui-submission ()
@@ -697,7 +698,7 @@ DATE defaults to the original deterministic test fixture date."
                'queued))
           (should (= accepted 0))
           (should-not sent)
-          (should (process-get process 'magnus-codex-input-queue))
+          (should (process-get process 'magnus-terminal-delivery-queue))
           ;; Stopping before readiness loses only the process-local queue; the
           ;; absent receipt leaves the review manifest pending for resurrection.
           (delete-process process)
@@ -732,24 +733,27 @@ DATE defaults to the original deterministic test fixture date."
                 (lambda () (cl-incf accepted)))
                'queued))
           (should (= accepted 0))
-          (should-not (process-get process 'magnus-codex-input-busy))
-          (should (process-get process 'magnus-codex-input-queue))
+          (should-not (process-get process 'magnus-terminal-delivery-busy))
+          (should (process-get process 'magnus-terminal-delivery-queue))
           (while timers
             (let ((timer (pop timers)))
               (apply (car timer) (cdr timer))))
           (should (= attempts 2))
           (should (= accepted 1))
           (should (equal (nreverse events) '("retry this" return)))
-          (should-not (process-get process 'magnus-codex-input-queue))
-          (should-not (process-get process 'magnus-codex-input-busy)))
+          (should (magnus-terminal-delivery-idle-p process)))
       (magnus-test--delete-terminal terminal))))
 
 (ert-deftest magnus-codex-concurrent-tui-messages-are-serialized ()
   (let* ((instance (magnus-instances-create "/tmp" "queued-codex" 'codex))
          (terminal (magnus-test--codex-tui instance))
          (process (cdr terminal))
+         (ready-hooks 0)
+         (magnus-process-ready-hook
+          (list (lambda (_instance) (cl-incf ready-hooks))))
          timers events)
     (process-put process 'magnus-codex-ready t)
+    (process-put process 'magnus-codex-ready-hook-pending t)
     (unwind-protect
         (cl-letf (((symbol-function 'vterm-send-string)
                    (lambda (text &optional _paste-p)
@@ -764,10 +768,14 @@ DATE defaults to the original deterministic test fixture date."
           (magnus-codex-send instance "first")
           (magnus-codex-send instance "second")
           (should (equal events '("first" return)))
+          (should (= ready-hooks 0))
           (while timers
             (let ((timer (pop timers)))
               (apply (car timer) (cdr timer))))
-          (should (equal events '("first" return "second" return))))
+          (should (equal events '("first" return "second" return)))
+          (should (= ready-hooks 1))
+          (should-not
+           (process-get process 'magnus-codex-ready-hook-pending)))
       (magnus-test--delete-terminal terminal))))
 
 (ert-deftest magnus-codex-stop-interrupts-and-closes-native-tui ()

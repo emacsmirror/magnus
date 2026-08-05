@@ -10,12 +10,33 @@
 (defconst magnus-test-review-ui--head-oid
   "2222222222222222222222222222222222222222")
 
+(defun magnus-test-review-ui--complete-attempt ()
+  "Return a canonical completed attempt for reader fixtures."
+  (magnus-review-attempt--create
+   :number 1 :token "reader-fixture-attempt"
+   :started-at 1 :finished-at 2 :execution 'complete))
+
 (defun magnus-test-review-ui--round (number)
-  "Return a map-shaped review round numbered NUMBER."
-  (list :number number
-        :base_oid magnus-test-review-ui--base-oid
-        :head_oid magnus-test-review-ui--head-oid
-        :verdict 'comment))
+  "Return a canonical review round numbered NUMBER."
+  (magnus-review-round--create
+   :number number
+   :base-oid magnus-test-review-ui--base-oid
+   :head-oid magnus-test-review-ui--head-oid
+   :verdict 'comment
+   :attempts (list (magnus-test-review-ui--complete-attempt))))
+
+(defun magnus-test-review-ui--review (&rest rounds)
+  "Return a canonical review containing ROUNDS."
+  (magnus-review--create
+   :id "review"
+   :project-root default-directory
+   :project-hash "project"
+   :author-instance-id "author-id"
+   :author-name "author"
+   :reviewer-name "reviewer"
+   :reviewer-provider 'codex
+   :rounds rounds
+   :checkpoint-requests nil))
 
 (defun magnus-test-review-ui--patch (&optional patch-path)
   "Return a one-file unified patch for PATCH-PATH."
@@ -93,10 +114,10 @@
          (findings
           (magnus-review-ui--normalize-findings
            (list
-            '(:id "F-inline" :path "lib/sample.el" :line 1
-              :side "head" :title "Inline")
-            '(:id "F-file" :path "lib/sample.el" :line 99
-              :side "head" :title "File fallback")
+            '(:id "F-inline" :kind "line" :path "lib/sample.el"
+              :head_line 1 :title "Inline")
+            '(:id "F-file" :kind "line" :path "lib/sample.el"
+              :head_line 99 :title "File fallback")
             '(:id "F-general" :kind "general" :title "General"))))
          (assigned (magnus-review-ui--assign-findings files findings))
          (inline (plist-get assigned :inline))
@@ -129,11 +150,18 @@
                   :head_oid "3333333333333333333333333333333333333333")))
      :type 'error)))
 
+(ert-deftest magnus-review-ui-requires-canonical-review-records ()
+  (let* ((round (magnus-test-review-ui--round 1))
+         (review (magnus-test-review-ui--review round)))
+    (should (eq (magnus-review-ui--select-round review nil) round))
+    (should-error
+     (magnus-review-ui--select-round (list :rounds (list round)) nil))))
+
 (ert-deftest magnus-review-ui-marks-a-valid-round-read-exactly-once ()
   (with-temp-buffer
     (magnus-review-ui-mode)
     (let* ((round (magnus-test-review-ui--round 1))
-           (review (list :id "review" :rounds (list round)))
+           (review (magnus-test-review-ui--review round))
            calls)
       (setq-local magnus-review-ui--review review)
       (setq-local magnus-review-ui--round round)
@@ -165,7 +193,7 @@
     (magnus-review-ui-mode)
     (let* ((first (magnus-test-review-ui--round 1))
            (second (magnus-test-review-ui--round 2))
-           (review (list :id "review" :rounds (list first second)))
+           (review (magnus-test-review-ui--review first second))
            (refreshed 0))
       (setq-local magnus-review-ui--review review)
       (setq-local magnus-review-ui--round first)
@@ -183,9 +211,9 @@
 (ert-deftest magnus-review-ui-actions-preserve-review-and-round-context ()
   (with-temp-buffer
     (magnus-review-ui-mode)
-    (let ((review '(:id "review"))
-          (round (magnus-test-review-ui--round 1))
-          received)
+    (let* ((round (magnus-test-review-ui--round 1))
+           (review (magnus-test-review-ui--review round))
+           received)
       (setq-local magnus-review-ui--review review)
       (setq-local magnus-review-ui--round round)
       (let ((magnus-review-ui-action-function

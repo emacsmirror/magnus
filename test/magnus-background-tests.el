@@ -197,7 +197,7 @@ Optionally simulate a harness which completes synchronously from cancellation."
                     (magnus-background-submit
                      'same 'fake
                      (magnus-background-test--request "replacement"))))
-        (should (= (magnus-background-queue-length) 1))
+        (should (= (length magnus-background--queue) 1))
         (should-not
          (magnus-background-submit
           'overflow 'fake

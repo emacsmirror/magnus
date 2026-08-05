@@ -55,11 +55,7 @@ artifact without limit."
 (defconst magnus-review-schema-version 2
   "Current on-disk review manifest schema version.")
 
-(defconst magnus-review--lifecycle-states '(open closed archived))
-(defconst magnus-review--legacy-execution-states
-  '(waiting-for-checkpoint queued starting running complete failed interrupted))
-(defconst magnus-review--round-execution-states
-  '(queued starting running complete failed interrupted))
+(defconst magnus-review--lifecycle-states '(open archived))
 (defconst magnus-review--attempt-execution-states
   '(starting running complete failed interrupted))
 (defconst magnus-review--verdict-states '(approve comment changes-requested))
@@ -162,8 +158,7 @@ from user-level Git presentation settings such as `diff.noprefix'."
   finished-at
   (execution 'starting)
   error
-  interruption-kind
-  metadata)
+  interruption-kind)
 
 (cl-defstruct (magnus-review-round
                (:constructor magnus-review-round--create)
@@ -172,11 +167,8 @@ from user-level Git presentation settings such as `diff.noprefix'."
   number
   base-oid
   head-oid
-  previous-head-oid
-  checkpoint-token
   created-at
   completed-at
-  (execution 'queued)
   verdict
   (delivery-state 'not-ready)
   (delivery-attempts 0)
@@ -202,22 +194,12 @@ from user-level Git presentation settings such as `diff.noprefix'."
   effort
   task
   (lifecycle 'open)
-  (execution 'waiting-for-checkpoint)
-  verdict
-  (delivery-state 'not-ready)
-  (read-state 'not-ready)
   session-id
-  checkpoint-token
   created-at
   updated-at
-  closed-at
   archived-at
-  base-oid
-  head-oid
-  previous-head-oid
   rounds
   metadata
-  checkpoint-acks
   checkpoint-requests)
 
 (defvar magnus-reviews nil
@@ -627,11 +609,6 @@ This is intended for raw JSONL and stderr streams; it never follows symlinks."
                  "--untracked-files=normal")))
     (unless (string-empty-p status) status)))
 
-(defun magnus-review-dirty-warning (project-root)
-  "Return a user-facing warning when PROJECT-ROOT has uncommitted changes."
-  (when (magnus-review-worktree-dirty-status project-root)
-    "Working tree has uncommitted changes; they are excluded from this review."))
-
 (defun magnus-review-inspect-scope (project-root base-revision head-revision)
   "Return validated Git evidence for BASE-REVISION..HEAD-REVISION.
 The result is a plist suitable for status/transient presentation."
@@ -770,9 +747,8 @@ Evidence files are append-only, private, and remain after worktree cleanup."
 
 (defun magnus-review-pending-checkpoint-request (review)
   "Return REVIEW's structurally pending checkpoint request, or nil.
-This is deliberately a pure lookup.  Loaded schema-1 records are migrated
-before registration; callers must never mutate durable state while asking
-whether a request is pending."
+This is deliberately a pure lookup: callers must never mutate durable state
+while asking whether a request is pending."
   (let ((request (magnus-review-current-checkpoint-request review)))
     (and request
          (null (magnus-review-checkpoint-request-events request))
@@ -790,103 +766,67 @@ whether a request is pending."
   (when-let ((number (magnus-review-checkpoint-event-round-number event)))
     (nth (1- number) (magnus-review-rounds review))))
 
-(defun magnus-review--checkpoint-ack-round-for-token (review token)
-  "Return REVIEW's acknowledged immutable round for TOKEN, or nil."
-  (or
-   (when-let* ((request
-                (magnus-review-checkpoint-request-for-token review token))
-               (event
-                (cl-find 'unchanged
-                         (magnus-review-checkpoint-request-events request)
-                         :key #'magnus-review-checkpoint-event-kind)))
-     (magnus-review--checkpoint-event-round review event))
-   ;; Compatibility only for an object that survived an in-place code reload.
-   ;; Normal disk loads migrate before registration, and pending-request lookup
-   ;; deliberately never synthesizes authority from this cache.
-   (when (null (magnus-review-checkpoint-requests review))
-     (when-let ((number
-                 (cdr (assoc token
-                             (magnus-review-checkpoint-acks review)))))
-       (nth (1- number) (magnus-review-rounds review))))))
-
 (defun magnus-review-latest-attempt (round)
   "Return ROUND's latest attempt, or nil."
   (car (last (magnus-review-round-attempts round))))
 
-(defun magnus-review--refresh-aggregate-notification-states (review)
-  "Derive REVIEW delivery/read aggregates without hiding older rounds."
-  (let* ((completed
-          (cl-remove-if-not
-           (lambda (round)
-             (eq (magnus-review-round-execution round) 'complete))
-           (magnus-review-rounds review)))
-         (delivery-states
-          (mapcar #'magnus-review-round-delivery-state completed))
-         (read-states
-          (mapcar #'magnus-review-round-read-state completed)))
-    (setf (magnus-review-delivery-state review)
-          (cond ((memq 'pending delivery-states) 'pending)
-                ((memq 'failed delivery-states) 'failed)
-                ((and completed
-                      (cl-every (lambda (state) (eq state 'sent))
-                                delivery-states))
-                 'sent)
-                (t 'not-ready))
-          (magnus-review-read-state review)
-          (cond ((memq 'unread read-states) 'unread)
-                ((and completed
-                      (cl-every (lambda (state) (eq state 'read)) read-states))
-                 'read)
-                (t 'not-ready)))))
+(defun magnus-review-round-execution (round)
+  "Return ROUND's execution state derived from its attempt history."
+  (if-let ((attempt (magnus-review-latest-attempt round)))
+      (magnus-review-attempt-execution attempt)
+    'queued))
 
-(defun magnus-review--refresh-derived-fields (review)
-  "Refresh REVIEW's schema-1 compatibility caches from canonical history.
-Schema 2 never serializes these fields.  They remain in the in-memory record
-for existing status, transient, and third-party read accessors."
-  (let* ((rounds (magnus-review-rounds review))
-         (latest (magnus-review-latest-round review))
-         (pending (magnus-review-pending-checkpoint-request review))
-         (current (magnus-review-current-checkpoint-request review))
-         latest-complete
-         acknowledgements)
-    (dolist (round rounds)
-      (setf (magnus-review-round-checkpoint-token round) nil)
-      (when (eq (magnus-review-round-execution round) 'complete)
-        (setq latest-complete round)))
-    (dolist (request (magnus-review-checkpoint-requests review))
-      (dolist (event (magnus-review-checkpoint-request-events request))
-        (pcase (magnus-review-checkpoint-event-kind event)
-          ('round
-           (when-let ((round
-                       (magnus-review--checkpoint-event-round review event)))
-             (setf (magnus-review-round-checkpoint-token round)
-                   (magnus-review-checkpoint-request-token request))))
-          ('unchanged
-           (setq acknowledgements
-                 (append
-                  acknowledgements
-                  (list
-                   (cons (magnus-review-checkpoint-request-token request)
-                         (magnus-review-checkpoint-event-round-number
-                          event)))))))))
-    (setf (magnus-review-checkpoint-token review)
-          (and current (magnus-review-checkpoint-request-token current))
-          (magnus-review-checkpoint-acks review) acknowledgements
-          (magnus-review-execution review)
-          (cond (pending 'waiting-for-checkpoint)
-                (latest (magnus-review-round-execution latest))
-                (t 'waiting-for-checkpoint))
-          (magnus-review-verdict review)
-          (and latest-complete
-               (magnus-review-round-verdict latest-complete))
-          (magnus-review-base-oid review)
-          (and latest (magnus-review-round-base-oid latest))
-          (magnus-review-head-oid review)
-          (and latest (magnus-review-round-head-oid latest))
-          (magnus-review-previous-head-oid review)
-          (and latest (magnus-review-round-previous-head-oid latest)))
-    (magnus-review--refresh-aggregate-notification-states review)
-    review))
+(defun magnus-review-execution (review)
+  "Return REVIEW's execution state derived from canonical history."
+  (let ((latest (magnus-review-latest-round review)))
+    (cond ((magnus-review-pending-checkpoint-request review)
+           'waiting-for-checkpoint)
+          (latest (magnus-review-round-execution latest))
+          (t 'waiting-for-checkpoint))))
+
+(defun magnus-review--completed-state (review accessor pending failed complete)
+  "Aggregate ACCESSOR over REVIEW's completed rounds.
+PENDING and FAILED take precedence; COMPLETE is returned when every completed
+round has that state.  Return `not-ready' when no completed round exists."
+  (let ((states
+         (mapcar accessor
+                 (cl-remove-if-not
+                  (lambda (round)
+                    (eq (magnus-review-round-execution round) 'complete))
+                  (magnus-review-rounds review)))))
+    (cond ((memq pending states) pending)
+          ((and failed (memq failed states)) failed)
+          ((and states (cl-every (lambda (state) (eq state complete)) states))
+           complete)
+          (t 'not-ready))))
+
+(defun magnus-review-delivery-state (review)
+  "Return REVIEW's aggregate delivery state without hiding older rounds."
+  (magnus-review--completed-state
+   review #'magnus-review-round-delivery-state 'pending 'failed 'sent))
+
+(defun magnus-review-read-state (review)
+  "Return REVIEW's aggregate read state without hiding older rounds."
+  (magnus-review--completed-state
+   review #'magnus-review-round-read-state 'unread nil 'read))
+
+(defun magnus-review-checkpoint-token (review)
+  "Return REVIEW's latest durable checkpoint token, or nil."
+  (when-let ((request (magnus-review-current-checkpoint-request review)))
+    (magnus-review-checkpoint-request-token request)))
+
+(defun magnus-review--latest-round-value (review accessor)
+  "Return ACCESSOR's value for REVIEW's latest round, or nil."
+  (when-let ((round (magnus-review-latest-round review)))
+    (funcall accessor round)))
+
+(defun magnus-review-base-oid (review)
+  "Return REVIEW's immutable base OID, or nil before its first round."
+  (magnus-review--latest-round-value review #'magnus-review-round-base-oid))
+
+(defun magnus-review-head-oid (review)
+  "Return REVIEW's latest reviewed head OID, or nil."
+  (magnus-review--latest-round-value review #'magnus-review-round-head-oid))
 
 (defun magnus-review--append-checkpoint-request (review &optional token requested-at)
   "Append and return a fresh pending checkpoint request for REVIEW."
@@ -900,7 +840,6 @@ for existing status, transient, and third-party read accessors."
           :events nil)))
     (setf (magnus-review-checkpoint-requests review)
           (append (magnus-review-checkpoint-requests review) (list request)))
-    (magnus-review--refresh-derived-fields review)
     request))
 
 (defun magnus-review--random-token ()
@@ -952,10 +891,6 @@ The initial request waits for an exact committed checkpoint."
             :effort effort
             :task task
             :lifecycle 'open
-            :execution 'waiting-for-checkpoint
-            :delivery-state 'not-ready
-            :read-state 'not-ready
-            :checkpoint-token checkpoint-token
             :created-at now
             :updated-at now
             :rounds nil
@@ -965,7 +900,6 @@ The initial request waits for an exact committed checkpoint."
              (magnus-review-checkpoint-request--create
               :number 1 :token checkpoint-token
               :requested-at now :events nil)))))
-      (magnus-review--refresh-derived-fields review)
       (magnus-review-save review)
       review)))
 
@@ -974,7 +908,6 @@ The initial request waits for an exact committed checkpoint."
   (unless (eq (magnus-review-lifecycle review) 'open)
     (magnus-review--signal "Closed review cannot await a checkpoint: %s"
                            (magnus-review-id review)))
-  (magnus-review--refresh-derived-fields review)
   (when (memq (magnus-review-execution review) '(starting running))
     (magnus-review--signal "Review already has a running attempt: %s"
                            (magnus-review-id review)))
@@ -1028,7 +961,6 @@ a later re-review must allocate a fresh checkpoint token."
                 :round-number (magnus-review-round-number latest)
                 :recorded-at (float-time)))))
       (when changed
-        (magnus-review--refresh-derived-fields review)
         (setf (magnus-review-updated-at review) (float-time))
         (magnus-review-save review)
         (message
@@ -1039,8 +971,7 @@ a later re-review must allocate a fresh checkpoint token."
       latest)))
 
 (cl-defun magnus-review-append-round
-    (review base-revision head-revision
-            &key previous-head-revision checkpoint-token metadata)
+    (review base-revision head-revision &key checkpoint-token metadata)
   "Append an exact immutable Git round to REVIEW.
 BASE-REVISION must remain fixed across rounds and be an ancestor of
 HEAD-REVISION.  Older rounds and attempts are never removed or rewritten."
@@ -1066,12 +997,6 @@ HEAD-REVISION.  Older rounds and attempts are never removed or rewritten."
            (base (plist-get scope :base-oid))
            (head (plist-get scope :head-oid))
            (latest (magnus-review-latest-round review))
-           (previous (cond
-                      (previous-head-revision
-                       (magnus-review-resolve-oid
-                        (magnus-review-project-root review)
-                        previous-head-revision))
-                      (latest (magnus-review-round-head-oid latest))))
            (expected-base (magnus-review-base-oid review))
            (scope-summary
             (list :commit-count (plist-get scope :commit-count)
@@ -1090,12 +1015,6 @@ HEAD-REVISION.  Older rounds and attempts are never removed or rewritten."
       (when (and expected-base (not (string= expected-base base)))
         (magnus-review--signal
          "Review base is immutable (%s, not %s)" expected-base base))
-      (when (and latest
-                 previous
-                 (not (string= previous (magnus-review-round-head-oid latest))))
-        (magnus-review--signal
-         "Previous head must equal the latest reviewed head (%s)"
-         (magnus-review-round-head-oid latest)))
       (when (and latest (string= (magnus-review-round-head-oid latest) head))
         (magnus-review--signal "Head %s is already the latest review round" head))
       (let* ((number (1+ (length (magnus-review-rounds review))))
@@ -1105,10 +1024,7 @@ HEAD-REVISION.  Older rounds and attempts are never removed or rewritten."
                :number number
                :base-oid base
                :head-oid head
-               :previous-head-oid previous
-               :checkpoint-token checkpoint-token
                :created-at now
-               :execution 'queued
                :delivery-state 'not-ready
                :read-state 'not-ready
                :attempts nil
@@ -1122,11 +1038,10 @@ HEAD-REVISION.  Older rounds and attempts are never removed or rewritten."
                (magnus-review-checkpoint-event--create
                 :kind 'round :round-number number :recorded-at now))
               (magnus-review-updated-at review) now)
-        (magnus-review--refresh-derived-fields review)
         (magnus-review-save review)
         round))))
 
-(cl-defun magnus-review-append-attempt (review round &key token metadata)
+(cl-defun magnus-review-append-attempt (review round &key token)
   "Append and persist a new starting provider attempt to ROUND of REVIEW."
   (unless (eq (magnus-review-lifecycle review) 'open)
     (magnus-review--signal "Cannot launch an attempt for a non-open review"))
@@ -1150,11 +1065,9 @@ HEAD-REVISION.  Older rounds and attempts are never removed or rewritten."
            :number number
            :token (or token (magnus-review--random-token))
            :started-at now
-           :execution 'starting
-           :metadata metadata)))
+           :execution 'starting)))
     (setf (magnus-review-round-attempts round)
           (append (magnus-review-round-attempts round) (list attempt))
-          (magnus-review-round-execution round) 'starting
           (magnus-review-updated-at review) now)
     (magnus-review--ensure-review-directories review round)
     (magnus-review-save review)
@@ -1185,7 +1098,6 @@ When ALLOWED-STATES is non-nil, ATTEMPT must be in one of them."
   (magnus-review--verify-current-attempt
    review round attempt token '(starting))
   (setf (magnus-review-attempt-execution attempt) 'running
-        (magnus-review-round-execution round) 'running
         (magnus-review-updated-at review) (float-time))
   (magnus-review-save review)
   attempt)
@@ -1212,7 +1124,6 @@ transition and call `magnus-review-save'."
           (magnus-review-attempt-error attempt)
           (magnus-review--error-string error)
           (magnus-review-attempt-interruption-kind attempt) interruption-kind
-          (magnus-review-round-execution round) state
           (magnus-review-updated-at review) now)
     (unless (eq state 'complete)
       ;; A failed retry does not erase the last valid verdict/report.
@@ -1251,14 +1162,12 @@ transition and call `magnus-review-save'."
           (or (magnus-review-attempt-finished-at attempt) now)
           (magnus-review-attempt-error attempt) nil
           (magnus-review-attempt-interruption-kind attempt) nil
-          (magnus-review-round-execution round) 'complete
           (magnus-review-round-verdict round) verdict
           (magnus-review-round-completed-at round) now
           (magnus-review-round-delivery-state round) 'pending
           (magnus-review-round-delivery-error round) nil
           (magnus-review-round-read-state round) 'unread
           (magnus-review-updated-at review) now)
-    (magnus-review--refresh-aggregate-notification-states review)
     (magnus-review-save review)
     round))
 
@@ -1319,7 +1228,6 @@ REASON is a durable diagnostic.  INTERRUPTION-KIND may be `manual',
             (magnus-review-round-delivery-error round) nil
             (magnus-review-round-delivered-at round) now
             (magnus-review-updated-at review) now))
-    (magnus-review--refresh-aggregate-notification-states review)
     (magnus-review-save review))
   round)
 
@@ -1335,7 +1243,6 @@ REASON is a durable diagnostic.  INTERRUPTION-KIND may be `manual',
           (magnus-review-round-delivery-error round)
           (magnus-review--error-string error)
           (magnus-review-updated-at review) (float-time))
-    (magnus-review--refresh-aggregate-notification-states review)
     (magnus-review-save review))
   round)
 
@@ -1349,23 +1256,8 @@ REASON is a durable diagnostic.  INTERRUPTION-KIND may be `manual',
       (setf (magnus-review-round-read-state round) 'read
             (magnus-review-round-read-at round) now
             (magnus-review-updated-at review) now))
-    (magnus-review--refresh-aggregate-notification-states review)
     (magnus-review-save review))
   round)
-
-(defun magnus-review-close (review)
-  "Close REVIEW without deleting its durable reports or worktree."
-  (when (memq (magnus-review-execution review) '(starting running))
-    (magnus-review--signal "Cannot close a running review"))
-  (let ((now (float-time)))
-    (setf (magnus-review-lifecycle review) 'closed
-          (magnus-review-closed-at review) now
-          (magnus-review-updated-at review) now)
-    (magnus-review-save review)
-    (when (fboundp 'magnus-coord--maybe-stop-watching)
-      (magnus-coord--maybe-stop-watching
-       (magnus-review-project-root review)))
-    review))
 
 (defun magnus-review-archive (review)
   "Archive REVIEW without deleting its durable reports."
@@ -1373,8 +1265,6 @@ REASON is a durable diagnostic.  INTERRUPTION-KIND may be `manual',
     (magnus-review--signal "Cannot archive a running review"))
   (let ((now (float-time)))
     (setf (magnus-review-lifecycle review) 'archived
-          (magnus-review-closed-at review)
-          (or (magnus-review-closed-at review) now)
           (magnus-review-archived-at review) now
           (magnus-review-updated-at review) now)
     (magnus-review-save review)
@@ -1446,9 +1336,7 @@ become arrays, while object keys remain strings, symbols, or keywords."
     (error . ,(magnus-review--error-string
                (magnus-review-attempt-error attempt)))
     (interruption_kind . ,(magnus-review--symbol-name
-                           (magnus-review-attempt-interruption-kind attempt)))
-    (metadata . ,(magnus-review--json-safe-value
-                  (magnus-review-attempt-metadata attempt)))))
+                           (magnus-review-attempt-interruption-kind attempt)))))
 
 (defun magnus-review--checkpoint-event-to-json (event)
   "Return JSON-ready alist for checkpoint EVENT."
@@ -1472,11 +1360,8 @@ become arrays, while object keys remain strings, symbols, or keywords."
   `((number . ,(magnus-review-round-number round))
     (base_oid . ,(magnus-review-round-base-oid round))
     (head_oid . ,(magnus-review-round-head-oid round))
-    (previous_head_oid . ,(magnus-review-round-previous-head-oid round))
     (created_at . ,(magnus-review-round-created-at round))
     (completed_at . ,(magnus-review-round-completed-at round))
-    (execution . ,(magnus-review--symbol-name
-                   (magnus-review-round-execution round)))
     (verdict . ,(magnus-review--symbol-name
                  (magnus-review-round-verdict round)))
     (delivery_state . ,(magnus-review--symbol-name
@@ -1520,7 +1405,6 @@ become arrays, while object keys remain strings, symbols, or keywords."
                  (magnus-review-checkpoint-requests review))))
     (created_at . ,(magnus-review-created-at review))
     (updated_at . ,(magnus-review-updated-at review))
-    (closed_at . ,(magnus-review-closed-at review))
     (archived_at . ,(magnus-review-archived-at review))
     (rounds . ,(vconcat
                 (mapcar #'magnus-review--round-to-json
@@ -1559,22 +1443,6 @@ become arrays, while object keys remain strings, symbols, or keywords."
     (magnus-review--signal "Invalid %s in manifest: %S" kind value))
   (and value (downcase value)))
 
-(defun magnus-review--checkpoint-acks-from-json (object)
-  "Deserialize checkpoint token-to-round acknowledgement OBJECT."
-  (mapcar
-   (lambda (entry)
-     (pcase entry
-       (`(,token ,round-number)
-        (unless (and (magnus-review--valid-token-p token)
-                     (integerp round-number)
-                     (> round-number 0))
-          (magnus-review--signal
-           "Invalid checkpoint acknowledgement: %S" entry))
-        (cons token round-number))
-       (_ (magnus-review--signal
-           "Malformed checkpoint acknowledgement: %S" entry))))
-   object))
-
 (defun magnus-review--checkpoint-event-from-json (object)
   "Deserialize one schema-2 checkpoint event OBJECT."
   (magnus-review-checkpoint-event--create
@@ -1606,10 +1474,8 @@ become arrays, while object keys remain strings, symbols, or keywords."
      (mapcar #'magnus-review--checkpoint-event-from-json
              (append (alist-get 'events object) nil)))))
 
-(defun magnus-review--attempt-from-json (object expected-number &optional legacy)
-  "Deserialize attempt OBJECT, requiring EXPECTED-NUMBER.
-When LEGACY is non-nil, accept schema 1's broader execution enum before its
-cross-field invariants are checked."
+(defun magnus-review--attempt-from-json (object expected-number)
+  "Deserialize attempt OBJECT, requiring EXPECTED-NUMBER."
   (let ((number (alist-get 'number object)))
     (unless (eql number expected-number)
       (magnus-review--signal "Non-append-only attempt sequence at %S" number))
@@ -1622,20 +1488,16 @@ cross-field invariants are checked."
                    (alist-get 'finished_at object) "attempt finish time" t)
      :execution (magnus-review--validate-state
                  (alist-get 'execution object)
-                 (if legacy
-                     magnus-review--legacy-execution-states
-                   magnus-review--attempt-execution-states)
+                 magnus-review--attempt-execution-states
                  "attempt execution")
      :error (alist-get 'error object)
      :interruption-kind
      (magnus-review--validate-state
       (alist-get 'interruption_kind object)
-      magnus-review--interruption-kinds "attempt interruption kind" t)
-     :metadata (alist-get 'metadata object))))
+      magnus-review--interruption-kinds "attempt interruption kind" t))))
 
-(defun magnus-review--round-from-json (object expected-number &optional legacy)
-  "Deserialize round OBJECT, requiring EXPECTED-NUMBER.
-LEGACY non-nil reads schema 1's round checkpoint token and broad state enum."
+(defun magnus-review--round-from-json (object expected-number)
+  "Deserialize round OBJECT, requiring EXPECTED-NUMBER."
   (let ((number (alist-get 'number object)))
     (unless (eql number expected-number)
       (magnus-review--signal "Non-append-only round sequence at %S" number))
@@ -1646,21 +1508,11 @@ LEGACY non-nil reads schema 1's round checkpoint token and broad state enum."
                   (alist-get 'base_oid object) "round base OID")
        :head-oid (magnus-review--require-oid
                   (alist-get 'head_oid object) "round head OID")
-       :previous-head-oid (magnus-review--require-oid
-                           (alist-get 'previous_head_oid object)
-                           "round previous head OID" t)
-       :checkpoint-token (and legacy (alist-get 'checkpoint_token object))
        :created-at (magnus-review--require-number
                     (alist-get 'created_at object) "round creation time")
        :completed-at (magnus-review--require-number
                       (alist-get 'completed_at object)
                       "round completion time" t)
-       :execution (magnus-review--validate-state
-                   (alist-get 'execution object)
-                   (if legacy
-                       magnus-review--legacy-execution-states
-                     magnus-review--round-execution-states)
-                   "round execution")
        :verdict (magnus-review--validate-state
                  (alist-get 'verdict object)
                  magnus-review--verdict-states "round verdict" t)
@@ -1684,15 +1536,14 @@ LEGACY non-nil reads schema 1's round checkpoint token and broad state enum."
                  (alist-get 'read_at object) "read time" t)
        :attempts
        (mapcar (lambda (attempt)
-               (magnus-review--attempt-from-json
-                  attempt (cl-incf attempt-number) legacy))
+                 (magnus-review--attempt-from-json
+                  attempt (cl-incf attempt-number)))
                (append (alist-get 'attempts object) nil))
        :metadata (alist-get 'metadata object)))))
 
 (defun magnus-review--review-from-json
-    (object legacy &optional expected-id expected-hash)
-  "Deserialize common review OBJECT fields.
-LEGACY non-nil also reads schema-1 aggregate caches and round tokens."
+    (object &optional expected-id expected-hash)
+  "Deserialize schema-2 review OBJECT fields."
   (let* ((id (alist-get 'id object))
          (project-root (alist-get 'project_root object))
          (project-hash (alist-get 'project_hash object))
@@ -1725,216 +1576,37 @@ LEGACY non-nil also reads schema-1 aggregate caches and round tokens."
      :lifecycle (magnus-review--validate-state
                  (alist-get 'lifecycle object)
                  magnus-review--lifecycle-states "lifecycle")
-     :execution
-     (if legacy
-         (magnus-review--validate-state
-          (alist-get 'execution object)
-          magnus-review--legacy-execution-states "execution")
-       'waiting-for-checkpoint)
-     :verdict
-     (and legacy
-          (magnus-review--validate-state
-           (alist-get 'verdict object)
-           magnus-review--verdict-states "verdict" t))
-     :delivery-state
-     (if legacy
-         (magnus-review--validate-state
-          (alist-get 'delivery_state object)
-          magnus-review--delivery-states "delivery")
-       'not-ready)
-     :read-state
-     (if legacy
-         (magnus-review--validate-state
-          (alist-get 'read_state object)
-          magnus-review--read-states "read")
-       'not-ready)
      :session-id (alist-get 'session_id object)
-     :checkpoint-token (and legacy (alist-get 'checkpoint_token object))
-     :checkpoint-acks
-     (and legacy
-          (magnus-review--checkpoint-acks-from-json
-           (alist-get 'checkpoint_acks object)))
      :checkpoint-requests
-     (unless legacy
-       (mapcar
-        (lambda (request)
-          (magnus-review--checkpoint-request-from-json
-           request (cl-incf request-number)))
-        (append (alist-get 'checkpoint_requests object) nil)))
+     (mapcar
+      (lambda (request)
+        (magnus-review--checkpoint-request-from-json
+         request (cl-incf request-number)))
+      (append (alist-get 'checkpoint_requests object) nil))
      :created-at (magnus-review--require-number
                   (alist-get 'created_at object) "creation time")
      :updated-at (magnus-review--require-number
                   (alist-get 'updated_at object) "update time")
-     :closed-at (magnus-review--require-number
-                 (alist-get 'closed_at object) "close time" t)
      :archived-at (magnus-review--require-number
                    (alist-get 'archived_at object) "archive time" t)
-     :base-oid (and legacy
-                    (magnus-review--require-oid
-                     (alist-get 'base_oid object) "base OID" t))
-     :head-oid (and legacy
-                    (magnus-review--require-oid
-                     (alist-get 'head_oid object) "head OID" t))
-     :previous-head-oid
-     (and legacy
-          (magnus-review--require-oid
-           (alist-get 'previous_head_oid object) "previous head OID" t))
      :rounds
      (mapcar (lambda (round)
                (magnus-review--round-from-json
-                round (cl-incf round-number) legacy))
+                round (cl-incf round-number)))
              (append (alist-get 'rounds object) nil))
             :metadata (alist-get 'metadata object))))
       review)))
 
-(defun magnus-review--migrate-schema-1 (review)
-  "Populate REVIEW's canonical checkpoint ledger from validated schema 1."
-  (let ((rounds (magnus-review-rounds review))
-        (acks (magnus-review-checkpoint-acks review))
-        (current-token (magnus-review-checkpoint-token review))
-        tokens)
-    ;; Schema 1 made the round token nullable, but such a record cannot be
-    ;; mapped losslessly to a token-addressable request.  Never invent one.
-    (dolist (round rounds)
-      (unless (magnus-review--valid-token-p
-               (magnus-review-round-checkpoint-token round))
-        (magnus-review--signal
-         "Cannot migrate schema-1 round %d without a checkpoint token"
-         (magnus-review-round-number round)))
-      (cl-pushnew (magnus-review-round-checkpoint-token round) tokens
-                  :test #'string=))
-    (dolist (ack acks)
-      (cl-pushnew (car ack) tokens :test #'string=))
-    (cl-pushnew current-token tokens :test #'string=)
-    (let* ((ack-index
-            (lambda (token)
-              (cl-position token acks :key #'car :test #'string=)))
-           (round-for-token
-            (lambda (token)
-              (cl-find token rounds
-                       :key #'magnus-review-round-checkpoint-token
-                       :test #'string=)))
-           (ack-for-token
-            (lambda (token) (assoc token acks)))
-           (sort-key
-            (lambda (token)
-              (let ((round (funcall round-for-token token))
-                    (ack (funcall ack-for-token token)))
-                (cond
-                 (round (* 2 (magnus-review-round-number round)))
-                 (ack (1+ (* 2 (cdr ack))))
-                 (t (+ 3 (* 2 (length rounds))))))))
-           (ordered
-            (cl-stable-sort
-             (nreverse tokens)
-             (lambda (left right)
-               (let ((left-key (funcall sort-key left))
-                     (right-key (funcall sort-key right)))
-                 (if (= left-key right-key)
-                     (< (or (funcall ack-index left) most-positive-fixnum)
-                        (or (funcall ack-index right) most-positive-fixnum))
-                   (< left-key right-key)))))))
-      (unless (string= (car (last ordered)) current-token)
-        (magnus-review--signal
-         "Cannot migrate schema-1 manifest whose current token is not latest"))
-      (let ((number 0))
-        (setf
-         (magnus-review-checkpoint-requests review)
-         (mapcar
-          (lambda (token)
-            (let ((round (funcall round-for-token token))
-                  (ack (funcall ack-for-token token))
-                  events)
-              (when ack
-                (setq events
-                      (append
-                       events
-                       (list
-                        (magnus-review-checkpoint-event--create
-                         :kind 'unchanged :round-number (cdr ack)
-                         :recorded-at nil)))))
-              (when round
-                (setq events
-                      (append
-                       events
-                       (list
-                        (magnus-review-checkpoint-event--create
-                         :kind 'round
-                         :round-number (magnus-review-round-number round)
-                         :recorded-at
-                         (magnus-review-round-created-at round))))))
-              (when (and (null events)
-                         (not (eq (magnus-review-execution review)
-                                  'waiting-for-checkpoint)))
-                (magnus-review--signal
-                 "Cannot migrate unbound non-pending checkpoint token"))
-              (magnus-review-checkpoint-request--create
-               :number (cl-incf number) :token token
-               :requested-at nil :events events)))
-          ordered))))
-    (magnus-review--refresh-derived-fields review)
-    review))
-
 (defun magnus-review--from-json (object &optional expected-id expected-hash)
   "Deserialize review OBJECT, validating optional storage identity."
-  (pcase (alist-get 'schema_version object)
-    (1
-     (let ((review (magnus-review--review-from-json
-                    object t expected-id expected-hash)))
-       ;; Preserve schema 1's established tolerance for stale notification
-       ;; caches, while validating every other old cache before migration.
-       (magnus-review--refresh-aggregate-notification-states review)
-       (magnus-review--validate-invariants review t)
-       (magnus-review--migrate-schema-1 review)
-       (magnus-review--validate-invariants review)
-       review))
-    (2
-     (let ((review (magnus-review--review-from-json
-                    object nil expected-id expected-hash)))
-       (magnus-review--refresh-derived-fields review)
-       (magnus-review--validate-invariants review)
-       review))
-    (_
-     (magnus-review--signal
-      "Unsupported review schema version: %S"
-      (alist-get 'schema_version object)))))
-
-(defun magnus-review--validate-legacy-checkpoints (review)
-  "Validate schema-1 round tokens and acknowledgement caches in REVIEW."
-  (let (round-checkpoints acknowledged-tokens)
-    (dolist (round (magnus-review-rounds review))
-      (when-let ((token (magnus-review-round-checkpoint-token round)))
-        (when (assoc token round-checkpoints)
-          (magnus-review--signal
-           "Checkpoint token identifies more than one review round"))
-        (push (cons token round) round-checkpoints)))
-    (dolist (ack (magnus-review-checkpoint-acks review))
-      (let* ((token (car-safe ack))
-             (round-number (cdr-safe ack))
-             (round (and (integerp round-number)
-                         (> round-number 0)
-                         (nth (1- round-number)
-                              (magnus-review-rounds review))))
-             (eventual-round (cdr (assoc token round-checkpoints))))
-        (unless (and (magnus-review--valid-token-p token)
-                     round
-                     (= round-number (magnus-review-round-number round)))
-          (magnus-review--signal
-           "Checkpoint acknowledgement has an invalid round: %S" ack))
-        (when (member token acknowledged-tokens)
-          (magnus-review--signal
-           "Checkpoint token has more than one acknowledgement"))
-        (when (and eventual-round
-                   (not
-                    (and
-                     (= (magnus-review-round-number eventual-round)
-                        (1+ round-number))
-                     (string=
-                      (magnus-review-round-previous-head-oid eventual-round)
-                      (magnus-review-round-head-oid round)))))
-          (magnus-review--signal
-           "Acknowledged checkpoint token advanced from the wrong round"))
-        (push token acknowledged-tokens)))))
+  (unless (eql (alist-get 'schema_version object)
+               magnus-review-schema-version)
+    (magnus-review--signal
+     "Unsupported review schema version: %S"
+     (alist-get 'schema_version object)))
+  (let ((review
+         (magnus-review--review-from-json object expected-id expected-hash)))
+    (magnus-review--validate-invariants review)))
 
 (defun magnus-review--validate-checkpoint-timeline (review)
   "Validate REVIEW's schema-2 checkpoint request and event timeline."
@@ -2028,9 +1700,8 @@ LEGACY non-nil also reads schema-1 aggregate caches and round tokens."
     (unless (eq (magnus-review-pending-checkpoint-request review) pending)
       (magnus-review--signal "Checkpoint pending-request cache is inconsistent"))))
 
-(defun magnus-review--validate-invariants (review &optional legacy)
-  "Validate cross-field and append-only invariants for REVIEW.
-LEGACY non-nil validates schema-1 checkpoint caches before migration."
+(defun magnus-review--validate-invariants (review)
+  "Validate cross-field and append-only invariants for REVIEW."
   (unless (and (magnus-review--valid-id-p (magnus-review-id review))
                (magnus-review--valid-hash-p
                 (magnus-review-project-hash review))
@@ -2041,15 +1712,10 @@ LEGACY non-nil validates schema-1 checkpoint caches before migration."
   (unless (and (stringp (magnus-review-author-instance-id review))
                (stringp (magnus-review-author-name review)))
     (magnus-review--signal "Review author identity is incomplete"))
-  (unless (magnus-review--valid-token-p
-           (magnus-review-checkpoint-token review))
-    (magnus-review--signal "Review checkpoint token is invalid"))
   (when (and (magnus-review-session-id review)
              (not (stringp (magnus-review-session-id review))))
     (magnus-review--signal "Review provider session ID is invalid"))
-  (let ((round-number 0)
-        previous-head
-        latest-complete)
+  (let ((round-number 0))
     (dolist (round (magnus-review-rounds review))
       (unless (= (magnus-review-round-number round) (cl-incf round-number))
         (magnus-review--signal "Review rounds are not append-only"))
@@ -2066,23 +1732,7 @@ LEGACY non-nil validates schema-1 checkpoint caches before migration."
                   (string= (magnus-review-base-oid review)
                            (magnus-review-round-base-oid round)))
         (magnus-review--signal "Review base changed between rounds"))
-      (unless (equal (magnus-review-round-previous-head-oid round)
-                     previous-head)
-        (magnus-review--signal "Review round %d has incorrect previous head"
-                               round-number))
-      (unless (memq (magnus-review-round-execution round)
-                    (if legacy
-                        magnus-review--legacy-execution-states
-                      magnus-review--round-execution-states))
-        (magnus-review--signal "Review round %d has an invalid execution state"
-                               round-number))
-      (when (and (magnus-review-round-checkpoint-token round)
-                 (not (magnus-review--valid-token-p
-                       (magnus-review-round-checkpoint-token round))))
-        (magnus-review--signal "Review round %d has an invalid checkpoint token"
-                               round-number))
-      (let ((attempt-number 0)
-            latest-attempt)
+      (let ((attempt-number 0))
         (dolist (attempt (magnus-review-round-attempts round))
           (unless (= (magnus-review-attempt-number attempt)
                      (cl-incf attempt-number))
@@ -2093,9 +1743,7 @@ LEGACY non-nil validates schema-1 checkpoint caches before migration."
             (magnus-review--signal "Round %d has an invalid attempt token"
                                    round-number))
           (unless (memq (magnus-review-attempt-execution attempt)
-                        (if legacy
-                            magnus-review--legacy-execution-states
-                          magnus-review--attempt-execution-states))
+                        magnus-review--attempt-execution-states)
             (magnus-review--signal
              "Round %d attempt %d has an invalid execution state"
              round-number attempt-number))
@@ -2107,66 +1755,26 @@ LEGACY non-nil validates schema-1 checkpoint caches before migration."
                          magnus-review--interruption-kinds)))
             (magnus-review--signal
              "Round %d attempt %d has invalid interruption metadata"
-             round-number attempt-number))
-          (setq latest-attempt attempt))
-        (when (and latest-attempt
-                   (not (eq (magnus-review-attempt-execution latest-attempt)
-                            (magnus-review-round-execution round))))
-          (magnus-review--signal
-           "Round %d execution disagrees with its latest attempt" round-number))
-        (when (and (null latest-attempt)
-                   (not (eq (magnus-review-round-execution round) 'queued)))
-          (magnus-review--signal "Round %d has execution without an attempt"
-                                 round-number)))
+             round-number attempt-number))))
       (if (eq (magnus-review-round-execution round) 'complete)
-          (progn
-            (unless (and (memq (magnus-review-round-verdict round)
-                               magnus-review--verdict-states)
-                         (numberp (magnus-review-round-completed-at round))
-                         (memq (magnus-review-round-delivery-state round)
-                               '(pending sent failed))
-                         (memq (magnus-review-round-read-state round)
-                               '(unread read)))
-              (magnus-review--signal
-               "Completed round %d is only partially published" round-number))
-            (setq latest-complete round))
+          (unless (and (memq (magnus-review-round-verdict round)
+                             magnus-review--verdict-states)
+                       (numberp (magnus-review-round-completed-at round))
+                       (memq (magnus-review-round-delivery-state round)
+                             '(pending sent failed))
+                       (memq (magnus-review-round-read-state round)
+                             '(unread read)))
+            (magnus-review--signal
+             "Completed round %d is only partially published" round-number))
         (when (or (magnus-review-round-verdict round)
                   (magnus-review-round-completed-at round)
                   (not (eq (magnus-review-round-delivery-state round)
                            'not-ready))
                   (not (eq (magnus-review-round-read-state round) 'not-ready)))
           (magnus-review--signal
-           "Non-complete round %d contains published result state" round-number)))
-      (setq previous-head (magnus-review-round-head-oid round)))
-    (if legacy
-        (magnus-review--validate-legacy-checkpoints review)
-      (magnus-review--validate-checkpoint-timeline review))
-    (let ((latest (magnus-review-latest-round review)))
-      (if latest
-          (unless (and (string= (magnus-review-base-oid review)
-                                (magnus-review-round-base-oid latest))
-                       (string= (magnus-review-head-oid review)
-                                (magnus-review-round-head-oid latest))
-                       (equal (magnus-review-previous-head-oid review)
-                              (magnus-review-round-previous-head-oid latest)))
-            (magnus-review--signal "Review scope cache disagrees with latest round"))
-        (when (or (magnus-review-base-oid review)
-                  (magnus-review-head-oid review)
-                  (magnus-review-previous-head-oid review))
-          (magnus-review--signal "Review without rounds contains Git scope")))
-      (unless
-          (or (and (eq (magnus-review-execution review)
-                       'waiting-for-checkpoint)
-                   (or (null latest)
-                       (eq (magnus-review-round-execution latest) 'complete)))
-              (and latest
-                   (eq (magnus-review-execution review)
-                       (magnus-review-round-execution latest))))
-        (magnus-review--signal "Review execution disagrees with latest round")))
-    (unless (equal (magnus-review-verdict review)
-                   (and latest-complete
-                        (magnus-review-round-verdict latest-complete)))
-      (magnus-review--signal "Review verdict cache is inconsistent")))
+           "Non-complete round %d contains published result state"
+           round-number))))
+    (magnus-review--validate-checkpoint-timeline review))
   review)
 
 (defun magnus-review--run-changed-hooks ()
@@ -2230,7 +1838,6 @@ this runs the manifest has already been atomically replaced on disk."
     (condition-case err
         (progn
           (setf (magnus-review-updated-at review) (float-time))
-          (magnus-review--refresh-derived-fields review)
           (magnus-review--validate-invariants review)
           (magnus-review--ensure-review-directories review)
           ;; Allocate the next rollback image before the atomic commit point.
@@ -2301,11 +1908,7 @@ EXPECTED-ID and EXPECTED-HASH validate its managed storage path."
                 (or (magnus-review-attempt-error attempt)
                     "Emacs exited while this review attempt was active")
                 (magnus-review-attempt-interruption-kind attempt) 'crash)
-          (setq changed t)))
-      (when (memq (magnus-review-round-execution round) '(starting running))
-        (setf (magnus-review-round-execution round) 'interrupted)
-        (setq changed t)))
-    (magnus-review--refresh-derived-fields review)
+          (setq changed t))))
     (when changed
       (setf (magnus-review-updated-at review) now)
       (magnus-review-save review))
@@ -2559,39 +2162,6 @@ If the owned worktree already exists, update it safely instead."
          ;; deliberately quarantined for manual inspection.
          (ignore-errors (magnus-review-worktree-repair review))
          (signal (car error-data) (cdr error-data)))))))
-
-(defun magnus-review-worktree-cleanup (review &optional force)
-  "Remove REVIEW's owned worktree, preserving reports and manifest.
-Without FORCE, Git refuses cleanup if anything modified the review checkout.
-Even with FORCE, cleanup never operates outside REVIEW's derived checkout."
-  (let ((checkout (magnus-review-checkout-path review))
-        (marker (magnus-review--worktree-marker-path review))
-        (review-directory (file-name-as-directory
-                           (magnus-review-directory review))))
-    (unless (string-prefix-p review-directory (expand-file-name checkout))
-      (magnus-review--signal "Derived checkout escaped the review directory"))
-    (cond
-     ((file-exists-p checkout)
-      (unless (or (magnus-review--owned-worktree-p review)
-                  (magnus-review-worktree-repair review))
-        (magnus-review--signal
-         "Refusing to remove unowned worktree: %s" checkout))
-      (apply #'magnus-review--git-output
-             (magnus-review-project-root review)
-             (append (list "worktree" "remove")
-                     (when force (list "--force"))
-                     (list checkout)))
-      (when (file-exists-p marker)
-        (delete-file marker))
-      t)
-     ((file-exists-p marker)
-      ;; The checkout is already gone; only delete a matching marker.
-      (let ((object (magnus-review--read-json-file marker)))
-        (unless (magnus-review--worktree-marker-matches-p review object)
-          (magnus-review--signal "Refusing mismatched worktree marker"))
-        (delete-file marker)
-        t))
-     (t nil))))
 
 ;;; Coordination checkpoint integration
 

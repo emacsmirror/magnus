@@ -26,7 +26,6 @@
 ;; - `magnus-coord-store-directory' returns the validated store root.
 ;; - `magnus-coord-store-writer-directory' returns a validated inbox path.
 ;; - `magnus-coord-store-ensure-writer-directory' creates a hardened inbox.
-;; - `magnus-coord-store-publish' atomically publishes one immutable event.
 ;; - `magnus-coord-store-revision' derives a cheap metadata-only change token.
 ;; - `magnus-coord-store-snapshot' reads one deterministic filesystem snapshot.
 ;; - `magnus-coord-store-prune' removes revalidated evidence from that snapshot.
@@ -63,15 +62,10 @@
     "writer_sequence")
   "Exact set of fields accepted in a schema-1 event envelope.")
 
-(defvar magnus-coord-store--id-counter 0
-  "Process-local input used to make generated event identifiers unique.")
-
 (define-error 'magnus-coord-store-error
   "Magnus coordination event-store error")
 (define-error 'magnus-coord-store-invalid-event
   "Invalid Magnus coordination event" 'magnus-coord-store-error)
-(define-error 'magnus-coord-store-conflict
-  "Conflicting Magnus coordination event" 'magnus-coord-store-error)
 (define-error 'magnus-coord-store-unsafe-entry
   "Unsafe Magnus coordination event entry" 'magnus-coord-store-error)
 (define-error 'magnus-coord-store-oversized-entry
@@ -199,19 +193,6 @@ Schema 1 uses six fractional-second digits so lexical order is time order."
                  (= month (nth 4 decoded))
                  (= year (nth 5 decoded))))
         (error (ignore timestamp-error))))))
-
-(defun magnus-coord-store--timestamp ()
-  "Return the current time in schema-1 canonical UTC form."
-  (format-time-string "%Y-%m-%dT%H:%M:%S.%6NZ" nil t))
-
-(defun magnus-coord-store--new-event-id (writer-id created-at)
-  "Return a collision-resistant event identifier for WRITER-ID at CREATED-AT."
-  (secure-hash
-   'sha256
-   (format "%s\0%s\0%s\0%s\0%s"
-           writer-id created-at (emacs-pid)
-           (cl-incf magnus-coord-store--id-counter)
-           (random most-positive-fixnum))))
 
 (defun magnus-coord-store--project-directory (project-directory)
   "Return validated canonical spelling of PROJECT-DIRECTORY."
@@ -371,41 +352,6 @@ EXPECTED-WRITER-ID and EXPECTED-EVENT-ID bind the envelope to its pathname."
        :content-hash (secure-hash 'sha256 bytes)
        :bytes bytes))))
 
-(defun magnus-coord-store--encode-event
-    (path event-id writer-id writer-name writer-sequence created-at kind payload)
-  "Encode and validate an event intended for PATH.
-The remaining arguments are the schema-1 envelope values."
-  (let ((object (make-hash-table :test #'equal))
-        text)
-    (puthash "schema" magnus-coord-store-schema-version object)
-    (puthash "id" event-id object)
-    (puthash "writer_id" writer-id object)
-    (puthash "writer_name" writer-name object)
-    (puthash "writer_sequence" writer-sequence object)
-    (puthash "created_at" created-at object)
-    (puthash "kind" kind object)
-    (puthash "payload" payload object)
-    (setq text
-          (condition-case error-data
-              (json-serialize object :null-object nil
-                              :false-object :json-false)
-            (error
-             (magnus-coord-store--invalid-event
-              "Payload is not JSON serializable: %s"
-              (error-message-string error-data)))))
-    (let* ((bytes (encode-coding-string (concat text "\n") 'utf-8-unix t))
-           (maximum (magnus-coord-store--max-event-bytes)))
-      (when (> (string-bytes bytes) maximum)
-        (signal 'magnus-coord-store-oversized-entry
-                (list (format "Encoded event exceeds %d bytes" maximum))))
-      (condition-case error-data
-          (magnus-coord-store--decode-event
-           bytes path writer-id event-id)
-        (json-error
-       (magnus-coord-store--invalid-event
-          "Serialized event is not valid JSON: %s"
-          (error-message-string error-data)))))))
-
 (defun magnus-coord-store--read-stable-entry (path)
   "Read bounded regular non-symlink PATH exactly once.
 Return (BYTES . ATTRIBUTES) from the same stable read.  Signal when PATH is
@@ -452,94 +398,6 @@ unsafe, too large, or replaced during the read."
                 (list (format "Event entry changed while being read: %s"
                               path))))
       (cons bytes after))))
-
-(defun magnus-coord-store--read-stable-bytes (path)
-  "Return bytes from one stable bounded read of PATH."
-  (car (magnus-coord-store--read-stable-entry path)))
-
-(defun magnus-coord-store--existing-content-matches-p (path bytes)
-  "Return non-nil when immutable PATH contains exactly BYTES."
-  (string= (magnus-coord-store--read-stable-bytes path) bytes))
-
-(cl-defun magnus-coord-store-publish
-    (project-directory writer-id writer-name kind payload
-                       &key event-id created-at writer-sequence)
-  "Publish one immutable coordination event and return it.
-
-PROJECT-DIRECTORY owns the store.  WRITER-ID is the stable instance identity,
-WRITER-NAME is its display name, KIND is a bounded event-kind string, and
-PAYLOAD must serialize as a JSON object.  WRITER-SEQUENCE is a required
-positive integer allocated durably by that writer.  EVENT-ID and CREATED-AT
-may be supplied when replaying deterministic evidence; otherwise Magnus
-generates them.
-
-Publication writes a private temporary file beside the final event and commits
-it with an atomic no-replace hard link.  Re-publishing the same ID with
-byte-identical content is idempotent.  Reusing an ID with different content
-signals `magnus-coord-store-conflict'."
-  (let* ((created-at (or created-at (magnus-coord-store--timestamp)))
-         (event-id (or event-id
-                       (magnus-coord-store--new-event-id writer-id created-at)))
-         (writer-directory
-          (magnus-coord-store-writer-directory project-directory writer-id))
-         (path (expand-file-name (concat event-id ".json") writer-directory))
-         ;; Encode before creating directories: invalid caller data must not
-         ;; leave a partial store hierarchy behind.
-         (event (magnus-coord-store--encode-event
-                 path event-id writer-id writer-name writer-sequence
-                 created-at kind payload))
-         (bytes (magnus-coord-store-event-bytes event))
-         temporary)
-    (magnus-coord-store-ensure-writer-directory project-directory writer-id)
-    (when (or (file-exists-p path) (file-symlink-p path))
-      (if (magnus-coord-store--existing-content-matches-p path bytes)
-          (cl-return-from magnus-coord-store-publish event)
-        (signal 'magnus-coord-store-conflict
-                (list (format "Event id already has different content: %s"
-                              event-id)))))
-    (setq temporary
-          (make-temp-file
-           (expand-file-name ".magnus-event-tmp-" writer-directory)))
-    (unwind-protect
-        (progn
-          (let ((coding-system-for-write 'no-conversion))
-            (write-region bytes nil temporary nil 'quiet))
-          (set-file-modes temporary #o600)
-          (condition-case publish-error
-              (progn
-                ;; A hard-link create is an atomic no-replace operation on the
-                ;; local filesystems supported by Magnus.  This avoids relying
-                ;; on the implementation of `rename-file' in older Emacsen.
-                (add-name-to-file temporary path nil)
-                ;; The final name is now committed.  Cleanup must not turn a
-                ;; successful publication into an apparent failure.
-                (let ((published-temporary temporary))
-                  (setq temporary nil)
-                  (ignore-errors (delete-file published-temporary)))
-                event)
-            (file-already-exists
-             (if (magnus-coord-store--existing-content-matches-p path bytes)
-                 event
-               (signal 'magnus-coord-store-conflict
-                       (list
-                        (format "Event id concurrently acquired: %s"
-                                event-id)))))
-            (file-error
-             ;; Some filesystems report an existing target as a generic
-             ;; `file-error'.  Resolve that race without hiding other errors.
-             (if (or (file-exists-p path) (file-symlink-p path))
-                 (if (magnus-coord-store--existing-content-matches-p
-                      path bytes)
-                     event
-                   (signal 'magnus-coord-store-conflict
-                           (list
-                            (format "Event id concurrently acquired: %s"
-                                    event-id))))
-               (signal (car publish-error) (cdr publish-error))))))
-      ;; Keep both the predicate and deletion below error precedence: a parent
-      ;; disappearing while unwinding must not replace the original failure.
-      (when temporary
-        (ignore-errors (delete-file temporary))))))
 
 (defun magnus-coord-store--issue
     (path code message &optional writer-id event-id related-path

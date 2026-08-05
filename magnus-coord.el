@@ -856,31 +856,33 @@ Each function receives DIRECTORY and a plist containing `:request-id',
 (defvar magnus-coord--last-review-handler-error nil
   "Most recent review handler error captured during synchronous dispatch.")
 
+(defun magnus-coord--review-retry-ledgers ()
+  "Return retry ledgers tagged by their coordination ingress kind."
+  (list (cons 'event magnus-coord--event-review-retries)
+        (cons 'legacy magnus-coord--review-ready-retries)))
+
+(defun magnus-coord--review-retry-display-id (kind id)
+  "Return retry ID labeled for coordination ingress KIND."
+  (if (eq kind 'legacy) (concat "legacy:" id) id))
+
 (defun magnus-coord-review-retry-diagnostics (directory)
   "Return read-only retry diagnostics for durable reviews in DIRECTORY."
   (let (pending exhausted details)
-    (maphash
-     (lambda (key state)
-       (when (magnus-coord--same-directory-p (car key) directory)
-         (if (plist-get state :exhausted)
-             (progn
-               (push (cdr key) exhausted)
-               (push (list :kind 'event :event-id (cdr key)
-                           :last-error (plist-get state :last-error))
-                     details))
-           (push (cdr key) pending))))
-     magnus-coord--event-review-retries)
-    (maphash
-     (lambda (key state)
-       (when (magnus-coord--same-directory-p (car key) directory)
-         (if (plist-get state :exhausted)
-             (progn
-               (push (concat "legacy:" (cdr key)) exhausted)
-               (push (list :kind 'legacy :event-id (cdr key)
-                           :last-error (plist-get state :last-error))
-                     details))
-           (push (concat "legacy:" (cdr key)) pending))))
-     magnus-coord--review-ready-retries)
+    (dolist (entry (magnus-coord--review-retry-ledgers))
+      (let ((kind (car entry)))
+        (maphash
+         (lambda (key state)
+           (when (magnus-coord--same-directory-p (car key) directory)
+             (let ((id (magnus-coord--review-retry-display-id
+                        kind (cdr key))))
+               (if (plist-get state :exhausted)
+                   (progn
+                     (push id exhausted)
+                     (push (list :kind kind :event-id (cdr key)
+                                 :last-error (plist-get state :last-error))
+                           details))
+                 (push id pending)))))
+         (cdr entry))))
     (list :pending-review-retry-count (length pending)
           :exhausted-review-count (length exhausted)
           :exhausted-review-event-ids (sort exhausted #'string<)
@@ -890,24 +892,31 @@ Each function receives DIRECTORY and a plist containing `:request-id',
                   (string< (plist-get left :event-id)
                            (plist-get right :event-id)))))))
 
-(defun magnus-coord--reset-exhausted-review-retries (directory)
-  "Forget exhausted retry guards in DIRECTORY and return tagged IDs."
-  (let (remove)
-    (dolist (entry
-             (list (cons 'event magnus-coord--event-review-retries)
-                   (cons 'legacy magnus-coord--review-ready-retries)))
+(defun magnus-coord--clear-review-retries (&optional directory exhausted-only)
+  "Cancel and remove matching review retries, returning tagged IDs.
+When DIRECTORY is non-nil, affect only that project.  When EXHAUSTED-ONLY is
+non-nil, retain retries that have not exhausted their bounded attempts."
+  (let (removed)
+    (dolist (entry (magnus-coord--review-retry-ledgers))
       (let (keys)
         (maphash
          (lambda (key state)
-           (when (and (magnus-coord--same-directory-p (car key) directory)
-                      (plist-get state :exhausted))
+           (when (and (or (null directory)
+                          (magnus-coord--same-directory-p
+                           (car key) directory))
+                      (or (not exhausted-only)
+                          (plist-get state :exhausted)))
              (when-let ((timer (plist-get state :timer)))
                (cancel-timer timer))
              (push key keys)
-             (push (cons (car entry) (cdr key)) remove)))
+             (push (cons (car entry) (cdr key)) removed)))
          (cdr entry))
         (dolist (key keys) (remhash key (cdr entry)))))
-    remove))
+    removed))
+
+(defun magnus-coord--reset-exhausted-review-retries (directory)
+  "Forget exhausted retry guards in DIRECTORY and return tagged IDs."
+  (magnus-coord--clear-review-retries directory t))
 
 (defvar magnus-coord--poll-timer nil
   "Timer for polling coordination files for messages and control markers.")
@@ -986,26 +995,7 @@ state, so an in-flight mention cannot be silently reclassified as history."
   (setq magnus-coord--processed-review-ready
         (assoc-delete-all directory magnus-coord--processed-review-ready))
   (magnus-coord-runtime-stop directory)
-  (let (remove)
-    (maphash
-     (lambda (key state)
-       (when (equal (car key) directory)
-         (when-let ((timer (plist-get state :timer)))
-           (cancel-timer timer))
-         (push key remove)))
-     magnus-coord--review-ready-retries)
-    (dolist (key remove)
-      (remhash key magnus-coord--review-ready-retries)))
-  (let (remove)
-    (maphash
-     (lambda (key state)
-       (when (equal (car key) directory)
-         (when-let ((timer (plist-get state :timer)))
-           (cancel-timer timer))
-         (push key remove)))
-     magnus-coord--event-review-retries)
-    (dolist (key remove)
-      (remhash key magnus-coord--event-review-retries)))
+  (magnus-coord--clear-review-retries directory)
   (when (and (null magnus-coord--watched-dirs)
              magnus-coord--poll-timer)
     (cancel-timer magnus-coord--poll-timer)
@@ -1061,16 +1051,7 @@ Also update vterm buffer activity ticks for quiescence tracking."
   (setq magnus-coord--processed-summons nil)
   (setq magnus-coord--processed-review-ready nil)
   (clrhash magnus-coord--lifecycle-signatures)
-  (maphash (lambda (_key state)
-             (when-let ((timer (plist-get state :timer)))
-               (cancel-timer timer)))
-           magnus-coord--review-ready-retries)
-  (clrhash magnus-coord--review-ready-retries)
-  (maphash (lambda (_key state)
-             (when-let ((timer (plist-get state :timer)))
-               (cancel-timer timer)))
-           magnus-coord--event-review-retries)
-  (clrhash magnus-coord--event-review-retries)
+  (magnus-coord--clear-review-retries)
   (magnus-coord-runtime-stop-all))
 
 (defun magnus-coord-shutdown ()
@@ -1408,45 +1389,64 @@ left unprocessed for bounded retry."
                 directory magnus-coord--last-review-handler-error)
        nil))))
 
-(defun magnus-coord--clear-review-ready-retry (directory hash)
-  "Clear any pending retry for marker HASH in DIRECTORY."
-  (let* ((key (cons directory hash))
-         (state (gethash key magnus-coord--review-ready-retries)))
+(defun magnus-coord--clear-review-retry (ledger directory id)
+  "Cancel and remove ID in DIRECTORY from retry LEDGER."
+  (let* ((key (cons directory id))
+         (state (gethash key ledger)))
     (when-let ((timer (plist-get state :timer)))
       (cancel-timer timer))
-    (remhash key magnus-coord--review-ready-retries)))
+    (remhash key ledger)))
 
-(defun magnus-coord--schedule-review-ready-retry (directory hash)
-  "Schedule a bounded retry for marker HASH in DIRECTORY."
-  (let* ((key (cons directory hash))
-         (state (gethash key magnus-coord--review-ready-retries))
+(defun magnus-coord--prepare-review-retry (ledger directory id)
+  "Clear ID's active timer in retry LEDGER and return its state."
+  (let* ((key (cons directory id))
+         (state (gethash key ledger)))
+    (when state
+      (puthash key (plist-put state :timer nil) ledger))
+    state))
+
+(defun magnus-coord--schedule-review-retry
+    (ledger directory id initial-state label retry-function &rest retry-arguments)
+  "Schedule one bounded review retry in LEDGER.
+DIRECTORY and ID form the ledger key.  INITIAL-STATE seeds a new entry, LABEL
+identifies it in diagnostics, and RETRY-FUNCTION receives RETRY-ARGUMENTS."
+  (let* ((key (cons directory id))
+         (state (or (gethash key ledger) initial-state))
          (count (or (plist-get state :count) 0)))
     (when magnus-coord--last-review-handler-error
-      (setq state
-            (plist-put state :last-error
-                       magnus-coord--last-review-handler-error)))
+      (setq state (plist-put state :last-error
+                             magnus-coord--last-review-handler-error)))
     (cond
      ((plist-get state :timer))
      ((>= count magnus-coord-review-ready-retry-count)
       (setq state (plist-put state :exhausted t))
-      (message
-       "Magnus: legacy review marker %s exhausted bounded retries; press g or diagnose"
-       hash))
+      (message "Magnus: %s %s exhausted bounded retries; press g or diagnose"
+               label id))
      (t
       (setq state (plist-put state :count (1+ count)))
       (setq state
             (plist-put
              state :timer
-             (run-with-timer
-              magnus-coord-review-ready-retry-delay nil
-              (lambda ()
-                (let ((current
-                       (gethash key magnus-coord--review-ready-retries)))
-                  (when current
-                    (puthash key (plist-put current :timer nil)
-                             magnus-coord--review-ready-retries))
-                  (magnus-coord--check-new-review-ready directory))))))))
-    (puthash key state magnus-coord--review-ready-retries)))
+             (apply #'run-with-timer magnus-coord-review-ready-retry-delay nil
+                    retry-function retry-arguments)))))
+    (puthash key state ledger)))
+
+(defun magnus-coord--clear-review-ready-retry (directory hash)
+  "Clear any pending retry for marker HASH in DIRECTORY."
+  (magnus-coord--clear-review-retry
+   magnus-coord--review-ready-retries directory hash))
+
+(defun magnus-coord--retry-review-ready (directory hash)
+  "Retry legacy review marker HASH in DIRECTORY."
+  (magnus-coord--prepare-review-retry
+   magnus-coord--review-ready-retries directory hash)
+  (magnus-coord--check-new-review-ready directory))
+
+(defun magnus-coord--schedule-review-ready-retry (directory hash)
+  "Schedule a bounded retry for marker HASH in DIRECTORY."
+  (magnus-coord--schedule-review-retry
+   magnus-coord--review-ready-retries directory hash nil
+   "legacy review marker" #'magnus-coord--retry-review-ready directory hash))
 
 (cl-defun magnus-coord--init-processed-review-ready
     (directory &optional (content nil content-supplied-p))
@@ -1525,11 +1525,8 @@ Read the legacy ingress when CONTENT was not supplied."
 
 (defun magnus-coord--clear-event-review-retry (directory event-id)
   "Clear exact EVENT-ID retry state for DIRECTORY."
-  (let* ((key (cons directory event-id))
-         (state (gethash key magnus-coord--event-review-retries)))
-    (when-let ((timer (plist-get state :timer)))
-      (cancel-timer timer))
-    (remhash key magnus-coord--event-review-retries)))
+  (magnus-coord--clear-review-retry
+   magnus-coord--event-review-retries directory event-id))
 
 (defun magnus-coord--settle-event-review (directory event-id)
   "Settle EVENT-ID in DIRECTORY after its durable handler completes."
@@ -1548,39 +1545,17 @@ Read the legacy ingress when CONTENT was not supplied."
 (defun magnus-coord--schedule-event-review-retry
     (directory event-id marker)
   "Schedule a bounded exact retry for review EVENT-ID and MARKER."
-  (let* ((key (cons directory event-id))
-         (state (or (gethash key magnus-coord--event-review-retries)
-                    (list :marker marker :count 0)))
-         (count (or (plist-get state :count) 0)))
-    (when magnus-coord--last-review-handler-error
-      (setq state
-            (plist-put state :last-error
-                       magnus-coord--last-review-handler-error)))
-    (cond
-     ((plist-get state :timer))
-     ((>= count magnus-coord-review-ready-retry-count)
-      (setq state (plist-put state :exhausted t))
-      (message
-       "Magnus: review event %s exhausted bounded retries; press g or diagnose"
-       event-id))
-     (t
-      (setq state (plist-put state :count (1+ count)))
-      (setq state
-            (plist-put
-             state :timer
-             (run-with-timer magnus-coord-review-ready-retry-delay nil
-                             #'magnus-coord--retry-event-review
-                             directory event-id)))))
-    (puthash key state magnus-coord--event-review-retries)))
+  (magnus-coord--schedule-review-retry
+   magnus-coord--event-review-retries directory event-id
+   (list :marker marker :count 0) "review event"
+   #'magnus-coord--retry-event-review directory event-id))
 
 (defun magnus-coord--retry-event-review (directory event-id)
   "Retry the exact immutable review EVENT-ID in DIRECTORY."
-  (let* ((key (cons directory event-id))
-         (state (gethash key magnus-coord--event-review-retries))
+  (let* ((state (magnus-coord--prepare-review-retry
+                 magnus-coord--event-review-retries directory event-id))
          (marker (plist-get state :marker)))
     (when state
-      (puthash key (plist-put state :timer nil)
-               magnus-coord--event-review-retries)
       (if (and (magnus-coord--dispatch-review-ready directory marker)
                (magnus-coord--settle-event-review directory event-id))
           (progn
@@ -1690,21 +1665,6 @@ Returns a plist with :log, :discoveries, :decisions, :git, :start, :end."
           :git (or git-log "No git data")
           :start start-time
           :end (float-time))))
-
-(defun magnus-coord--extract-discoveries (directory)
-  "Extract the Discoveries section text from DIRECTORY's coord file."
-  (let ((file (magnus-coord-file-path directory)))
-    (when (file-exists-p file)
-      (with-temp-buffer
-        (insert-file-contents file)
-        (goto-char (point-min))
-        (when (re-search-forward "^## Discoveries" nil t)
-          (forward-line 1)
-          (let ((start (point))
-                (end (if (re-search-forward "^## " nil t)
-                         (match-beginning 0)
-                       (point-max))))
-            (string-trim (buffer-substring-no-properties start end))))))))
 
 (defun magnus-coord--format-log-for-retro (entries)
   "Format log ENTRIES for the retro prompt."

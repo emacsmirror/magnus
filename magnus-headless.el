@@ -692,10 +692,6 @@ remains with the caller."
   "Return the captured, preassigned, or resumed session ID for PROCESS."
   (process-get process 'magnus-headless-session-id))
 
-(defun magnus-headless-structured-result (process)
-  "Return PROCESS's latest decoded structured result, or nil."
-  (process-get process 'magnus-headless-structured-result))
-
 (defun magnus-headless-cancel (process &optional force)
   "Cancel live headless PROCESS.
 With FORCE, kill the process immediately; otherwise send an interrupt."

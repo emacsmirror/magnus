@@ -262,14 +262,6 @@ FAILURE-KIND and MESSAGE have the same meaning as in
                   (equal key (magnus-background-job-key job)))
                 magnus-background--queue)))
 
-(defun magnus-background-pending-p (key)
-  "Return non-nil when KEY identifies active or queued background work."
-  (not (null (magnus-background--find key))))
-
-(defun magnus-background-queue-length ()
-  "Return the number of waiting background jobs."
-  (length magnus-background--queue))
-
 (defun magnus-background-submit (key provider request &optional callbacks)
   "Submit PROVIDER REQUEST under coalescing KEY.
 CALLBACKS accepts :on-event, :on-error, :on-complete, and :timeout.  Return the

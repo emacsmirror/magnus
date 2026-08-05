@@ -9,6 +9,16 @@
 (require 'magnus-status)
 (require 'magnus-transient)
 
+(defun magnus-test-status--attempts-for-state (state)
+  "Return canonical attempt history deriving review round STATE."
+  (unless (eq state 'queued)
+    (list
+     (magnus-review-attempt--create
+      :number 1 :token (format "status-fixture-%s" state)
+      :started-at 1
+      :finished-at (and (memq state '(complete failed interrupted)) 2)
+      :execution state))))
+
 (defun magnus-test-status--render-instance (instance reviews)
   "Render INSTANCE with REVIEWS and return its text plus slot position."
   (with-temp-buffer
@@ -23,6 +33,27 @@
       (list (buffer-string)
             (text-property-any (point-min) (point-max)
                                'magnus-review-animation-slot t)))))
+
+(defun magnus-test-status--review-in-state (execution &rest arguments)
+  "Return a review whose canonical history derives EXECUTION.
+ARGUMENTS are passed to `magnus-review--create'."
+  (apply
+   #'magnus-review--create
+   (append
+    arguments
+    (if (eq execution 'waiting-for-checkpoint)
+        (list
+         :checkpoint-requests
+         (list
+          (magnus-review-checkpoint-request--create
+           :number 1 :token "status-fixture-checkpoint"
+           :requested-at 1 :events nil)))
+      (list
+       :rounds
+       (list
+        (magnus-review-round--create
+         :number 1
+         :attempts (magnus-test-status--attempts-for-state execution))))))))
 
 (ert-deftest magnus-status-review-keys-are-directly-discoverable ()
   (should (eq (lookup-key magnus-status-mode-map (kbd "v"))
@@ -186,19 +217,21 @@
 (ert-deftest magnus-status-context-hints-follow-review-lines-and-bindings ()
   (let* ((round
           (magnus-review-round--create
-           :number 1 :execution 'complete :verdict 'approve
+           :number 1 :verdict 'approve
+           :attempts (magnus-test-status--attempts-for-state 'complete)
            :read-state 'unread))
          (review
           (magnus-review--create
            :id "review-hint" :reviewer-name "keen-owl"
-           :author-name "quick-wren" :lifecycle 'open :execution 'complete
-           :read-state 'unread :created-at (float-time)
+           :author-name "quick-wren" :lifecycle 'open
+           :created-at (float-time)
            :updated-at (float-time) :rounds (list round)))
          (waiting
-          (magnus-review--create
+          (magnus-test-status--review-in-state
+           'waiting-for-checkpoint
            :id "review-waiting" :reviewer-name "swift-hare"
            :author-name "bright-crow" :lifecycle 'open
-           :execution 'waiting-for-checkpoint :created-at (float-time)
+           :created-at (float-time)
            :updated-at (float-time))))
     (with-temp-buffer
       (magnus-status-mode)
@@ -422,10 +455,11 @@
           (magnus-instance--create
            :id "author" :name "quick-wren" :directory "/tmp/project"))
          (review
-          (magnus-review--create
+          (magnus-test-status--review-in-state
+           'running
            :id "active" :author-instance-id "author"
            :author-name "quick-wren" :reviewer-name "keen-owl"
-           :lifecycle 'open :execution 'running)))
+           :lifecycle 'open)))
     (unwind-protect
         (progn
           (setq magnus-transient--review-request-context
@@ -524,9 +558,10 @@
           (magnus-instance--create
            :id "author" :name "quick-wren" :directory "/tmp/project"))
          (review
-          (magnus-review--create
+          (magnus-test-status--review-in-state
+           'running
            :id "now-running" :author-instance-id "author"
-           :reviewer-name "keen-owl" :lifecycle 'open :execution 'running))
+           :reviewer-name "keen-owl" :lifecycle 'open))
          (cached (list :author author :root "/tmp/project" :task "Task"
                        :review nil :action 'new))
          (fresh (list :author author :root "/tmp/project" :task "Task"
@@ -549,7 +584,7 @@
          (review
           (magnus-review--create
            :id "waiting-review" :author-instance-id "author"
-           :lifecycle 'open :execution 'waiting-for-checkpoint
+           :lifecycle 'open
            :checkpoint-requests (list first)))
          cached fresh)
     (cl-letf (((symbol-function 'magnus-review-git-root)
@@ -603,7 +638,8 @@
           (magnus-review-rounds review)
           (list
            (magnus-review-round--create
-            :number 1 :head-oid "head-one" :execution 'complete)))
+            :number 1 :head-oid "head-one"
+            :attempts (magnus-test-status--attempts-for-state 'complete))))
     (cl-letf (((symbol-function 'magnus-review-get)
                (lambda (_id) review))
               ((symbol-function 'magnus-review-rereview)
@@ -646,13 +682,15 @@
 (ert-deftest magnus-review-action-transient-does-not-retarget-at-point ()
   (let* ((old-round
           (magnus-review-round--create
-           :number 1 :head-oid "head-a" :execution 'complete))
+           :number 1 :head-oid "head-a"
+           :attempts (magnus-test-status--attempts-for-state 'complete)))
          (old-a
           (magnus-review--create
            :id "review-a" :lifecycle 'open :rounds (list old-round)))
          (fresh-round
           (magnus-review-round--create
-           :number 1 :head-oid "head-a" :execution 'complete))
+           :number 1 :head-oid "head-a"
+           :attempts (magnus-test-status--attempts-for-state 'complete)))
          (fresh-a
           (magnus-review--create
            :id "review-a" :lifecycle 'open :rounds (list fresh-round)))
@@ -662,7 +700,9 @@
            :rounds
            (list
             (magnus-review-round--create
-             :number 1 :head-oid "head-b" :execution 'complete))))
+             :number 1 :head-oid "head-b"
+             :attempts
+             (magnus-test-status--attempts-for-state 'complete)))))
          (magnus-transient--review-action-context
           (magnus-transient--make-review-action-context old-a))
          (transient-current-command 'magnus-review-actions-menu)
@@ -681,13 +721,15 @@
 (ert-deftest magnus-review-action-transient-resolves-fresh-historical-round ()
   (let* ((old-round
           (magnus-review-round--create
-           :number 1 :head-oid "head-a" :execution 'complete))
+           :number 1 :head-oid "head-a"
+           :attempts (magnus-test-status--attempts-for-state 'complete)))
          (old-review
           (magnus-review--create
            :id "review-a" :lifecycle 'open :rounds (list old-round)))
          (fresh-round
           (magnus-review-round--create
-           :number 1 :head-oid "head-a" :execution 'complete))
+           :number 1 :head-oid "head-a"
+           :attempts (magnus-test-status--attempts-for-state 'complete)))
          (fresh-review
           (magnus-review--create
            :id "review-a" :lifecycle 'open :rounds (list fresh-round)))
@@ -712,27 +754,29 @@
          (magnus-status-review-animation-interval 0.4))
     (dolist (state '(starting running))
       (let* ((review
-              (magnus-review--create
+              (magnus-test-status--review-in-state
+               state
                :id (symbol-name state) :author-instance-id "author"
-               :reviewer-name "keen-owl" :lifecycle 'open :execution state))
+               :reviewer-name "keen-owl" :lifecycle 'open))
              (rendered (magnus-test-status--render-instance
                         instance (list review))))
         (should (string-match-p (regexp-quote "[review |]") (car rendered)))
         (should (number-or-marker-p (cadr rendered)))))
     (dolist (state '(waiting-for-checkpoint queued complete failed interrupted))
       (let* ((review
-              (magnus-review--create
+              (magnus-test-status--review-in-state
+               state
                :id (symbol-name state) :author-instance-id "author"
-               :reviewer-name "keen-owl" :lifecycle 'open :execution state))
+               :reviewer-name "keen-owl" :lifecycle 'open))
              (rendered (magnus-test-status--render-instance
                         instance (list review))))
         (should-not (string-match-p "\\[review" (car rendered)))
         (should-not (cadr rendered))))
     (let* ((review
-            (magnus-review--create
+            (magnus-test-status--review-in-state
+             'running
              :id "archived" :author-instance-id "author"
-             :reviewer-name "keen-owl" :lifecycle 'archived
-             :execution 'running))
+             :reviewer-name "keen-owl" :lifecycle 'archived))
            (rendered (magnus-test-status--render-instance
                       instance (list review))))
       (should-not (cadr rendered)))))
@@ -743,9 +787,10 @@
            :id "author-a" :name "quick-wren" :directory "/tmp/project"
            :created-at (current-time) :status 'running))
          (review
-          (magnus-review--create
+          (magnus-test-status--review-in-state
+           'running
            :id "other-author" :author-instance-id "author-b"
-           :reviewer-name "keen-owl" :lifecycle 'open :execution 'running))
+           :reviewer-name "keen-owl" :lifecycle 'open))
          (rendered (magnus-test-status--render-instance instance (list review))))
     (should-not (cadr rendered))))
 
@@ -756,12 +801,14 @@
            :created-at (current-time) :status 'running))
          (reviews
           (list
-           (magnus-review--create
+           (magnus-test-status--review-in-state
+            'running
             :id "first" :author-instance-id "author"
-            :reviewer-name "keen-owl" :lifecycle 'open :execution 'running)
-           (magnus-review--create
+            :reviewer-name "keen-owl" :lifecycle 'open)
+           (magnus-test-status--review-in-state
+            'starting
             :id "second" :author-instance-id "author"
-            :reviewer-name "swift-hare" :lifecycle 'open :execution 'starting))))
+            :reviewer-name "swift-hare" :lifecycle 'open))))
     (let* ((magnus-status-review-animation-interval 0.4)
            (rendered (magnus-test-status--render-instance instance reviews)))
       (should (string-match-p (regexp-quote "[2 reviews |]") (car rendered)))

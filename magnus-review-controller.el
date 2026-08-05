@@ -25,14 +25,12 @@
 (require 'magnus-instances)
 (require 'magnus-provider)
 (require 'magnus-review)
+(require 'magnus-terminal)
 
 (declare-function magnus--generate-random-name "magnus")
 (declare-function magnus-expertise-match "magnus")
 (declare-function magnus-review-actions "magnus-transient")
 (declare-function magnus-status-refresh "magnus-status")
-(declare-function vterm-send-return "vterm")
-(declare-function vterm-send-string "vterm")
-
 (defvar magnus-process-ready-hook)
 (defvar magnus-coord--do-not-disturb)
 (defvar magnus-review-ui-action-function nil
@@ -73,11 +71,6 @@ replacement attempt because ownership includes the process and attempt token."
   :type '(choice (const :tag "No timeout" nil) number)
   :group 'magnus)
 
-(defcustom magnus-review-local-delivery-retry-delay 1.0
-  "Seconds before retrying a message deferred from a user-owned agent TUI."
-  :type 'number
-  :group 'magnus)
-
 (defvar magnus-review-controller--processes (make-hash-table :test #'equal)
   "Map review IDs to their currently owned headless process.")
 
@@ -89,10 +82,6 @@ replacement attempt because ownership includes the process and attempt token."
 
 (defvar magnus-review-controller--recovering nil
   "Non-nil while startup reconstructs the complete durable review queue.")
-
-(defvar magnus-review-controller--local-delivery-processes
-  (make-hash-table :test #'eq)
-  "Processes with controller messages waiting for safe atomic TUI delivery.")
 
 (defvar magnus-review-controller-changed-hook nil
   "Hook run after a controller-visible review state transition.")
@@ -296,36 +285,12 @@ PRIOR is the previous canonical structured result, when this is a re-review."
        "\nThis is the first review round; prior_findings must be an empty array.\n"))))
 
 (defun magnus-review-controller--field (object key)
-  "Read KEY from JSON-like OBJECT."
-  (let ((plain (intern (substring (symbol-name key) 1))))
-    (cond
-     ((hash-table-p object)
-      (or (gethash key object)
-          (gethash plain object)
-          (gethash (symbol-name plain) object)))
-     ((and (listp object) (keywordp (car object)))
-      (plist-get object key))
-     ((listp object)
-      (or (alist-get key object)
-          (alist-get plain object)
-          (alist-get (symbol-name plain) object nil nil #'equal))))))
+  "Read keyword KEY from canonical symbol-keyed alist OBJECT."
+  (alist-get (intern (substring (symbol-name key) 1)) object))
 
 (defun magnus-review-controller--field-present-p (object key)
-  "Return non-nil when JSON-like OBJECT explicitly contains KEY."
-  (let* ((plain (intern (substring (symbol-name key) 1)))
-         (string (symbol-name plain))
-         (missing (make-symbol "missing")))
-    (cond
-     ((hash-table-p object)
-      (or (not (eq missing (gethash key object missing)))
-          (not (eq missing (gethash plain object missing)))
-          (not (eq missing (gethash string object missing)))))
-     ((and (listp object) (keywordp (car object)))
-      (plist-member object key))
-     ((listp object)
-      (or (assq key object) (assq plain object)
-          (assoc string object)))
-     (t nil))))
+  "Return non-nil when canonical alist OBJECT explicitly contains KEY."
+  (assq (intern (substring (symbol-name key) 1)) object))
 
 (defun magnus-review-controller--array (value field)
   "Return VALUE as a list for array FIELD, or signal a validation error."
@@ -616,18 +581,6 @@ RAW is a Magnus-published artifact whose IDs and anchor metadata must survive."
             (magnus-review-controller--normalize-string-array
              items 'tests 2000))))))
 
-(defun magnus-review-controller--git-bytes (directory &rest arguments)
-  "Run Git with ARGUMENTS in DIRECTORY and return its literal output."
-  (with-temp-buffer
-    (set-buffer-multibyte nil)
-    (let ((status (apply #'process-file "git" nil t nil
-                         "-C" directory arguments)))
-      (unless (and (integerp status) (zerop status))
-        (error "Git review evidence failed: %s"
-               (string-trim (decode-coding-string (buffer-string)
-                                                  'utf-8-unix))))
-      (buffer-string))))
-
 (defun magnus-review-controller--artifact-bytes (path)
   "Read exact bytes from regular, non-symlink artifact PATH."
   (when (or (file-symlink-p path) (not (file-regular-p path)))
@@ -806,11 +759,6 @@ shown beneath unrelated code."
         (list :name (magnus--generate-random-name exclusions)
               :reason "fresh independent reviewer"))))
 
-(defun magnus-review-controller--reviewer-name (root task author)
-  "Choose a durable reviewer identity for TASK in ROOT, excluding AUTHOR."
-  (plist-get (magnus-review-controller--reviewer-selection root task author)
-             :name))
-
 (defun magnus-review-controller--instance-running-p (instance)
   "Return non-nil when INSTANCE can accept a durable controller message."
   (if (magnus-provider-external-p instance)
@@ -825,103 +773,6 @@ shown beneath unrelated code."
       (and (buffer-live-p buffer)
            (get-buffer-process buffer)
            (process-live-p (get-buffer-process buffer))))))
-
-(defun magnus-review-controller--schedule-local-delivery (process)
-  "Schedule safe delivery of queued controller messages for PROCESS."
-  (unless (process-get process 'magnus-review-delivery-retry-timer)
-    (puthash process t magnus-review-controller--local-delivery-processes)
-    (process-put
-     process 'magnus-review-delivery-retry-timer
-     (run-with-timer
-      magnus-review-local-delivery-retry-delay nil
-      (lambda ()
-        (when (processp process)
-          (process-put process 'magnus-review-delivery-retry-timer nil))
-        (magnus-review-controller--drain-local-delivery process))))))
-
-(defun magnus-review-controller--local-delivery-owner-p (entry process)
-  "Return non-nil when ENTRY still belongs to exact local PROCESS runtime."
-  (let ((instance (plist-get entry :instance))
-        (buffer (plist-get entry :buffer))
-        (owner-process (plist-get entry :process)))
-    (and (magnus-instance-p instance)
-         (eq process owner-process)
-         (buffer-live-p buffer)
-         (eq buffer (magnus-instance-buffer instance))
-         (eq process (get-buffer-process buffer))
-         (process-live-p process))))
-
-(defun magnus-review-controller--drain-local-delivery (process)
-  "Deliver PROCESS's next queued message when the user does not own its TUI."
-  (let* ((queue (and (processp process)
-                     (process-get process 'magnus-review-delivery-queue)))
-         (entry (car queue))
-         (buffer (plist-get entry :buffer)))
-    (cond
-     ((or magnus-review-controller--shutting-down
-          (not (and (processp process) (process-live-p process))))
-      (when (processp process)
-        (process-put process 'magnus-review-delivery-queue nil))
-      (remhash process magnus-review-controller--local-delivery-processes))
-     ((null queue)
-      (remhash process magnus-review-controller--local-delivery-processes))
-     ((not (magnus-review-controller--local-delivery-owner-p entry process))
-      ;; The instance was archived, moved, or resumed while this process-local
-      ;; delivery was deferred.  Never acknowledge submission to an obsolete
-      ;; TUI; clearing its queue leaves durable notices pending for the new
-      ;; runtime's process-ready replay.
-      (process-put process 'magnus-review-delivery-queue nil)
-      (remhash process magnus-review-controller--local-delivery-processes))
-     ((eq buffer (window-buffer (selected-window)))
-      ;; Never append to a composer while Hrishi owns this TUI.
-      (magnus-review-controller--schedule-local-delivery process))
-     (t
-      (let* ((text (plist-get entry :text))
-             (accepted (plist-get entry :accepted))
-             submitted)
-        ;; Paste and Return in one Emacs event.  Keep the entry durable until
-        ;; both operations succeed: a transient vterm failure must not poison
-        ;; the queue and strand a pending author notice.  Pop before invoking
-        ;; ACCEPTED so a callback cannot submit this exact entry twice.
-        (condition-case err
-            (progn
-              (with-current-buffer buffer
-                (vterm-send-string text t)
-                (vterm-send-return))
-              (process-put process 'magnus-review-delivery-queue (cdr queue))
-              (setq submitted t))
-          (error
-           (message "Magnus: deferred author delivery failed: %s"
-                    (error-message-string err))))
-        ;; Transport acceptance and receipt persistence are separate phases.
-        ;; Once submitted, never replay automatically merely because saving the
-        ;; receipt failed; the stable marker makes explicit recovery idempotent.
-        (when (and submitted accepted)
-          (condition-case err
-              (funcall accepted)
-            (error
-             (message "Magnus: could not persist author delivery receipt: %s"
-                      (error-message-string err)))))
-        (if (process-get process 'magnus-review-delivery-queue)
-            (magnus-review-controller--schedule-local-delivery process)
-          (remhash process
-                   magnus-review-controller--local-delivery-processes)))))))
-
-(defun magnus-review-controller--queue-local-delivery
-    (instance buffer process text accepted)
-  "Queue TEXT and ACCEPTED for exact INSTANCE BUFFER PROCESS ownership."
-  (let ((queue (process-get process 'magnus-review-delivery-queue)))
-    (unless (seq-some (lambda (entry)
-                        (string= text (plist-get entry :text)))
-                      queue)
-      (process-put process 'magnus-review-delivery-queue
-                   (append queue (list (list :instance instance
-                                             :buffer buffer
-                                             :process process
-                                             :text text
-                                             :accepted accepted)))))
-    (magnus-review-controller--schedule-local-delivery process)
-    'queued))
 
 (defun magnus-review-controller--send (instance text &optional accepted)
   "Submit durable controller TEXT to running INSTANCE.
@@ -941,22 +792,12 @@ the message; callers include stable idempotency keys for replay."
               (_ (if accepted
                      (error "provider did not acknowledge durable delivery")
                    t)))
-          (let* ((buffer (magnus-instance-buffer instance))
-                 (process (and (buffer-live-p buffer)
-                               (get-buffer-process buffer))))
-            (unless (and process (process-live-p process))
-              (error "agent process is not live"))
-            (if (or (eq buffer (window-buffer (selected-window)))
-                    (process-get process 'magnus-review-delivery-queue))
-                (magnus-review-controller--queue-local-delivery
-                 instance buffer process text accepted)
-              ;; Bracketed paste and Return occur without a timer boundary, so
-              ;; user input cannot be accidentally joined to this submission.
-              (with-current-buffer buffer
-                (vterm-send-string text t)
-                (vterm-send-return))
-              (when accepted (funcall accepted))
-              t)))
+          (pcase (magnus-terminal-submit
+                  instance text accepted
+                  :settle-delay magnus-terminal-delivery-retry-delay
+                  :scope 'magnus-review-controller :deduplicate t)
+            ('submitted t)
+            ('queued 'queued)))
       (error
        (message "Magnus: durable author delivery failed: %s"
                 (error-message-string err))
@@ -1078,9 +919,7 @@ as checkpoint authority."
            (round (magnus-review-latest-round review))
            (attempt (and round (magnus-review-latest-attempt round)))
            (execution
-            (or (and round (magnus-review-round-execution round))
-                (let ((legacy (magnus-review-execution review)))
-                  (unless (eq legacy 'waiting-for-checkpoint) legacy))))
+            (and round (magnus-review-round-execution round)))
            (action
             (cond
              (request 'waiting)
@@ -2248,21 +2087,7 @@ Return non-nil when publication was recovered."
                    (error-message-string err)))))
      magnus-review-controller--processes)
     (clrhash magnus-review-controller--processes)
-    (maphash
-     (lambda (process _value)
-       (condition-case err
-           (when (processp process)
-             (when-let ((timer
-                         (process-get
-                          process 'magnus-review-delivery-retry-timer)))
-               (cancel-timer timer))
-             (process-put process 'magnus-review-delivery-retry-timer nil)
-             (process-put process 'magnus-review-delivery-queue nil))
-         (error
-          (message "Magnus: could not clear deferred delivery: %s"
-                   (error-message-string err)))))
-     magnus-review-controller--local-delivery-processes)
-    (clrhash magnus-review-controller--local-delivery-processes)
+    (magnus-terminal-cancel-scope 'magnus-review-controller)
     (remove-hook 'magnus-review-ready-hook #'magnus-review-controller--ready)
     (remove-hook 'magnus-review-checkpoint-mismatch-hook
                  #'magnus-review-controller--recover-checkpoint-token)

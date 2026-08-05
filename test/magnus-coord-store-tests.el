@@ -47,21 +47,34 @@
    (concat event-id ".json")
    (magnus-coord-store-writer-directory project writer-id)))
 
-(ert-deftest magnus-coord-store-publishes-and-reads-schema-1-event ()
-  "A published event is private, path-bound, and survives a snapshot."
+(cl-defun magnus-coord-store-tests--write-event
+    (project writer-id writer-name kind payload
+             &key event-id created-at writer-sequence)
+  "Write one schema-1 fixture event beneath PROJECT and return its path."
+  (let* ((path (magnus-coord-store-tests--event-path
+                project writer-id event-id))
+         (bytes (magnus-coord-store-tests--event-bytes
+                 event-id writer-id writer-name writer-sequence
+                 created-at kind payload)))
+    (magnus-coord-store-ensure-writer-directory project writer-id)
+    (magnus-coord-store-tests--write-bytes path bytes)
+    (set-file-modes path #o600)
+    path))
+
+(ert-deftest magnus-coord-store-reads-schema-1-event ()
+  "A valid event is path-bound and survives a snapshot."
   (magnus-coord-store-tests--with-project
-    (let* ((event
-            (magnus-coord-store-publish
-             project "writer-1" "Swift Hare" "log.append"
-             (magnus-coord-store-tests--payload "héllo")
-             :event-id "event-1"
-             :writer-sequence 1
-             :created-at "2026-08-04T01:02:03.000001Z"))
-           (path (magnus-coord-store-event-path event))
+    (magnus-coord-store-tests--write-event
+     project "writer-1" "Swift Hare" "log.append"
+     (magnus-coord-store-tests--payload "héllo")
+     :event-id "event-1"
+     :writer-sequence 1
+     :created-at "2026-08-04T01:02:03.000001Z")
+    (let* ((path (magnus-coord-store-tests--event-path
+                  project "writer-1" "event-1"))
            (snapshot (magnus-coord-store-snapshot project))
            (loaded (car (magnus-coord-store-snapshot-events snapshot))))
       (should (file-regular-p path))
-      (should (= (logand (file-modes path) #o777) #o600))
       (should (string-suffix-p
                ".magnus-coord/writers/writer-1/event-1.json" path))
       (should (equal (magnus-coord-store-snapshot-candidate-paths snapshot)
@@ -79,136 +92,20 @@
                      (secure-hash
                       'sha256 (magnus-coord-store-event-bytes loaded)))))))
 
-(ert-deftest magnus-coord-store-publish-is-atomic-immutable-and-idempotent ()
-  "Publishing uses a sibling hard-link commit and never replaces evidence."
-  (magnus-coord-store-tests--with-project
-    (let ((original-link (symbol-function 'add-name-to-file))
-          link-calls)
-      (cl-letf (((symbol-function 'add-name-to-file)
-                 (lambda (source target &optional overwrite)
-                   (push (list source target overwrite) link-calls)
-                   (funcall original-link source target overwrite))))
-        (let* ((arguments
-                (list project "writer-1" "Swift Hare" "log.append"
-                      (magnus-coord-store-tests--payload "same")
-                      :event-id "stable-id"
-                      :writer-sequence 1
-                      :created-at "2026-08-04T01:02:03.000001Z"))
-               (first (apply #'magnus-coord-store-publish arguments))
-               (path (magnus-coord-store-event-path first))
-               (before (magnus-coord-store-event-bytes first))
-               (second (apply #'magnus-coord-store-publish arguments)))
-          (should (= (length link-calls) 1))
-          (pcase-let ((`(,source ,target ,overwrite) (car link-calls)))
-            (should (equal (file-name-directory source)
-                           (file-name-directory target)))
-            (should (equal target path))
-            (should-not overwrite))
-          (should (equal (magnus-coord-store-event-content-hash first)
-                         (magnus-coord-store-event-content-hash second)))
-          (should-error
-           (magnus-coord-store-publish
-            project "writer-1" "Swift Hare" "log.append"
-            (magnus-coord-store-tests--payload "different")
-            :event-id "stable-id"
-            :writer-sequence 1
-            :created-at "2026-08-04T01:02:03.000001Z")
-           :type 'magnus-coord-store-conflict)
-          (should (= (length link-calls) 1))
-          (should
-           (string=
-            before
-            (with-temp-buffer
-              (set-buffer-multibyte nil)
-              (insert-file-contents-literally path)
-              (buffer-string)))))))))
-
-(ert-deftest magnus-coord-store-publish-resolves-an-exact-concurrent-race ()
-  "A concurrent publisher winning the same ID with the same bytes is success."
-  (magnus-coord-store-tests--with-project
-    (cl-letf (((symbol-function 'add-name-to-file)
-               (lambda (source target &optional _overwrite)
-                 ;; Model another process atomically winning between our
-                 ;; existence check and commit, then the filesystem using a
-                 ;; generic `file-error' for EEXIST.
-                 (copy-file source target nil t)
-                 (signal 'file-error '("simulated concurrent winner")))))
-      (let* ((event
-              (magnus-coord-store-publish
-               project "writer" "Writer" "log.append"
-               (magnus-coord-store-tests--payload "same")
-               :event-id "race"
-               :writer-sequence 1
-               :created-at "2026-08-04T01:00:00.000000Z"))
-             (writer-directory
-              (magnus-coord-store-writer-directory project "writer")))
-        (should (file-regular-p (magnus-coord-store-event-path event)))
-        (should-not
-         (directory-files writer-directory nil
-                          "\\`\\.magnus-event-tmp-"))))))
-
-(ert-deftest magnus-coord-store-invalid-publication-leaves-no-store ()
-  "Invalid envelope data is rejected before the store hierarchy is created."
-  (magnus-coord-store-tests--with-project
-    (dolist
-        (operation
-         (list
-          (lambda ()
-            (magnus-coord-store-publish
-             project "../escape" "Writer" "log.append"
-             (magnus-coord-store-tests--payload "x") :writer-sequence 1))
-          (lambda ()
-            (magnus-coord-store-publish
-             project "writer" "Writer" "log.append"
-             (magnus-coord-store-tests--payload "x")
-             :event-id "../escape" :writer-sequence 1))
-          (lambda ()
-            (magnus-coord-store-publish
-             project "writer" "Writer\nInjected" "log.append"
-             (magnus-coord-store-tests--payload "x") :writer-sequence 1))
-          (lambda ()
-            (magnus-coord-store-publish
-             project "writer" "Writer" "bad/kind"
-             (magnus-coord-store-tests--payload "x") :writer-sequence 1))
-          (lambda ()
-            (magnus-coord-store-publish
-             project "writer" "Writer" "log.append" ["not" "an" "object"]
-             :writer-sequence 1))
-          (lambda ()
-            (magnus-coord-store-publish
-             project "writer" "Writer" "log.append"
-             (magnus-coord-store-tests--payload "x")
-             :writer-sequence 1
-             :created-at "2026-99-99T99:99:99.000000Z"))
-          (lambda ()
-            (magnus-coord-store-publish
-             project "writer" "Writer" "log.append"
-             (magnus-coord-store-tests--payload "missing sequence")))
-          (lambda ()
-            (magnus-coord-store-publish
-             project "writer" "Writer" "log.append"
-             (magnus-coord-store-tests--payload "zero sequence")
-             :writer-sequence 0))))
-      (should-error (funcall operation)
-                    :type 'magnus-coord-store-invalid-event))
-    (should-not
-     (file-exists-p
-      (expand-file-name magnus-coord-store-directory-name project)))))
-
 (ert-deftest magnus-coord-store-snapshot-is-deterministic-and-read-once ()
   "A snapshot captures sorted paths, reads each once, and orders by metadata."
   (magnus-coord-store-tests--with-project
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer-z" "Zed" "log.append"
      (magnus-coord-store-tests--payload "later")
      :event-id "event-z" :writer-sequence 1
      :created-at "2026-08-04T02:00:00.000000Z")
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer-b" "Bee" "log.append"
      (magnus-coord-store-tests--payload "tie b")
      :event-id "event-b" :writer-sequence 1
      :created-at "2026-08-04T01:00:00.000000Z")
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer-a" "Aye" "log.append"
      (magnus-coord-store-tests--payload "tie a")
      :event-id "event-a" :writer-sequence 1
@@ -238,12 +135,12 @@
 (ert-deftest magnus-coord-store-malformed-entry-does-not-hide-siblings ()
   "Malformed JSON and path debris are isolated from valid sibling events."
   (magnus-coord-store-tests--with-project
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer" "Writer" "log.append"
      (magnus-coord-store-tests--payload "first")
      :event-id "good-a" :writer-sequence 1
      :created-at "2026-08-04T01:00:00.000000Z")
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer" "Writer" "log.append"
      (magnus-coord-store-tests--payload "second")
      :event-id "good-b" :writer-sequence 2
@@ -269,7 +166,7 @@
   "Symlinks, directories, and oversized files are issues, not content reads."
   (magnus-coord-store-tests--with-project
     (let ((magnus-coord-store-max-event-bytes 512))
-      (magnus-coord-store-publish
+      (magnus-coord-store-tests--write-event
        project "writer" "Writer" "log.append"
        (magnus-coord-store-tests--payload "good")
        :event-id "good" :writer-sequence 1
@@ -432,7 +329,7 @@
       (make-directory writer t)
       (dolist (directory (list root writers writer))
         (set-file-modes directory #o777))
-      (magnus-coord-store-publish
+      (magnus-coord-store-tests--write-event
        project "writer" "Writer" "log.append"
        (magnus-coord-store-tests--payload "private")
        :event-id "private-event"
@@ -464,17 +361,17 @@
 (ert-deftest magnus-coord-store-orders-by-writer-sequence-not-wall-clock ()
   "Backward wall-clock movement cannot reverse one writer's causal order."
   (magnus-coord-store-tests--with-project
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer-a" "Aye" "active.set"
      (magnus-coord-store-tests--payload "first")
      :event-id "first" :writer-sequence 1
      :created-at "2026-08-04T03:00:00.000000Z")
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer-a" "Aye" "active.clear"
      (magnus-coord-store-tests--payload "second")
      :event-id "second" :writer-sequence 2
      :created-at "2026-08-04T01:00:00.000000Z")
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer-b" "Bee" "log.append"
      (magnus-coord-store-tests--payload "other writer")
      :event-id "other" :writer-sequence 1
@@ -489,12 +386,12 @@
 (ert-deftest magnus-coord-store-surfaces-writer-sequence-ambiguity ()
   "Two IDs cannot silently claim the same writer-local causal position."
   (magnus-coord-store-tests--with-project
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer" "Writer" "active.set"
      (magnus-coord-store-tests--payload "first by path")
      :event-id "event-a" :writer-sequence 7
      :created-at "2026-08-04T03:00:00.000000Z")
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer" "Writer" "active.clear"
      (magnus-coord-store-tests--payload "ambiguous")
      :event-id "event-b" :writer-sequence 7
@@ -515,7 +412,7 @@
 (ert-deftest magnus-coord-store-revision-is-stable-and-does-no-event-io ()
   "An unchanged revision lists only writers/ and performs no event operations."
   (magnus-coord-store-tests--with-project
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer-a" "Aye" "log.append"
      (magnus-coord-store-tests--payload "a")
      :event-id "event-a" :writer-sequence 1
@@ -570,7 +467,7 @@
                          (magnus-coord-store-revision project))))
       (should-not (equal empty with-writer))
       (let* ((event
-              (magnus-coord-store-publish
+              (magnus-coord-store-tests--write-event
                project "writer-a" "Aye" "log.append"
                (magnus-coord-store-tests--payload "event")
                :event-id "event" :writer-sequence 1
@@ -587,7 +484,7 @@
           (should (equal with-event
                          (magnus-coord-store-revision-result-token
                           (magnus-coord-store-revision project)))))
-        (delete-file (magnus-coord-store-event-path event))
+        (delete-file event)
         (should-not
          (equal with-event
                 (magnus-coord-store-revision-result-token
@@ -623,13 +520,13 @@
   "Pruning deletes selected snapshot evidence but no later or malformed file."
   (magnus-coord-store-tests--with-project
     (let* ((keep
-            (magnus-coord-store-publish
+            (magnus-coord-store-tests--write-event
              project "writer" "Writer" "log.append"
              (magnus-coord-store-tests--payload "keep")
              :event-id "keep" :writer-sequence 1
              :created-at "2026-08-04T01:00:00.000000Z"))
            (remove
-            (magnus-coord-store-publish
+            (magnus-coord-store-tests--write-event
              project "writer" "Writer" "log.append"
              (magnus-coord-store-tests--payload "remove")
              :event-id "remove" :writer-sequence 2
@@ -639,7 +536,7 @@
       (magnus-coord-store-tests--write-bytes bad "not json")
       (let ((snapshot (magnus-coord-store-snapshot project)))
         (let ((later
-               (magnus-coord-store-publish
+               (magnus-coord-store-tests--write-event
                 project "writer" "Writer" "log.append"
                 (magnus-coord-store-tests--payload "later")
                 :event-id "later" :writer-sequence 3
@@ -657,25 +554,24 @@
             (should (equal (mapcar #'magnus-coord-store-issue-code
                                    (magnus-coord-store-prune-result-issues result))
                            '(invalid-json)))
-            (should (file-exists-p (magnus-coord-store-event-path keep)))
-            (should-not (file-exists-p
-                         (magnus-coord-store-event-path remove)))
-            (should (file-exists-p (magnus-coord-store-event-path later)))
+            (should (file-exists-p keep))
+            (should-not (file-exists-p remove))
+            (should (file-exists-p later))
             (should (file-exists-p bad))))))))
 
 (ert-deftest magnus-coord-store-prune-refuses-replaced-or-mutated-events ()
   "Identity and content checks preserve evidence changed since the snapshot."
   (magnus-coord-store-tests--with-project
     (let* ((original
-            (magnus-coord-store-publish
+            (magnus-coord-store-tests--write-event
              project "writer" "Writer" "log.append"
              (magnus-coord-store-tests--payload "original")
              :event-id "replaced" :writer-sequence 1
              :created-at "2026-08-04T01:00:00.000000Z"))
            (snapshot (magnus-coord-store-snapshot project))
-           (path (magnus-coord-store-event-path original)))
+           (path original))
       (delete-file path)
-      (magnus-coord-store-publish
+      (magnus-coord-store-tests--write-event
        project "writer" "Writer" "log.append"
        (magnus-coord-store-tests--payload "original")
        :event-id "replaced" :writer-sequence 1
@@ -687,13 +583,13 @@
                     'prune-identity-mismatch))
         (should (file-exists-p path)))
       (let* ((mutated
-              (magnus-coord-store-publish
+              (magnus-coord-store-tests--write-event
                project "writer" "Writer" "log.append"
                (magnus-coord-store-tests--payload "before")
                :event-id "mutated" :writer-sequence 2
                :created-at "2026-08-04T02:00:00.000000Z"))
              (mutated-snapshot (magnus-coord-store-snapshot project))
-             (mutated-path (magnus-coord-store-event-path mutated)))
+             (mutated-path mutated))
         (magnus-coord-store-tests--write-bytes mutated-path "changed in place")
         (let ((result
                (magnus-coord-store-prune
@@ -707,13 +603,13 @@
   "Pruning never follows a replacement symlink or trusts a forged event path."
   (magnus-coord-store-tests--with-project
     (let* ((event
-            (magnus-coord-store-publish
+            (magnus-coord-store-tests--write-event
              project "writer" "Writer" "log.append"
              (magnus-coord-store-tests--payload "event")
              :event-id "event" :writer-sequence 1
              :created-at "2026-08-04T01:00:00.000000Z"))
            (snapshot (magnus-coord-store-snapshot project))
-           (path (magnus-coord-store-event-path event))
+           (path event)
            (outside (expand-file-name "outside" project)))
       (magnus-coord-store-tests--write-bytes outside "outside")
       (delete-file path)
@@ -725,7 +621,7 @@
         (should (file-symlink-p path))
         (should (file-exists-p outside))))
     (let* ((event
-            (magnus-coord-store-publish
+            (magnus-coord-store-tests--write-event
              project "other-writer" "Other" "log.append"
              (magnus-coord-store-tests--payload "other")
              :event-id "other" :writer-sequence 1
@@ -741,13 +637,13 @@
                       (mapcar #'magnus-coord-store-issue-code
                               (magnus-coord-store-prune-result-issues result))))
         (should (file-exists-p outside))
-        (should (file-exists-p (magnus-coord-store-event-path event)))))))
+        (should (file-exists-p event))))))
 
 (ert-deftest magnus-coord-store-prune-protects-conflicted-evidence ()
   "Pruning cannot discard the deterministic representative of an ambiguity."
   (magnus-coord-store-tests--with-project
     (dolist (id '("event-a" "event-b"))
-      (magnus-coord-store-publish
+      (magnus-coord-store-tests--write-event
        project "writer" "Writer" "log.append"
        (magnus-coord-store-tests--payload id)
        :event-id id :writer-sequence 1
@@ -774,7 +670,7 @@
   (magnus-coord-store-tests--with-project
     (dolist (description '(("one" 1) ("two" 2) ("three" 3)))
       (pcase-let ((`(,id ,sequence) description))
-        (magnus-coord-store-publish
+        (magnus-coord-store-tests--write-event
          project "writer" "Writer" "knowledge.put"
          (magnus-coord-store-tests--payload id)
          :event-id id :writer-sequence sequence
@@ -795,18 +691,18 @@
 (ert-deftest magnus-coord-store-conflict-claims-close-transitively ()
   "A rejected duplicate ID still reserves its independent causal slot."
   (magnus-coord-store-tests--with-project
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer-a" "Aye" "log.append"
      (magnus-coord-store-tests--payload "accepted")
      :event-id "shared-id" :writer-sequence 1
      :created-at "2026-08-04T01:00:00.000000Z")
     ;; This loses the global-ID claim but must still reserve writer-b/7.
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer-b" "Bee" "log.append"
      (magnus-coord-store-tests--payload "id conflict")
      :event-id "shared-id" :writer-sequence 7
      :created-at "2026-08-04T02:00:00.000000Z")
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer-b" "Bee" "log.append"
      (magnus-coord-store-tests--payload "sequence conflict")
      :event-id "third-id" :writer-sequence 7
@@ -834,19 +730,19 @@
 (ert-deftest magnus-coord-store-emits-every-applicable-conflict-dimension ()
   "One event conflicting by global ID and writer sequence reports both."
   (magnus-coord-store-tests--with-project
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer-a" "Aye" "log.append"
      (magnus-coord-store-tests--payload "id owner")
      :event-id "shared-z" :writer-sequence 1
      :created-at "2026-08-04T01:00:00.000000Z")
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer-b" "Bee" "log.append"
      (magnus-coord-store-tests--payload "sequence owner")
      :event-id "a-sequence-owner" :writer-sequence 9
      :created-at "2026-08-04T02:00:00.000000Z")
     ;; This path sorts after writer-b/a-sequence-owner, so both dimensions are
     ;; already claimed when it is examined.
-    (magnus-coord-store-publish
+    (magnus-coord-store-tests--write-event
      project "writer-b" "Bee" "log.append"
      (magnus-coord-store-tests--payload "both conflicts")
      :event-id "shared-z" :writer-sequence 9
@@ -869,26 +765,26 @@
   "A sequence-1 failure leaves sequence 2 untouched and explicitly deferred."
   (magnus-coord-store-tests--with-project
     (let* ((first
-            (magnus-coord-store-publish
+            (magnus-coord-store-tests--write-event
              project "writer" "Writer" "knowledge.put"
              (magnus-coord-store-tests--payload "first")
              :event-id "first" :writer-sequence 1
              :created-at "2026-08-04T01:00:00.000000Z"))
            (second
-            (magnus-coord-store-publish
+            (magnus-coord-store-tests--write-event
              project "writer" "Writer" "knowledge.put"
              (magnus-coord-store-tests--payload "second")
              :event-id "second" :writer-sequence 2
              :created-at "2026-08-04T02:00:00.000000Z"))
            (snapshot (magnus-coord-store-snapshot project))
-           (first-path (magnus-coord-store-event-path first))
-           (second-path (magnus-coord-store-event-path second))
+           (first-path first)
+           (second-path second)
            (original-read (symbol-function 'insert-file-contents-literally))
            reads
            result)
       ;; Recreate identical bytes at the first path with a new inode.
       (delete-file first-path)
-      (magnus-coord-store-publish
+      (magnus-coord-store-tests--write-event
        project "writer" "Writer" "knowledge.put"
        (magnus-coord-store-tests--payload "first")
        :event-id "first" :writer-sequence 1

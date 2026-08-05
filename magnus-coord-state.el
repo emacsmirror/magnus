@@ -582,12 +582,6 @@ Permit the empty string only when EMPTY-OK is non-nil."
                        (magnus-coord-state-log-record-message entry)))))
     (buffer-string)))
 
-(defun magnus-coord-state-projection-path (state)
-  "Return the generated projection path for STATE."
-  (expand-file-name "current.md"
-                    (magnus-coord-store-directory
-                     (magnus-coord-state-project-directory state))))
-
 ;;;###autoload
 (defun magnus-coord-state-write-projection (state)
   "Atomically write a private `.magnus-coord/current.md' for STATE.

@@ -14,9 +14,9 @@
 ;; to; findings that cannot be attached precisely fall back to their file or
 ;; to a general findings section.
 ;;
-;; The durable review domain lives in magnus-review.el.  The small adapter
-;; section below deliberately isolates that module's object and result-file
-;; API from the reader and makes partially migrated persisted reviews usable.
+;; The durable review domain lives in magnus-review.el.  The reader accepts
+;; only its canonical review records and the canonical structured result
+;; envelope published by magnus-review-controller.el.
 
 ;;; Code:
 
@@ -31,163 +31,11 @@
 
 (defvar magnus-review-max-evidence-bytes)
 
-;; Review-domain accessors.  Keeping these declarations together makes the
-;; boundary between the durable model and this presentation module explicit.
-(declare-function magnus-review-id "magnus-review")
-(declare-function magnus-review-project-root "magnus-review")
-(declare-function magnus-review-author-name "magnus-review")
-(declare-function magnus-review-reviewer-name "magnus-review")
-(declare-function magnus-review-reviewer-provider "magnus-review")
-(declare-function magnus-review-model "magnus-review")
-(declare-function magnus-review-effort "magnus-review")
-(declare-function magnus-review-task "magnus-review")
-(declare-function magnus-review-rounds "magnus-review")
-(declare-function magnus-review-latest-round "magnus-review")
-(declare-function magnus-review-round-number "magnus-review")
-(declare-function magnus-review-round-base-oid "magnus-review")
-(declare-function magnus-review-round-head-oid "magnus-review")
-(declare-function magnus-review-round-verdict "magnus-review")
-(declare-function magnus-review-round-result-path "magnus-review")
-(declare-function magnus-review-round-patch-path "magnus-review")
-(declare-function magnus-review-round-name-status-path "magnus-review")
-(declare-function magnus-review-mark-read "magnus-review")
-
-;;; Domain adapter
-
-(defun magnus-review-ui--map-value (object keys)
-  "Return the first value for KEYS found in map-like OBJECT."
-  (seq-some
-   (lambda (key)
-     (cond
-      ((hash-table-p object)
-       (or (gethash key object)
-           (gethash (substring (symbol-name key) 1) object)))
-      ((and (listp object) (keywordp (car object)))
-       (plist-get object key))
-      ((listp object)
-       (or (alist-get key object)
-           (alist-get (intern (substring (symbol-name key) 1)) object)))))
-   keys))
-
-(defun magnus-review-ui--field (object accessors keys)
-  "Read a field from OBJECT using ACCESSORS, then map-like KEYS.
-
-Undefined accessors and accessors for a different persisted object shape are
-ignored.  This tolerance is intentionally confined to this adapter block."
-  (or (seq-some
-       (lambda (accessor)
-         (when (fboundp accessor)
-           (condition-case err
-               (funcall accessor object)
-             (error
-              (message "Magnus: review reader accessor %s failed: %s"
-                       accessor (error-message-string err))
-              nil))))
-       accessors)
-      (magnus-review-ui--map-value object keys)))
-
-(defun magnus-review-ui--review-id (review)
-  "Return REVIEW's stable identifier."
-  (magnus-review-ui--field review
-                           '(magnus-review-id)
-                           '(:id :review_id)))
-
-(defun magnus-review-ui--project-root (review)
-  "Return REVIEW's source repository root."
-  (magnus-review-ui--field review
-                           '(magnus-review-project-root)
-                           '(:project_root :project-root :directory)))
-
-(defun magnus-review-ui--author-name (review)
-  "Return REVIEW's author name."
-  (magnus-review-ui--field review
-                           '(magnus-review-author-name)
-                           '(:author_name :author-name :author)))
-
-(defun magnus-review-ui--reviewer-name (review)
-  "Return REVIEW's reviewer name."
-  (magnus-review-ui--field review
-                           '(magnus-review-reviewer-name)
-                           '(:reviewer_name :reviewer-name :reviewer)))
-
-(defun magnus-review-ui--reviewer-provider (review)
-  "Return REVIEW's reviewer provider."
-  (magnus-review-ui--field review
-                           '(magnus-review-reviewer-provider)
-                           '(:reviewer_provider :reviewer-provider :provider)))
-
-(defun magnus-review-ui--model (review)
-  "Return REVIEW's model."
-  (magnus-review-ui--field review '(magnus-review-model) '(:model)))
-
-(defun magnus-review-ui--effort (review)
-  "Return REVIEW's reasoning effort."
-  (magnus-review-ui--field review '(magnus-review-effort) '(:effort)))
-
-(defun magnus-review-ui--task (review)
-  "Return REVIEW's task description."
-  (magnus-review-ui--field review '(magnus-review-task) '(:task)))
-
-(defun magnus-review-ui--rounds (review)
-  "Return REVIEW's rounds in chronological order."
-  (let ((rounds (magnus-review-ui--field review
-                                         '(magnus-review-rounds)
-                                         '(:rounds))))
-    (cond ((vectorp rounds) (append rounds nil))
-          ((listp rounds) rounds)
-          (t nil))))
-
-(defun magnus-review-ui--round-number (round)
-  "Return ROUND's ordinal number."
-  (magnus-review-ui--field round
-                           '(magnus-review-round-number)
-                           '(:number :round :round_number)))
-
-(defun magnus-review-ui--round-base (round)
-  "Return ROUND's base object ID."
-  (magnus-review-ui--field round
-                           '(magnus-review-round-base-oid)
-                           '(:base_oid :base-oid :base)))
-
-(defun magnus-review-ui--round-head (round)
-  "Return ROUND's head object ID."
-  (magnus-review-ui--field round
-                           '(magnus-review-round-head-oid)
-                           '(:head_oid :head-oid :head)))
-
-(defun magnus-review-ui--latest-round (review)
-  "Return the latest round in REVIEW."
-  (or (when (fboundp 'magnus-review-latest-round)
-        (condition-case err
-            (magnus-review-latest-round review)
-          (error
-           (message "Magnus: review reader could not select latest round: %s"
-                    (error-message-string err))
-           nil)))
-      (car (last (magnus-review-ui--rounds review)))))
-
-(defun magnus-review-ui--result-path (review round)
-  "Return the canonical structured-result path for REVIEW and ROUND."
-  (when (fboundp 'magnus-review-round-result-path)
-    ;; The domain helper takes REVIEW and ROUND.  The one-argument fallback
-    ;; keeps persisted prototypes readable while the domain is being migrated.
-    (or (condition-case err
-            (magnus-review-round-result-path review round)
-          (wrong-number-of-arguments nil)
-          (error
-           (message "Magnus: review result path lookup failed: %s"
-                    (error-message-string err))
-           nil))
-        (condition-case err
-            (funcall #'magnus-review-round-result-path round)
-          (error
-           (message "Magnus: legacy review result path lookup failed: %s"
-                    (error-message-string err))
-           nil)))))
+;;; Canonical result artifacts
 
 (defun magnus-review-ui--read-result (review round)
   "Read REVIEW ROUND's canonical structured JSON result."
-  (when-let ((path (magnus-review-ui--result-path review round)))
+  (let ((path (magnus-review-round-result-path review round)))
     (when (file-readable-p path)
       (condition-case err
           (with-temp-buffer
@@ -200,36 +48,24 @@ ignored.  This tolerance is intentionally confined to this adapter block."
          (list :magnus_review_ui_error (error-message-string err)))))))
 
 (defun magnus-review-ui--result-body (result)
-  "Return the review payload within RESULT."
-  (or (magnus-review-ui--map-value result '(:result :review)) result))
+  "Return the canonical review payload within RESULT's envelope."
+  (plist-get result :result))
 
-(defun magnus-review-ui--result-field (result keys)
-  "Return the first value for KEYS in structured RESULT."
-  (magnus-review-ui--map-value (magnus-review-ui--result-body result) keys))
+(defun magnus-review-ui--result-field (result key)
+  "Return KEY from the canonical structured RESULT envelope."
+  (plist-get (magnus-review-ui--result-body result) key))
 
 (defun magnus-review-ui--summary (result)
   "Return the summary from structured RESULT."
-  (magnus-review-ui--result-field result '(:summary :overview)))
+  (magnus-review-ui--result-field result :summary))
 
 (defun magnus-review-ui--result-error (result)
   "Return a structured-result loading error from RESULT, if present."
-  (magnus-review-ui--map-value result '(:magnus_review_ui_error)))
-
-(defun magnus-review-ui--verdict (round result)
-  "Return ROUND's verdict, falling back to structured RESULT."
-  (or (magnus-review-ui--field round
-                               '(magnus-review-round-verdict)
-                               '(:verdict))
-      (magnus-review-ui--result-field
-       result '(:verdict :proposed_verdict :proposed-verdict))))
+  (plist-get result :magnus_review_ui_error))
 
 (defun magnus-review-ui--findings (result)
   "Return the findings list from structured RESULT."
-  (let ((findings (magnus-review-ui--result-field
-                   result '(:findings :comments :notes))))
-    (cond ((vectorp findings) (append findings nil))
-          ((listp findings) findings)
-          (t nil))))
+  (magnus-review-ui--result-field result :findings))
 
 ;;; Customization and faces
 
@@ -324,7 +160,6 @@ The review transient should set this to its dispatcher."
 (defvar-local magnus-review-ui--round nil)
 (defvar-local magnus-review-ui--result nil)
 (defvar-local magnus-review-ui--diff-error nil)
-(defvar-local magnus-review-ui--evidence-source nil)
 (defvar-local magnus-review-ui--marked-read-rounds nil)
 
 (defvar magnus-review-ui-mode-map
@@ -448,32 +283,13 @@ Signal an error containing Git's diagnostic when the command fails."
                     records))))))
     (nreverse records)))
 
-(defun magnus-review-ui--name-status-live (root base head)
-  "Return live path metadata for BASE..HEAD in ROOT."
-  (magnus-review-ui--parse-name-status
-   (magnus-review-ui--git
-    root "diff" "--no-ext-diff" "--no-color"
-    "--find-renames" "--name-status" "-z" base head "--")))
-
-(defun magnus-review-ui--artifact-path (accessor review round)
-  "Call evidence path ACCESSOR for REVIEW and ROUND when available."
-  (when (fboundp accessor)
-    (funcall accessor review round)))
-
-(defun magnus-review-ui--artifact-present-p (path)
-  "Return non-nil when PATH exists, including as a broken symlink."
-  (and path (or (file-exists-p path) (file-symlink-p path))))
-
 (defun magnus-review-ui--artifact-bytes (path kind)
   "Read exact bytes from regular, non-symlink evidence PATH named KIND."
   (when (or (file-symlink-p path) (not (file-regular-p path)))
     (error "Review %s evidence is unavailable or unsafe: %s" kind path))
   (let* ((attributes (file-attributes path 'string))
          (size (file-attribute-size attributes))
-         (limit (if (and (boundp 'magnus-review-max-evidence-bytes)
-                         (integerp magnus-review-max-evidence-bytes))
-                    magnus-review-max-evidence-bytes
-                  (* 50 1024 1024))))
+         (limit magnus-review-max-evidence-bytes))
     (when (> size limit)
       (error "Review %s evidence exceeds the configured size limit" kind))
     (with-temp-buffer
@@ -483,33 +299,18 @@ Signal an error containing Git's diagnostic when the command fails."
       (buffer-string))))
 
 (defun magnus-review-ui--persisted-evidence (review round)
-  "Return persisted patch and name-status text for REVIEW ROUND.
-
-Return nil when both artifacts are absent, as with reviews created before
-durable evidence was introduced.  A partial or unsafe pair is corruption and
-signals instead of silently substituting mutable repository state."
-  (let* ((patch-path
-          (magnus-review-ui--artifact-path
-           'magnus-review-round-patch-path review round))
-         (name-status-path
-          (magnus-review-ui--artifact-path
-           'magnus-review-round-name-status-path review round))
-         (patch-present (magnus-review-ui--artifact-present-p patch-path))
-         (name-status-present
-          (magnus-review-ui--artifact-present-p name-status-path)))
-    (cond
-     ((and patch-present name-status-present)
-      (list
-       :patch
-       (decode-coding-string
-        (magnus-review-ui--artifact-bytes patch-path "patch") 'utf-8-unix)
-       :name-status
-       (decode-coding-string
-        (magnus-review-ui--artifact-bytes name-status-path "name-status")
-        'utf-8-unix)))
-     ((or patch-present name-status-present)
-      (error "Review has an incomplete persisted evidence pair"))
-     (t nil))))
+  "Return canonical persisted patch and name-status text for REVIEW ROUND."
+  (list
+   :patch
+   (decode-coding-string
+    (magnus-review-ui--artifact-bytes
+     (magnus-review-round-patch-path review round) "patch")
+    'utf-8-unix)
+   :name-status
+   (decode-coding-string
+    (magnus-review-ui--artifact-bytes
+     (magnus-review-round-name-status-path review round) "name-status")
+    'utf-8-unix)))
 
 (defun magnus-review-ui--path-from-header (line prefix)
   "Extract and normalize a path from LINE beginning with PREFIX."
@@ -648,14 +449,8 @@ signals instead of silently substituting mutable repository state."
 (defun magnus-review-ui--validate-result-scope (round result)
   "Require any scope object IDs in RESULT to agree with ROUND."
   (unless (magnus-review-ui--result-error result)
-    (dolist (spec `((,(magnus-review-ui--round-base round)
-                      (:base_oid :base-oid :reviewed_base_oid
-                       :reviewed-base-oid)
-                      "base")
-                    (,(magnus-review-ui--round-head round)
-                      (:head_oid :head-oid :reviewed_head_oid
-                       :reviewed-head-oid)
-                      "head")))
+    (dolist (spec `((,(magnus-review-round-base-oid round) :base_oid "base")
+                    (,(magnus-review-round-head-oid round) :head_oid "head")))
       (let ((expected (nth 0 spec))
             (actual (magnus-review-ui--result-field result (nth 1 spec)))
             (kind (nth 2 spec)))
@@ -667,28 +462,17 @@ signals instead of silently substituting mutable repository state."
 
 (defun magnus-review-ui--load-diff (review round)
   "Load and parse REVIEW ROUND's immutable base..head diff."
-  (let ((root (magnus-review-ui--project-root review))
-        (base (magnus-review-ui--round-base round))
-        (head (magnus-review-ui--round-head round)))
+  (let ((base (magnus-review-round-base-oid round))
+        (head (magnus-review-round-head-oid round)))
     (unless (magnus-review-ui--valid-oid-p base)
       (error "Review round has no resolved base object ID"))
     (unless (magnus-review-ui--valid-oid-p head)
       (error "Review round has no resolved head object ID"))
     (magnus-review-ui--validate-result-scope round magnus-review-ui--result)
-    (if-let ((evidence (magnus-review-ui--persisted-evidence review round)))
-        (progn
-          (setq magnus-review-ui--evidence-source 'persisted)
-          (magnus-review-ui--parse-evidence
-           (plist-get evidence :patch)
-           (plist-get evidence :name-status)))
-      ;; Compatibility path for reviews created before durable round evidence.
-      ;; New reviews must never reach this branch.
-      (setq magnus-review-ui--evidence-source 'git)
-      (let ((statuses (magnus-review-ui--name-status-live root base head))
-            (patch
-             (apply #'magnus-review-ui--git root
-                    (magnus-review-canonical-patch-arguments base head))))
-        (magnus-review-ui--parse-diff patch statuses)))))
+    (let ((evidence (magnus-review-ui--persisted-evidence review round)))
+      (magnus-review-ui--parse-evidence
+       (plist-get evidence :patch)
+       (plist-get evidence :name-status)))))
 
 ;;; Finding assignment
 
@@ -708,26 +492,20 @@ signals instead of silently substituting mutable repository state."
    collect
    (magnus-review-ui--make-finding
     :raw raw
-    :id (or (magnus-review-ui--map-value raw '(:id :finding_id :finding-id))
+    :id (or (plist-get raw :id)
             (format "F%d" index))
-    :severity (or (magnus-review-ui--map-value raw '(:severity :priority))
-                  "note")
-    :kind (magnus-review-ui--map-value raw '(:kind :type))
+    :severity (or (plist-get raw :severity) "note")
+    :kind (plist-get raw :kind)
     :path (magnus-review-ui--normalize-path
-           (magnus-review-ui--map-value raw '(:path :file :filename)))
-    :line (magnus-review-ui--integer
-           (magnus-review-ui--map-value
-            raw '(:line :head_line :head-line :start_line :start-line)))
+           (plist-get raw :path))
+    :line (magnus-review-ui--integer (plist-get raw :head_line))
     :end-line (magnus-review-ui--integer
-               (magnus-review-ui--map-value
-                raw '(:end_line :end-line :head_end_line :head-end-line)))
-    :side (or (magnus-review-ui--map-value raw '(:side)) "head")
-    :title (or (magnus-review-ui--map-value raw '(:title :subject))
+               (plist-get raw :end_line))
+    :side "head"
+    :title (or (plist-get raw :title)
                "Untitled finding")
-    :evidence (magnus-review-ui--map-value
-               raw '(:evidence :body :explanation :detail))
-    :recommendation (magnus-review-ui--map-value
-                     raw '(:recommendation :suggestion :fix)))))
+    :evidence (plist-get raw :explanation)
+    :recommendation (plist-get raw :suggestion))))
 
 (defun magnus-review-ui--file-aliases (file)
   "Return all paths identifying FILE."
@@ -812,20 +590,20 @@ Return a plist containing equal-tested hash tables under `:inline' and
   "Insert the current review header, including scope and FILES count."
   (let* ((review magnus-review-ui--review)
          (round magnus-review-ui--round)
-         (rounds (magnus-review-ui--rounds review))
+         (rounds (magnus-review-rounds review))
          (author (magnus-review-ui--display-value
-                  (magnus-review-ui--author-name review) "unknown author"))
+                  (magnus-review-author-name review) "unknown author"))
          (reviewer (magnus-review-ui--display-value
-                    (magnus-review-ui--reviewer-name review) "unassigned"))
+                    (magnus-review-reviewer-name review) "unassigned"))
          (provider (magnus-review-ui--display-value
-                    (magnus-review-ui--reviewer-provider review) "provider"))
+                    (magnus-review-reviewer-provider review) "provider"))
          (model (magnus-review-ui--display-value
-                 (magnus-review-ui--model review) "default model"))
+                 (magnus-review-model review) "default model"))
          (effort (magnus-review-ui--display-value
-                  (magnus-review-ui--effort review) "default effort"))
-         (number (or (magnus-review-ui--round-number round) "?"))
+                  (magnus-review-effort review) "default effort"))
+         (number (or (magnus-review-round-number round) "?"))
          (verdict (magnus-review-ui--display-value
-                   (magnus-review-ui--verdict round magnus-review-ui--result)
+                   (magnus-review-round-verdict round)
                    "pending")))
     (insert (propertize (format "Review of %s\n" author)
                         'face 'magnus-review-ui-title))
@@ -836,19 +614,16 @@ Return a plist containing equal-tested hash tables under `:inline' and
     (insert (propertize
              (format "Scope: %s..%s    Files: %d    Evidence: %s    Verdict: "
                      (magnus-review-ui--short-oid
-                      (magnus-review-ui--round-base round))
+                      (magnus-review-round-base-oid round))
                      (magnus-review-ui--short-oid
-                      (magnus-review-ui--round-head round))
+                      (magnus-review-round-head-oid round))
                      (length files)
-                     (pcase magnus-review-ui--evidence-source
-                       ('persisted "archived")
-                       ('git "Git")
-                       (_ "unavailable")))
+                     "archived")
              'face 'magnus-review-ui-metadata))
     (insert (propertize (upcase verdict)
                         'face (magnus-review-ui--verdict-face verdict)))
     (insert "\n")
-    (when-let ((task (magnus-review-ui--task review)))
+    (when-let ((task (magnus-review-task review)))
       (insert (propertize (format "Task: %s\n" task)
                           'face 'magnus-review-ui-metadata)))
     (insert "\n")))
@@ -861,50 +636,24 @@ Return a plist containing equal-tested hash tables under `:inline' and
       (insert (if face (propertize line 'face face) line))
       (insert "\n"))))
 
-(defun magnus-review-ui--result-items (keys)
-  "Return structured result value under KEYS as a list of items."
-  (let ((value (magnus-review-ui--result-field
-                magnus-review-ui--result keys)))
-    (cond ((null value) nil)
-          ((vectorp value) (append value nil))
-          ;; A JSON object is a plist; a JSON array is already a list.
-          ((and (listp value) (keywordp (car value))) (list value))
-          ((listp value) value)
-          (t (list value)))))
-
 (defun magnus-review-ui--format-note-item (item)
   "Return compact human-readable text for structured note ITEM."
   (or (magnus-review-ui--string item)
-      (when (or (hash-table-p item) (listp item))
-        (let* ((id (magnus-review-ui--map-value
-                    item '(:id :finding_id :finding-id)))
-               (title (magnus-review-ui--map-value
-                       item '(:title :name :area :command :test)))
-               (status (magnus-review-ui--map-value
-                        item '(:status :disposition :result)))
-               (detail (magnus-review-ui--map-value
-                        item '(:detail :reason :note :summary :explanation)))
-               (parts (delq nil
-                            (mapcar #'magnus-review-ui--string
-                                    (list id title status)))))
-          (concat (if parts (string-join parts ": ") "Review note")
-                  (if detail
-                      (format " — %s"
-                              (magnus-review-ui--display-value detail ""))
-                    ""))))
+      (let* ((id (plist-get item :id))
+             (status (plist-get item :disposition))
+             (detail (plist-get item :explanation))
+             (label (string-join (delq nil (list id status)) ": ")))
+        (concat (if (string-empty-p label) "Review note" label)
+                (if detail (format " — %s" detail) "")))
       "Review note"))
 
 (defun magnus-review-ui--insert-result-notes ()
   "Insert compact strengths, verification, and continuity notes."
-  (dolist (spec '(("Strengths" (:strengths))
-                  ("Coverage" (:coverage))
-                  ("Tests" (:tests :tests_run :tests-run))
-                  ("Limitations" (:limitations))
-                  ("Prior findings"
-                   (:prior_findings :prior-findings
-                    :prior_finding_dispositions
-                    :prior-finding-dispositions))))
-    (when-let ((items (magnus-review-ui--result-items (cadr spec))))
+  (dolist (spec '(("Strengths" :strengths)
+                  ("Tests" :tests)
+                  ("Prior findings" :prior_findings)))
+    (when-let ((items (magnus-review-ui--result-field
+                       magnus-review-ui--result (cadr spec))))
       (insert "  " (propertize (concat (car spec) ":") 'face 'bold) "\n")
       (dolist (item items)
         (insert "    • " (magnus-review-ui--format-note-item item) "\n")))))
@@ -1138,7 +887,7 @@ Return a plist containing equal-tested hash tables under `:inline' and
          (inline (plist-get assigned :inline))
          (file-findings (plist-get assigned :file))
          (general (plist-get assigned :general))
-         (id (or (magnus-review-ui--review-id magnus-review-ui--review)
+         (id (or (magnus-review-id magnus-review-ui--review)
                  "review")))
     (magit-insert-section (magnus-review-ui-root-section id)
       (magnus-review-ui--insert-header files)
@@ -1165,19 +914,19 @@ Return a plist containing equal-tested hash tables under `:inline' and
 (defun magnus-review-ui--select-round (review round)
   "Resolve ROUND, which may be an object or number, within REVIEW."
   (cond
-   ((null round) (magnus-review-ui--latest-round review))
+   ((null round) (magnus-review-latest-round review))
    ((integerp round)
     (seq-find (lambda (candidate)
-                (equal round (magnus-review-ui--round-number candidate)))
-              (magnus-review-ui--rounds review)))
+                (equal round (magnus-review-round-number candidate)))
+              (magnus-review-rounds review)))
    (t round)))
 
 (defun magnus-review-ui--buffer-name (review)
   "Return the reader buffer name for REVIEW."
   (let ((author (magnus-review-ui--display-value
-                 (magnus-review-ui--author-name review) "unknown"))
+                 (magnus-review-author-name review) "unknown"))
         (id (magnus-review-ui--display-value
-             (magnus-review-ui--review-id review) "review")))
+             (magnus-review-id review) "review")))
     (format "*magnus-review: %s [%s]*"
             author (substring id 0 (min 8 (length id))))))
 
@@ -1197,14 +946,14 @@ Magnus never manufactures a window layout."
           (magnus-review-ui-mode))
         (setq-local magnus-review-ui--review review)
         (setq-local magnus-review-ui--round selected)
-        (when-let ((root (magnus-review-ui--project-root review)))
+        (when-let ((root (magnus-review-project-root review)))
           (setq default-directory (file-name-as-directory root)))
         (magnus-review-ui-refresh))
       (pop-to-buffer buffer))))
 
 (defun magnus-review-ui--mark-read ()
   "Mark the displayed round read using the configured callback."
-  (let ((number (magnus-review-ui--round-number magnus-review-ui--round)))
+  (let ((number (magnus-review-round-number magnus-review-ui--round)))
     ;; A missing or corrupt structured result is an error view, not a read
     ;; review.  Preserve the unread indicator so Hrishi can return after the
     ;; controller repairs or retries the round.
@@ -1233,7 +982,6 @@ Magnus never manufactures a window layout."
   (setq magnus-review-ui--result
         (magnus-review-ui--read-result
          magnus-review-ui--review magnus-review-ui--round))
-  (setq magnus-review-ui--evidence-source nil)
   (let ((files
          (condition-case err
              (prog1 (magnus-review-ui--load-diff
@@ -1376,12 +1124,12 @@ object, ensuring that the displayed source and line number always agree."
   (if-let ((location (magnus-review-ui--location-at-point)))
       (condition-case err
           (let* ((root
-                  (magnus-review-ui--project-root magnus-review-ui--review))
+                  (magnus-review-project-root magnus-review-ui--review))
                  (side (plist-get location :side))
                  (oid (if (memq side '(base left old))
-                          (magnus-review-ui--round-base
+                          (magnus-review-round-base-oid
                            magnus-review-ui--round)
-                        (magnus-review-ui--round-head
+                        (magnus-review-round-head-oid
                          magnus-review-ui--round)))
                  (path (plist-get location :path))
                  (line (plist-get location :line))
@@ -1402,7 +1150,7 @@ object, ensuring that the displayed source and line number always agree."
             (path (or (plist-get location :current-path)
                       (plist-get location :path))))
       (let* ((root (file-name-as-directory
-                    (magnus-review-ui--project-root
+                    (magnus-review-project-root
                      magnus-review-ui--review)))
              (safe (magnus-review-ui--normalize-path path))
              (file (and safe (expand-file-name safe root))))
@@ -1419,18 +1167,18 @@ object, ensuring that the displayed source and line number always agree."
 
 (defun magnus-review-ui--move-round (delta)
   "Move DELTA rounds from the currently displayed review round."
-  (let* ((rounds (magnus-review-ui--rounds magnus-review-ui--review))
-         (number (magnus-review-ui--round-number magnus-review-ui--round))
+  (let* ((rounds (magnus-review-rounds magnus-review-ui--review))
+         (number (magnus-review-round-number magnus-review-ui--round))
          (position
           (cl-position number rounds :test #'equal
-                       :key #'magnus-review-ui--round-number))
+                       :key #'magnus-review-round-number))
          (target (and position (+ position delta))))
     (unless (and target (>= target 0) (< target (length rounds)))
       (user-error "No %s review round" (if (< delta 0) "previous" "next")))
     (setq magnus-review-ui--round (nth target rounds))
     (magnus-review-ui-refresh)
     (message "Review round %s"
-             (magnus-review-ui--round-number magnus-review-ui--round))))
+             (magnus-review-round-number magnus-review-ui--round))))
 
 (defun magnus-review-ui-previous-round ()
   "Display the previous round of the current review."

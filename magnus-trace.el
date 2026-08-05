@@ -436,26 +436,6 @@ is `thinking' or `response'.  Unmarked text is treated as response."
      ;; A writer may not have finished the final JSONL record yet.
      nil)))
 
-(defun magnus-trace--split-complete-lines (text)
-  "Split JSONL TEXT into complete lines and an incomplete trailing fragment.
-Return a cons whose car is the line list and whose cdr is the fragment.  A
-valid final JSON value is complete even when no newline has been written yet."
-  (let ((position 0)
-        lines)
-    (while (string-match "\n" text position)
-      (let ((line (substring text position (match-beginning 0))))
-        (unless (string-empty-p line)
-          (push line lines)))
-      (setq position (match-end 0)))
-    (let ((fragment (substring text position)))
-      (if (or (string-empty-p fragment)
-              (magnus-trace--complete-json-p fragment))
-          (progn
-            (unless (string-empty-p fragment)
-              (push fragment lines))
-            (cons (nreverse lines) ""))
-        (cons (nreverse lines) fragment)))))
-
 (defun magnus-trace--read-range (file start end)
   "Read FILE bytes from START through measured END."
   (let ((coding-system-for-read 'binary))
