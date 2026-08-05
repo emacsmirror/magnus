@@ -59,6 +59,35 @@ When AGENT is non-nil, include its pre-existing Active Work row."
     (puthash key started-at magnus-coord--session-start-times)
     key))
 
+(ert-deftest magnus-process-transaction-runtime-owner-is-first-writer-wins ()
+  (let* ((first-buffer (generate-new-buffer " *magnus-first-runtime*"))
+         (second-buffer (generate-new-buffer " *magnus-second-runtime*"))
+         (first-process
+          (make-pipe-process
+           :name (generate-new-buffer-name "magnus-first-runtime")
+           :buffer first-buffer :noquery t))
+         (second-process
+          (make-pipe-process
+           :name (generate-new-buffer-name "magnus-second-runtime")
+           :buffer second-buffer :noquery t))
+         (magnus-process--transaction-runtime-buffer (list nil)))
+    (unwind-protect
+        (progn
+          (magnus-process--record-transaction-runtime
+           first-buffer first-process)
+          (magnus-process--record-transaction-runtime
+           second-buffer second-process)
+          (should (eq (caar magnus-process--transaction-runtime-buffer)
+                      first-buffer))
+          (should (eq (cdar magnus-process--transaction-runtime-buffer)
+                      first-process)))
+      (dolist (process (list first-process second-process))
+        (when (process-live-p process)
+          (delete-process process)))
+      (dolist (buffer (list first-buffer second-buffer))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
 (ert-deftest magnus-process-create-rolls-back-registry-add-failure ()
   (magnus-test-process-lifecycle--isolated
     (let ((directory (make-temp-file "magnus-create-registry-" t))
@@ -397,6 +426,41 @@ When AGENT is non-nil, include its pre-existing Active Work row."
           (kill-buffer terminal))
         (delete-directory directory t)))))
 
+(ert-deftest magnus-process-runtime-rollback-preserves-same-buffer-replacement ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((instance
+            (magnus-instances-create default-directory "rollback-owner"))
+           (buffer (generate-new-buffer " *magnus-rollback-owner*"))
+           (old-process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-old-rollback-owner")
+             :buffer buffer :noquery t))
+           (replacement-process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-new-rollback-owner")
+             :buffer buffer :noquery t)))
+      (unwind-protect
+          (progn
+            (should (eq (get-buffer-process buffer) replacement-process))
+            (magnus-instances-update
+             instance :status 'running :buffer buffer)
+            (cl-letf (((symbol-function 'magnus-provider-call)
+                       (lambda (&rest _arguments)
+                         (ert-fail "stale owner must not stop the provider"))))
+              (magnus-process--discard-created-runtime
+               instance t (cons buffer old-process)))
+            (should-not (process-live-p old-process))
+            (should (process-live-p replacement-process))
+            (should (buffer-live-p buffer))
+            (should (eq (magnus-instance-buffer instance) buffer))
+            (should (eq (magnus-instance-status instance) 'running)))
+        (when (process-live-p old-process)
+          (delete-process old-process))
+        (when (process-live-p replacement-process)
+          (delete-process replacement-process))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
 (ert-deftest magnus-process-terminal-compatibility-wrappers-delegate ()
   (let (calls)
     (cl-letf (((symbol-function 'magnus-terminal-create-buffer)
@@ -500,10 +564,10 @@ When AGENT is non-nil, include its pre-existing Active Work row."
                 (lambda (&rest _arguments) nil))
                ((symbol-function 'magnus-process--watch-for-session)
                 (lambda (instance project before &optional candidate owner
-                                  _legacy-token)
+                                  _legacy-token owner-process)
                   (push (list :instance instance :directory project
                               :before before :candidate candidate
-                              :owner owner)
+                              :owner owner :owner-process owner-process)
                         watches))))
             (magnus-process--spawn first)
             (magnus-process--spawn second)
@@ -519,6 +583,8 @@ When AGENT is non-nil, include its pre-existing Active Work row."
                        directory candidate)))
                 (should-not (plist-get watch :before))
                 (should (eq owner (magnus-instance-buffer instance)))
+                (should (eq (plist-get watch :owner-process)
+                            (get-buffer-process owner)))
                 (should
                  (equal
                   (gethash owner commands)
@@ -569,7 +635,7 @@ When AGENT is non-nil, include its pre-existing Active Work row."
                 (lambda (&rest _arguments) nil))
                ((symbol-function 'magnus-process--watch-for-session)
                 (lambda (_instance _project _before &optional _candidate
-                                  _owner legacy-token)
+                                  _owner legacy-token _owner-process)
                   (setq first-token legacy-token))))
             (magnus-process--spawn first)
             (let ((err (should-error (magnus-process--spawn second)
@@ -654,6 +720,102 @@ When AGENT is non-nil, include its pre-existing Active Work row."
           (kill-buffer stale-owner))
         (when (buffer-live-p current-owner)
           (kill-buffer current-owner))
+        (delete-directory directory t)
+        (delete-directory home t)))))
+
+(ert-deftest magnus-process-session-watcher-rejects-same-buffer-replacement ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((directory (make-temp-file "magnus-replaced-session-" t))
+           (home (make-temp-file "magnus-replaced-home-" t))
+           (process-environment (copy-sequence process-environment))
+           (instance (magnus-instances-create directory "reused-claude-buffer"))
+           (buffer (generate-new-buffer " *shared-claude-session-owner*"))
+           (old-process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-old-session-owner")
+             :buffer buffer :noquery t))
+           replacement-process
+           (candidate "44444444-4444-4444-a444-444444444444")
+           cleaned)
+      (setenv "HOME" home)
+      (unwind-protect
+          (progn
+            (magnus-instances-update
+             instance :buffer buffer :status 'running)
+            (let ((path
+                   (magnus-process--session-candidate-path
+                    directory candidate)))
+              (make-directory (file-name-directory path) t)
+              (with-temp-file path (insert "{}\n")))
+            (setq replacement-process
+                  (make-pipe-process
+                   :name (generate-new-buffer-name
+                          "magnus-new-session-owner")
+                   :buffer buffer :noquery t))
+            (should (eq (get-buffer-process buffer) replacement-process))
+            (cl-letf (((symbol-function
+                        'magnus-process--cleanup-session-watch)
+                       (lambda (resources) (setq cleaned resources))))
+              (should
+               (eq (magnus-process--detect-new-session
+                    instance directory nil '(watch poll cleanup)
+                    candidate buffer nil old-process)
+                   'stale)))
+            (should-not (magnus-instance-session-id instance))
+            (should (equal cleaned '(watch poll cleanup))))
+        (when (process-live-p old-process)
+          (delete-process old-process))
+        (when (process-live-p replacement-process)
+          (delete-process replacement-process))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))
+        (delete-directory directory t)
+        (delete-directory home t)))))
+
+(ert-deftest magnus-process-session-watcher-rehomes-to-restored-instance ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((directory (make-temp-file "magnus-restored-session-" t))
+           (home (make-temp-file "magnus-restored-home-" t))
+           (process-environment (copy-sequence process-environment))
+           (old-instance (magnus-instances-create directory "restored-claude"))
+           (restored
+            (magnus-instances-deserialize
+             (magnus-instances-serialize old-instance)))
+           (buffer (generate-new-buffer " *restored-claude-session-owner*"))
+           (process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-restored-session-owner")
+             :buffer buffer :noquery t))
+           (candidate "55555555-5555-4555-a555-555555555555")
+           cleaned)
+      (setenv "HOME" home)
+      (unwind-protect
+          (progn
+            (magnus-instances-update
+             old-instance :buffer buffer :status 'running)
+            (magnus-instances-update
+             restored :buffer buffer :status 'running)
+            (setq magnus-instances (list restored))
+            (let ((path
+                   (magnus-process--session-candidate-path
+                    directory candidate)))
+              (make-directory (file-name-directory path) t)
+              (with-temp-file path (insert "{}\n")))
+            (cl-letf (((symbol-function
+                        'magnus-process--cleanup-session-watch)
+                       (lambda (resources) (setq cleaned resources))))
+              (should
+               (eq (magnus-process--detect-new-session
+                    old-instance directory nil '(watch poll cleanup)
+                    candidate buffer nil process)
+                   'captured)))
+            (should-not (magnus-instance-session-id old-instance))
+            (should (equal (magnus-instance-session-id restored) candidate))
+            (should (equal cleaned '(watch poll cleanup))))
+        (when (process-live-p process)
+          (delete-process process))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))
         (delete-directory directory t)
         (delete-directory home t)))))
 
@@ -1114,6 +1276,781 @@ When AGENT is non-nil, include its pre-existing Active Work row."
         (when (buffer-live-p failed-buffer)
           (kill-buffer failed-buffer))
         (delete-directory directory t)))))
+
+(ert-deftest magnus-process-resurrection-nudge-rejects-a-replacement ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((directory (make-temp-file "magnus-resurrect-nudge-" t))
+           (instance
+            (magnus-instances-create directory "resurrected-claude"))
+           old-buffer
+           old-process
+           replacement
+           replacement-process
+           delayed
+           nudges)
+      (unwind-protect
+          (progn
+            (magnus-instances-update
+             instance :status 'purged :session-id "resume-me"
+             :purged-at 123.0)
+            (cl-letf
+                (((symbol-function 'magnus-provider-external-p)
+                  (lambda (_candidate) nil))
+                 ((symbol-function 'magnus-coord-register-agent) #'ignore)
+                 ((symbol-function 'magnus-process--spawn-with-session)
+                  (lambda (candidate session-id)
+                    (should (equal session-id "resume-me"))
+                    (setq old-buffer
+                          (generate-new-buffer " *magnus-old-resurrection*"))
+                    (setq old-process
+                          (make-pipe-process
+                           :name (generate-new-buffer-name
+                                  "magnus-old-resurrection")
+                           :buffer old-buffer :noquery t))
+                    (when (consp magnus-process--transaction-runtime-buffer)
+                      (setcar magnus-process--transaction-runtime-buffer
+                              (cons old-buffer old-process)))
+                    (magnus-instances-update
+                     candidate :status 'running :buffer old-buffer)))
+                 ((symbol-function 'run-with-timer)
+                  (lambda (_seconds _repeat function &rest arguments)
+                    (setq delayed (cons function arguments))))
+                 ((symbol-function 'magnus-coord-nudge-agent)
+                  (lambda (&rest arguments) (push arguments nudges))))
+              (magnus-process-resurrect-purged instance))
+            (should delayed)
+            (setq replacement
+                  (generate-new-buffer " *magnus-new-resurrection*"))
+            (setq replacement-process
+                  (make-pipe-process
+                   :name (generate-new-buffer-name
+                          "magnus-new-resurrection")
+                   :buffer replacement :noquery t))
+            (magnus-instances-update
+             instance :status 'running :buffer replacement)
+            (apply (car delayed) (cdr delayed))
+            (should-not nudges))
+        (when (process-live-p old-process)
+          (delete-process old-process))
+        (when (process-live-p replacement-process)
+          (delete-process replacement-process))
+        (when (buffer-live-p old-buffer)
+          (kill-buffer old-buffer))
+        (when (buffer-live-p replacement)
+          (kill-buffer replacement))
+        (delete-directory directory t)))))
+
+(ert-deftest magnus-process-project-hash-uses-the-physical-root ()
+  (let* ((directory (make-temp-file "magnus-project-hash-" t))
+         (link (concat directory "-link")))
+    (unwind-protect
+        (progn
+          (make-symbolic-link directory link)
+          (should
+           (equal (magnus-process--project-hash directory)
+                  (magnus-process--project-hash link))))
+      (when (file-symlink-p link)
+        (delete-file link))
+      (delete-directory directory t))))
+
+(ert-deftest magnus-process-reconnect-normalizes-stale-runtime-state ()
+  (magnus-test-process-lifecycle--isolated
+    (dolist (status '(running suspended))
+      (let ((instance
+             (magnus-instances-create
+              default-directory
+              (format "stale-%s-%s" status (random most-positive-fixnum)))))
+        (magnus-instances-update instance :status status)
+        (cl-letf (((symbol-function 'magnus-provider-external-p)
+                   (lambda (_candidate) nil)))
+          (magnus-process-reconnect instance))
+        (should (eq (magnus-instance-status instance) 'stopped))
+        (should-not (magnus-instance-buffer instance))))
+    ;; Durable terminal states are evidence, not runtimes to revive.
+    (dolist (status '(purged finished errored))
+      (let ((instance
+             (magnus-instances-create
+              default-directory
+              (format "terminal-%s-%s" status
+                      (random most-positive-fixnum)))))
+        (magnus-instances-update instance :status status)
+        (cl-letf (((symbol-function 'magnus-provider-external-p)
+                   (lambda (_candidate) nil)))
+          (magnus-process-reconnect instance))
+        (should (eq (magnus-instance-status instance) status))))
+    ;; External terminals also cannot survive Emacs, including any stale
+    ;; suspended state loaded from older or hand-edited storage.
+    (dolist (status '(running suspended))
+      (let ((instance
+             (magnus-instances-create
+              default-directory
+              (format "external-%s-%s" status
+                      (random most-positive-fixnum))
+              'codex)))
+        (magnus-instances-update instance :status status)
+        (cl-letf (((symbol-function 'magnus-provider-external-p)
+                   (lambda (_candidate) t)))
+          (magnus-process-reconnect instance))
+        (should (eq (magnus-instance-status instance) 'stopped))
+        (should-not (magnus-instance-buffer instance))))))
+
+(ert-deftest magnus-process-reconnect-requires-a-live-local-process ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((name (format "reconnect-%s" (random most-positive-fixnum)))
+           (instance (magnus-instances-create default-directory name))
+           (buffer (generate-new-buffer (format "*claude:%s*" name))))
+      (unwind-protect
+          (progn
+            (magnus-instances-update
+             instance :status 'suspended :buffer buffer)
+            (cl-letf (((symbol-function 'magnus-provider-external-p)
+                       (lambda (_candidate) nil)))
+              (magnus-process-reconnect instance))
+            ;; An untagged display-name collision is not ours to destroy.
+            (should (buffer-live-p buffer))
+            (should-not (magnus-instance-buffer instance))
+            (should (eq (magnus-instance-status instance) 'stopped)))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest magnus-process-reconnect-preserves-a-live-suspension ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((name (format "live-reconnect-%s"
+                         (random most-positive-fixnum)))
+           (instance (magnus-instances-create default-directory name))
+           (buffer (generate-new-buffer (format "*claude:%s*" name)))
+           (process (make-pipe-process
+                     :name (generate-new-buffer-name "magnus-live-reconnect")
+                     :buffer buffer :noquery t)))
+      (unwind-protect
+          (progn
+            (with-current-buffer buffer
+              (setq-local magnus-process--instance-id
+                          (magnus-instance-id instance)))
+            (magnus-instances-update instance :status 'suspended :buffer nil)
+            (cl-letf (((symbol-function 'magnus-provider-external-p)
+                       (lambda (_candidate) nil)))
+              (magnus-process-reconnect instance))
+            (should (eq (magnus-instance-buffer instance) buffer))
+            (should (eq (magnus-instance-status instance) 'suspended)))
+        (when (process-live-p process)
+          (delete-process process))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest magnus-process-reconnect-ignores-an-untagged-name-collision ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((name (format "reconnect-collision-%s"
+                         (random most-positive-fixnum)))
+           (instance (magnus-instances-create default-directory name))
+           (collision (generate-new-buffer (format "*claude:%s*" name)))
+           (collision-process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-reconnect-collision")
+             :buffer collision :noquery t)))
+      (unwind-protect
+          (progn
+            (magnus-instances-update instance :status 'running :buffer nil)
+            (cl-letf (((symbol-function 'magnus-provider-external-p)
+                       (lambda (_candidate) nil)))
+              (magnus-process-reconnect instance))
+            (should (eq (magnus-instance-status instance) 'stopped))
+            (should-not (magnus-instance-buffer instance))
+            (should (buffer-live-p collision))
+            (should (process-live-p collision-process)))
+        (when (process-live-p collision-process)
+          (delete-process collision-process))
+        (when (buffer-live-p collision)
+          (kill-buffer collision))))))
+
+(ert-deftest magnus-process-reconnect-finds-a-tagged-suffixed-terminal ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((name (format "reconnect-suffix-%s"
+                         (random most-positive-fixnum)))
+           (instance (magnus-instances-create default-directory name))
+           (collision (generate-new-buffer (format "*claude:%s*" name)))
+           (collision-process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-reconnect-decoy")
+             :buffer collision :noquery t))
+           (owned (generate-new-buffer (format "*claude:%s*" name)))
+           (owned-process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-reconnect-owned")
+             :buffer owned :noquery t)))
+      (unwind-protect
+          (progn
+            (should-not (string= (buffer-name owned)
+                                (format "*claude:%s*" name)))
+            (with-current-buffer owned
+              (setq-local magnus-process--instance-id
+                          (magnus-instance-id instance)))
+            (magnus-instances-update instance :status 'running :buffer nil)
+            (cl-letf (((symbol-function 'magnus-provider-external-p)
+                       (lambda (_candidate) nil)))
+              (magnus-process-reconnect instance))
+            (should (eq (magnus-instance-buffer instance) owned))
+            (should (eq (magnus-instance-status instance) 'running))
+            (should (process-live-p owned-process))
+            (should (process-live-p collision-process)))
+        (when (process-live-p collision-process)
+          (delete-process collision-process))
+        (when (process-live-p owned-process)
+          (delete-process owned-process))
+        (when (buffer-live-p collision)
+          (kill-buffer collision))
+        (when (buffer-live-p owned)
+          (kill-buffer owned))))))
+
+(ert-deftest magnus-process-reconnect-rehomes-exit-callback-to-restored-instance ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((old-instance
+            (magnus-instances-create default-directory "restored-terminal"))
+           (restored
+            (magnus-instances-deserialize
+             (magnus-instances-serialize old-instance)))
+           (buffer (generate-new-buffer " *magnus-restored-terminal*"))
+           (process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-restored-terminal")
+             :buffer buffer :noquery t))
+           sentinel
+           (magnus-buffer-name " *magnus-status-not-present*"))
+      (unwind-protect
+          (progn
+            (with-current-buffer buffer
+              (setq-local magnus-process--instance-id
+                          (magnus-instance-id old-instance)))
+            (magnus-instances-update
+             old-instance :status 'running :buffer buffer)
+            (magnus-process--setup-sentinel old-instance buffer)
+            ;; Model persistence atomically replacing the registry object.
+            (setq magnus-instances (list restored))
+            (cl-letf (((symbol-function 'magnus-provider-external-p)
+                       (lambda (_candidate) nil)))
+              (magnus-process-reconnect restored))
+            (should (eq (magnus-instance-buffer restored) buffer))
+            (setq sentinel (process-sentinel process))
+            (set-process-sentinel process nil)
+            (delete-process process)
+            (funcall sentinel process "finished")
+            (should (eq (magnus-instance-status restored) 'stopped))
+            ;; The orphan is no longer a callback target.
+            (should (eq (magnus-instance-status old-instance) 'running)))
+        (when (process-live-p process)
+          (delete-process process))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest magnus-process-sentinel-updates-only-its-current-buffer-owner ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((instance
+            (magnus-instances-create default-directory "sentinel-owner"))
+           (old-buffer (generate-new-buffer " *magnus-old-terminal*"))
+           (old-process (make-pipe-process
+                         :name (generate-new-buffer-name "magnus-old-terminal")
+                         :buffer old-buffer :noquery t))
+           (replacement
+            (generate-new-buffer " *magnus-new-terminal*"))
+           sentinel
+           (magnus-buffer-name " *magnus-status-not-present*"))
+      (unwind-protect
+          (progn
+            (magnus-instances-update
+             instance :status 'running :buffer old-buffer)
+            (magnus-process--setup-sentinel instance old-buffer)
+            (setq sentinel (process-sentinel old-process))
+            (set-process-sentinel old-process nil)
+            (magnus-instances-update
+             instance :status 'running :buffer replacement)
+            (delete-process old-process)
+            (funcall sentinel old-process "finished")
+            (should (eq (magnus-instance-buffer instance) replacement))
+            (should (eq (magnus-instance-status instance) 'running)))
+        (when (process-live-p old-process)
+          (delete-process old-process))
+        (when (buffer-live-p old-buffer)
+          (kill-buffer old-buffer))
+        (when (buffer-live-p replacement)
+          (kill-buffer replacement))))))
+
+(ert-deftest magnus-process-sentinel-stops-its-current-buffer-owner ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((instance
+            (magnus-instances-create default-directory "sentinel-current"))
+           (buffer (generate-new-buffer " *magnus-current-terminal*"))
+           (process (make-pipe-process
+                     :name (generate-new-buffer-name "magnus-current-terminal")
+                     :buffer buffer :noquery t))
+           sentinel
+           (magnus-buffer-name " *magnus-status-not-present*"))
+      (unwind-protect
+          (progn
+            (magnus-instances-update
+             instance :status 'running :buffer buffer)
+            (magnus-process--setup-sentinel instance buffer)
+            (setq sentinel (process-sentinel process))
+            (set-process-sentinel process nil)
+            (delete-process process)
+            (funcall sentinel process "finished")
+            (should (eq (magnus-instance-buffer instance) buffer))
+            (should (eq (magnus-instance-status instance) 'stopped)))
+        (when (process-live-p process)
+          (delete-process process))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest magnus-process-sentinel-rejects-a-same-buffer-replacement ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((instance
+            (magnus-instances-create default-directory "same-buffer-owner"))
+           (buffer (generate-new-buffer " *magnus-shared-terminal*"))
+           (old-process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-old-shared-terminal")
+             :buffer buffer :noquery t))
+           replacement-process
+           sentinel
+           (magnus-buffer-name " *magnus-status-not-present*"))
+      (unwind-protect
+          (progn
+            (magnus-instances-update
+             instance :status 'running :buffer buffer)
+            (magnus-process--setup-sentinel instance buffer)
+            (setq sentinel (process-sentinel old-process))
+            (set-process-sentinel old-process nil)
+            (setq replacement-process
+                  (make-pipe-process
+                   :name (generate-new-buffer-name
+                          "magnus-new-shared-terminal")
+                   :buffer buffer :noquery t))
+            (should (eq (get-buffer-process buffer) replacement-process))
+            (delete-process old-process)
+            (funcall sentinel old-process "finished")
+            (should (eq (magnus-instance-buffer instance) buffer))
+            (should (eq (magnus-instance-status instance) 'running)))
+        (when (process-live-p old-process)
+          (delete-process old-process))
+        (when (process-live-p replacement-process)
+          (delete-process replacement-process))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest magnus-process-delayed-stop-preserves-same-buffer-replacement ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((instance
+            (magnus-instances-create default-directory "local-stop-owner"))
+           (buffer (generate-new-buffer " *magnus-shared-stop-terminal*"))
+           (old-process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-old-stop-terminal")
+             :buffer buffer :noquery t))
+           replacement-process
+           delayed-stop
+           sent-key)
+      (unwind-protect
+          (progn
+            (magnus-instances-update
+             instance :status 'running :buffer buffer)
+            (cl-letf (((symbol-function 'vterm-send-key)
+                       (lambda (key &rest _arguments) (setq sent-key key)))
+                      ((symbol-function 'run-with-timer)
+                       (lambda (_seconds _repeat function &rest arguments)
+                         (setq delayed-stop (cons function arguments))
+                         'test-timer)))
+              (magnus-process-kill instance))
+            (should (equal sent-key "C-c"))
+            (should delayed-stop)
+            (setq replacement-process
+                  (make-pipe-process
+                   :name (generate-new-buffer-name
+                          "magnus-new-stop-terminal")
+                   :buffer buffer :noquery t))
+            (apply (car delayed-stop) (cdr delayed-stop))
+            (should-not (process-live-p old-process))
+            (should (process-live-p replacement-process))
+            (should (buffer-live-p buffer))
+            (should (eq (get-buffer-process buffer) replacement-process)))
+        (when (process-live-p old-process)
+          (delete-process old-process))
+        (when (process-live-p replacement-process)
+          (delete-process replacement-process))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest magnus-process-switch-rejects-archived-and-missing-terminal-output ()
+  (magnus-test-process-lifecycle--isolated
+    (dolist (status '(purged finished errored))
+      (let ((instance
+             (magnus-instances-create
+              default-directory
+              (format "unvisitable-%s-%s" status
+                      (random most-positive-fixnum)))))
+        (magnus-instances-update instance :status status)
+        (cl-letf (((symbol-function 'magnus-provider-external-p)
+                   (lambda (_candidate)
+                     (ert-fail "terminal state must fail before dispatch")))
+                  ((symbol-function 'magnus-process--spawn)
+                   (lambda (&rest _arguments)
+                     (ert-fail "terminal state must not spawn"))))
+          (should-error (magnus-process-switch-to instance)
+                        :type 'user-error))
+        (should (eq (magnus-instance-status instance) status))))))
+
+(ert-deftest magnus-process-switch-opens-retained-headless-output ()
+  (magnus-test-process-lifecycle--isolated
+    (dolist (status '(finished errored))
+      (let* ((instance
+              (magnus-instances-create
+               default-directory
+               (format "output-%s-%s" status
+                       (random most-positive-fixnum))))
+             (buffer (generate-new-buffer " *magnus-retained-output*"))
+             switched)
+        (unwind-protect
+            (progn
+              (magnus-instances-update
+               instance :status status :buffer buffer)
+              (cl-letf (((symbol-function 'switch-to-buffer)
+                         (lambda (candidate) (setq switched candidate)))
+                        ((symbol-function 'magnus-provider-external-p)
+                         (lambda (_candidate)
+                           (ert-fail "retained output must not dispatch")))
+                        ((symbol-function 'magnus-process--spawn)
+                         (lambda (&rest _arguments)
+                           (ert-fail "retained output must not spawn"))))
+                (magnus-process-switch-to instance))
+              (should (eq switched buffer))
+              (should (eq (magnus-instance-status instance) status)))
+          (when (buffer-live-p buffer)
+            (kill-buffer buffer)))))))
+
+(ert-deftest magnus-process-switch-replaces-a-processless-terminal ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((name (format "replace-terminal-%s"
+                         (random most-positive-fixnum)))
+           (instance (magnus-instances-create default-directory name))
+           (stale (generate-new-buffer (format "*claude:%s*" name)))
+           (replacement (generate-new-buffer " *magnus-replacement*"))
+           resumed-session
+           switched)
+      (unwind-protect
+          (progn
+            (magnus-instances-update
+             instance :status 'stopped :buffer stale
+             :session-id "resume-this-session")
+            (cl-letf (((symbol-function 'magnus-provider-external-p)
+                       (lambda (_candidate) nil))
+                      ((symbol-function 'magnus-process--spawn-with-session)
+                       (lambda (candidate session-id)
+                         (setq resumed-session session-id)
+                         (magnus-instances-update
+                          candidate :status 'running :buffer replacement)))
+                      ((symbol-function 'switch-to-buffer)
+                       (lambda (candidate) (setq switched candidate))))
+              (magnus-process-switch-to instance))
+            (should-not (buffer-live-p stale))
+            (should (equal resumed-session "resume-this-session"))
+            (should (eq switched replacement)))
+        (when (buffer-live-p stale)
+          (kill-buffer stale))
+        (when (buffer-live-p replacement)
+          (kill-buffer replacement))))))
+
+(ert-deftest magnus-process-resume-spawn-failure-discards-partial-terminal ()
+  (magnus-test-process-lifecycle--isolated
+    (let ((instance
+           (magnus-instances-create default-directory "failed-resume"))
+          terminal)
+      (cl-letf (((symbol-value 'magnus-claude-executable) "claude")
+                ((symbol-function 'magnus-terminal-create-buffer)
+                 (lambda (&rest _arguments)
+                   (setq terminal
+                         (generate-new-buffer " *magnus-failed-resume*"))))
+                ((symbol-function 'vterm-send-string)
+                 (lambda (&rest _arguments)
+                   (error "simulated resume send failure"))))
+        (should-error
+         (magnus-process--spawn-with-session instance "session-to-resume")))
+      (should-not (buffer-live-p terminal))
+      (should-not (magnus-instance-buffer instance))
+      (should (eq (magnus-instance-status instance) 'stopped)))))
+
+(ert-deftest magnus-process-stale-onboarding-cannot-steer-a-replacement ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((instance
+            (magnus-instances-create default-directory "late-onboarding"))
+           (old-buffer (generate-new-buffer " *magnus-old-onboarding*"))
+           (old-process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-old-onboarding")
+             :buffer old-buffer :noquery t))
+           (replacement
+            (generate-new-buffer " *magnus-new-onboarding*"))
+           (replacement-process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-new-onboarding")
+             :buffer replacement :noquery t))
+           delayed-submit
+           pasted-into
+           returns
+           ready)
+      (unwind-protect
+          (cl-letf (((symbol-function 'magnus-process--onboarding-message)
+                     (lambda (&rest _arguments) "hello\nreplacement"))
+                    ((symbol-function 'vterm-send-string)
+                     (lambda (&rest _arguments)
+                       (push (current-buffer) pasted-into)))
+                    ((symbol-function 'vterm-send-return)
+                     (lambda () (push (current-buffer) returns)))
+                    ((symbol-function 'run-with-timer)
+                     (lambda (_seconds _repeat function &rest arguments)
+                       (setq delayed-submit (cons function arguments)))))
+            ;; The five-second launch timer must become a no-op if this launch
+            ;; lost ownership before it even tried to paste onboarding.
+            (magnus-instances-update
+             instance :status 'running :buffer replacement)
+            (magnus-process--send-onboarding
+             instance nil old-buffer old-process)
+            (should-not pasted-into)
+            (should-not delayed-submit)
+
+            ;; Ownership can also change in the half-second between paste and
+            ;; submit.  That delayed Return must not reach the replacement or
+            ;; announce it ready.
+            (magnus-instances-update
+             instance :status 'running :buffer old-buffer)
+            (let ((magnus-process-ready-hook
+                   (list (lambda (_candidate) (setq ready t)))))
+              (magnus-process--send-onboarding
+               instance nil old-buffer old-process)
+              (should (equal pasted-into (list old-buffer)))
+              (should delayed-submit)
+              (magnus-instances-update
+               instance :status 'running :buffer replacement)
+              (apply (car delayed-submit) (cdr delayed-submit)))
+            (should-not returns)
+            (should-not ready))
+        (when (process-live-p old-process)
+          (delete-process old-process))
+        (when (process-live-p replacement-process)
+          (delete-process replacement-process))
+        (when (buffer-live-p old-buffer)
+          (kill-buffer old-buffer))
+        (when (buffer-live-p replacement)
+          (kill-buffer replacement))))))
+
+(ert-deftest magnus-process-stale-resume-ready-timer-cannot-release-work ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((instance
+            (magnus-instances-create default-directory "late-resume-ready"))
+           (old-buffer (generate-new-buffer " *magnus-old-resume-ready*"))
+           (old-process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-old-resume-ready")
+             :buffer old-buffer :noquery t))
+           (replacement
+            (generate-new-buffer " *magnus-new-resume-ready*"))
+           (replacement-process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-new-resume-ready")
+             :buffer replacement :noquery t))
+           ready
+           returns)
+      (unwind-protect
+          (let ((magnus-process-ready-hook
+                 (list (lambda (_candidate) (push 'ready ready)))))
+            (magnus-instances-update
+             instance :status 'running :buffer replacement)
+            ;; Model both delayed callbacks installed by the old resume.
+            (cl-letf (((symbol-function 'vterm-send-return)
+                       (lambda () (push (current-buffer) returns))))
+              (magnus-process--send-return-if-owner
+               instance old-buffer old-process))
+            (magnus-process--run-ready-hook
+             instance old-buffer old-process)
+            (should-not returns)
+            (should-not ready)
+
+            ;; The same callbacks still work for the exact current owner.
+            (cl-letf (((symbol-function 'vterm-send-return)
+                       (lambda () (push (current-buffer) returns))))
+              (magnus-process--send-return-if-owner
+               instance replacement replacement-process))
+            (magnus-process--run-ready-hook
+             instance replacement replacement-process)
+            (should (equal returns (list replacement)))
+            (should (equal ready '(ready))))
+        (when (process-live-p old-process)
+          (delete-process old-process))
+        (when (process-live-p replacement-process)
+          (delete-process replacement-process))
+        (when (buffer-live-p old-buffer)
+          (kill-buffer old-buffer))
+        (when (buffer-live-p replacement)
+          (kill-buffer replacement))))))
+
+(ert-deftest magnus-process-headless-completion-cannot-overwrite-replacement ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((instance
+            (magnus-instances-create default-directory "late-headless"))
+           (old-buffer (generate-new-buffer " *magnus-old-headless*"))
+           (old-process (make-pipe-process
+                         :name (generate-new-buffer-name "magnus-old-headless")
+                         :buffer old-buffer :noquery t))
+           (replacement
+            (generate-new-buffer " *magnus-headless-replacement*"))
+           (magnus-buffer-name " *magnus-status-not-present*"))
+      (unwind-protect
+          (progn
+            (magnus-instances-update
+             instance :status 'running :buffer old-buffer)
+            (set-process-sentinel old-process nil)
+            (delete-process old-process)
+            (magnus-instances-update
+             instance :status 'running :buffer replacement)
+            (magnus-process--headless-complete
+             instance old-process
+             '(:success-p t :status exit :process-event "finished")
+             old-buffer)
+            (should (eq (magnus-instance-buffer instance) replacement))
+            (should (eq (magnus-instance-status instance) 'running))
+            (with-current-buffer replacement
+              (should-not (string-match-p "Process finished"
+                                          (buffer-string)))))
+        (when (process-live-p old-process)
+          (delete-process old-process))
+        (when (buffer-live-p old-buffer)
+          (kill-buffer old-buffer))
+        (when (buffer-live-p replacement)
+          (kill-buffer replacement))))))
+
+(ert-deftest magnus-process-headless-completion-rejects-same-buffer-replacement ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((instance
+            (magnus-instances-create default-directory "shared-headless"))
+           (buffer (generate-new-buffer " *magnus-shared-headless*"))
+           (old-process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-old-headless-owner")
+             :buffer buffer :noquery t))
+           replacement-process
+           (magnus-buffer-name " *magnus-status-not-present*"))
+      (unwind-protect
+          (progn
+            (magnus-instances-update
+             instance :status 'running :buffer buffer)
+            (setq replacement-process
+                  (make-pipe-process
+                   :name (generate-new-buffer-name
+                          "magnus-new-headless-owner")
+                   :buffer buffer :noquery t))
+            (should (eq (get-buffer-process buffer) replacement-process))
+            (magnus-process--headless-complete
+             instance old-process
+             '(:success-p t :status exit :process-event "finished")
+             buffer)
+            (should (eq (magnus-instance-status instance) 'running))
+            (with-current-buffer buffer
+              (should-not (string-match-p "Process finished"
+                                          (buffer-string)))))
+        (when (process-live-p old-process)
+          (delete-process old-process))
+        (when (process-live-p replacement-process)
+          (delete-process replacement-process))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest magnus-process-headless-render-rejects-same-buffer-replacement ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((instance
+            (magnus-instances-create default-directory "shared-headless-output"))
+           (buffer (generate-new-buffer " *magnus-shared-headless-output*"))
+           (old-process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-old-headless-output")
+             :buffer buffer :noquery t))
+           replacement-process)
+      (unwind-protect
+          (progn
+            (with-current-buffer buffer (insert "replacement output\n"))
+            (magnus-instances-update
+             instance :status 'running :buffer buffer)
+            (setq replacement-process
+                  (make-pipe-process
+                   :name (generate-new-buffer-name
+                          "magnus-new-headless-output")
+                   :buffer buffer :noquery t))
+            (magnus-process--headless-render-event
+             instance old-process '(:type "assistant" :text "stale\n") buffer)
+            (with-current-buffer buffer
+              (should (equal (buffer-string) "replacement output\n")))
+            ;; The exact current owner remains able to render normally.
+            (magnus-process--headless-render-event
+             instance replacement-process
+             '(:type "assistant" :text "current\n") buffer)
+            (with-current-buffer buffer
+              (should (equal (buffer-string)
+                             "replacement output\ncurrent\n"))))
+        (when (process-live-p old-process)
+          (delete-process old-process))
+        (when (process-live-p replacement-process)
+          (delete-process replacement-process))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest magnus-process-headless-completes-after-output-buffer-is-killed ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((instance
+            (magnus-instances-create default-directory "killed-output"))
+           (buffer (generate-new-buffer " *magnus-killed-headless-output*"))
+           (process
+            (make-pipe-process
+             :name (generate-new-buffer-name "magnus-killed-headless-output")
+             :buffer buffer :noquery t))
+           (magnus-buffer-name " *magnus-status-not-present*"))
+      (unwind-protect
+          (progn
+            (magnus-instances-update
+             instance :status 'running :buffer buffer)
+            (kill-buffer buffer)
+            (magnus-process--headless-complete
+             instance process
+             '(:success-p t :status exit :process-event "finished")
+             buffer)
+            (should-not (buffer-live-p buffer))
+            (should (eq (magnus-instance-buffer instance) buffer))
+            (should (eq (magnus-instance-status instance) 'finished)))
+        (when (process-live-p process)
+          (delete-process process))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest magnus-process-chdir-rejects-terminal-lifecycle-states ()
+  (magnus-test-process-lifecycle--isolated
+    (let ((old-directory (make-temp-file "magnus-chdir-terminal-old-" t))
+          (new-directory (make-temp-file "magnus-chdir-terminal-new-" t)))
+      (unwind-protect
+          (dolist (status '(purged finished errored))
+            (let* ((instance
+                    (magnus-instances-create
+                     old-directory
+                     (format "immovable-%s-%s" status
+                             (random most-positive-fixnum))))
+                   (_ (magnus-instances-update
+                       instance :status status :purged-at 123.0))
+                   (before (magnus-instances-serialize instance)))
+              (cl-letf (((symbol-function 'magnus-provider-external-p)
+                         (lambda (_candidate)
+                           (ert-fail "guard must run before provider dispatch")))
+                        ((symbol-function 'magnus-coord--normalized-directory)
+                         (lambda (_directory)
+                           (ert-fail "guard must run before path work"))))
+                (should-error (magnus-process-chdir instance new-directory)
+                              :type 'user-error))
+              (should (equal (magnus-instances-serialize instance) before))))
+        (delete-directory old-directory t)
+        (delete-directory new-directory t)))))
 
 (ert-deftest magnus-process-archive-purges-before-unregistering ()
   (dolist (provider '(claude codex))

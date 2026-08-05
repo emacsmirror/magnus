@@ -180,6 +180,55 @@ DATE defaults to the original deterministic test fixture date."
       (magnus-test--delete-terminal terminal)
       (delete-directory directory t))))
 
+(ert-deftest magnus-codex-direct-start-rolls-back-failed-tui-replacement ()
+  (let* ((directory (make-temp-file "magnus-codex-start-rollback-" t))
+         (instance (magnus-instances-create
+                    directory "failed-replacement" 'codex))
+         (old-buffer (generate-new-buffer " *magnus-old-codex-tui*"))
+         (new-buffer (generate-new-buffer " *magnus-new-codex-tui*"))
+         (new-process
+          (make-pipe-process
+           :name (generate-new-buffer-name "magnus-new-codex-tui")
+           :buffer new-buffer
+           :noquery t))
+         (unrelated-buffer
+          (generate-new-buffer " *magnus-unrelated-codex-tui*"))
+         (magnus-process--transaction-runtime-buffer (list nil))
+         (magnus-instances-changed-hook nil)
+         (magnus-buffer-name " *magnus-status-not-present*"))
+    (unwind-protect
+        (progn
+          (magnus-instances-update
+           instance :buffer old-buffer :status 'stopped
+           :session-id "resume-after-failure")
+          (cl-letf (((symbol-function 'executable-find)
+                     (lambda (_executable) "/usr/bin/codex"))
+                    ((symbol-function 'magnus-terminal-create-buffer)
+                     (lambda (&rest _arguments) new-buffer))
+                    ((symbol-function 'magnus-codex--setup-tui-sentinel)
+                     (lambda (&rest _arguments)
+                       (error "simulated sentinel setup failure"))))
+            (let ((err (should-error (magnus-codex-start instance))))
+              (should (string-match-p
+                       "simulated sentinel setup failure"
+                       (error-message-string err)))))
+          (should-not (buffer-live-p old-buffer))
+          (should-not (buffer-live-p new-buffer))
+          (should-not (process-live-p new-process))
+          (should (buffer-live-p unrelated-buffer))
+          (should (eq (caar magnus-process--transaction-runtime-buffer)
+                      new-buffer))
+          (should (eq (cdar magnus-process--transaction-runtime-buffer)
+                      new-process))
+          (should-not (magnus-instance-buffer instance))
+          (should (eq (magnus-instance-status instance) 'stopped)))
+      (when (process-live-p new-process)
+        (delete-process new-process))
+      (dolist (buffer (list old-buffer new-buffer unrelated-buffer))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer)))
+      (delete-directory directory t))))
+
 (ert-deftest magnus-codex-session-capture-matches-exact-first-prompt ()
   (let* ((root (make-temp-file "magnus-codex-sessions-" t))
          (directory (make-temp-file "magnus-codex-project-" t))
@@ -743,6 +792,50 @@ DATE defaults to the original deterministic test fixture date."
       (should-not (magnus-instance-buffer instance)))
     (magnus-test--delete-terminal terminal)))
 
+(ert-deftest magnus-codex-delayed-stop-preserves-same-buffer-replacement ()
+  (let* ((instance
+          (magnus-instances-create "/tmp" "delayed-stop-replacement" 'codex))
+         (terminal (magnus-test--codex-tui instance))
+         (buffer (car terminal))
+         (old-process (cdr terminal))
+         replacement-process
+         delayed-stop
+         sent-key)
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'vterm-send-key)
+                     (lambda (key &rest _arguments) (setq sent-key key)))
+                    ((symbol-function 'run-with-timer)
+                     (lambda (_seconds _repeat function &rest arguments)
+                       (setq delayed-stop (cons function arguments))
+                       'test-timer)))
+            (magnus-codex-stop instance))
+          (should (equal sent-key "C-c"))
+          (should delayed-stop)
+          ;; A new TUI can claim the same terminal buffer during the grace
+          ;; period after C-c but before the delayed stop callback runs.
+          (setq replacement-process
+                (make-pipe-process
+                 :name (generate-new-buffer-name
+                        "magnus-delayed-stop-replacement")
+                 :buffer buffer :noquery t))
+          (process-put replacement-process 'magnus-codex-instance instance)
+          (magnus-instances-update
+           instance :buffer buffer :status 'running)
+          (apply (car delayed-stop) (cdr delayed-stop))
+          (should-not (process-live-p old-process))
+          (should (process-live-p replacement-process))
+          (should (buffer-live-p buffer))
+          (should (eq (get-buffer-process buffer) replacement-process))
+          (should (eq (magnus-instance-buffer instance) buffer))
+          (should (eq (magnus-instance-status instance) 'running)))
+      (when (process-live-p old-process)
+        (delete-process old-process))
+      (when (process-live-p replacement-process)
+        (delete-process replacement-process))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest magnus-codex-stale-tui-exit-preserves-replacement ()
   (let* ((instance (magnus-instances-create "/tmp" "replacement" 'codex))
          (old-terminal (magnus-test--codex-tui instance))
@@ -761,6 +854,62 @@ DATE defaults to the original deterministic test fixture date."
           (should (eq (magnus-instance-status instance) 'running)))
       (magnus-test--delete-terminal old-terminal)
       (magnus-test--delete-terminal new-terminal))))
+
+(ert-deftest magnus-codex-stale-tui-exit-preserves-same-buffer-replacement ()
+  (let* ((instance
+          (magnus-instances-create "/tmp" "same-buffer-replacement" 'codex))
+         (buffer (generate-new-buffer " *magnus-same-buffer-codex-tui*"))
+         (old-process
+          (make-pipe-process
+           :name (generate-new-buffer-name "magnus-old-same-buffer-tui")
+           :buffer buffer :noquery t))
+         replacement-process
+         sentinel
+         (magnus-buffer-name " *magnus-status-not-present*"))
+    (unwind-protect
+        (progn
+          (magnus-instances-update
+           instance :buffer buffer :status 'running)
+          (magnus-codex--setup-tui-sentinel instance buffer)
+          (setq sentinel (process-sentinel old-process))
+          ;; A second process can claim the same terminal buffer before Emacs
+          ;; dispatches the old process's terminal sentinel.
+          (setq replacement-process
+                (make-pipe-process
+                 :name (generate-new-buffer-name
+                        "magnus-new-same-buffer-tui")
+                 :buffer buffer :noquery t))
+          (process-put replacement-process 'magnus-codex-instance instance)
+          (set-process-sentinel old-process nil)
+          (delete-process old-process)
+          (funcall sentinel old-process "exited")
+          (should (eq (get-buffer-process buffer) replacement-process))
+          (should (magnus-codex-running-p instance))
+          (should (eq (magnus-instance-status instance) 'running)))
+      (when (process-live-p old-process)
+        (delete-process old-process))
+      (when (process-live-p replacement-process)
+        (delete-process replacement-process))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest magnus-codex-current-tui-exit-publishes-stopped-state ()
+  (let* ((instance (magnus-instances-create "/tmp" "current-exit" 'codex))
+         (terminal (magnus-test--codex-tui instance))
+         (buffer (car terminal))
+         (process (cdr terminal))
+         (magnus-buffer-name " *magnus-status-not-present*")
+         sentinel)
+    (unwind-protect
+        (progn
+          (magnus-codex--setup-tui-sentinel instance buffer)
+          (setq sentinel (process-sentinel process))
+          (set-process-sentinel process nil)
+          (delete-process process)
+          (funcall sentinel process "finished")
+          (should (eq (magnus-instance-buffer instance) buffer))
+          (should (eq (magnus-instance-status instance) 'stopped)))
+      (magnus-test--delete-terminal terminal))))
 
 (ert-deftest magnus-coord-stopped-agent-nudge-stays-local-and-does-not-signal ()
   (let* ((directory (make-temp-file "magnus-stopped-nudge-" t))

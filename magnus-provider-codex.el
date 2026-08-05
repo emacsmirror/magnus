@@ -29,6 +29,7 @@
 (declare-function vterm-send-return "vterm" ())
 (declare-function vterm-send-string "vterm" (string &optional paste-p))
 (defvar magnus-buffer-name)
+(defvar magnus-process--transaction-runtime-buffer nil)
 
 (defcustom magnus-codex-executable "codex"
   "Path to the Codex executable used for native TUI sessions."
@@ -308,14 +309,59 @@ FILES-BEFORE contains rollout files that predate this launch."
                              magnus-codex-input-busy-timer))
            (magnus-codex--cancel-timer terminal property))
          ;; A replaced vterm may report its exit after a new TUI is running.
-         (when (and (buffer-live-p (magnus-instance-buffer instance))
-                    (eq terminal (get-buffer-process
-                                  (magnus-instance-buffer instance))))
-           (unless (eq (magnus-instance-status instance) 'purged)
-             (magnus-instances-update instance :status 'stopped))
-           (when (and (boundp 'magnus-buffer-name)
-                      (get-buffer magnus-buffer-name))
-             (magnus-status-refresh))))))))
+         ;; Emacs normally detaches a dead process before its sentinel runs, so
+         ;; nil still means this captured runtime exited normally.  A different
+         ;; process in the same buffer is a replacement and must win the race.
+         (let ((current (and (buffer-live-p buffer)
+                             (get-buffer-process buffer))))
+           (when (and (eq buffer (magnus-instance-buffer instance))
+                      (or (null current) (eq terminal current)))
+             (unless (eq (magnus-instance-status instance) 'purged)
+               (magnus-instances-update instance :status 'stopped))
+             (when (and (boundp 'magnus-buffer-name)
+                        (get-buffer magnus-buffer-name))
+               (magnus-status-refresh)))))))))
+
+(defun magnus-codex--rollback-tui-spawn
+    (instance buffer process command-timer submit-timer)
+  "Roll back one failed Codex TUI launch for INSTANCE.
+BUFFER and PROCESS are the exact runtime allocated by this launch.  The timer
+arguments are startup callbacks which must not survive a synchronous failure.
+Never detach or kill a replacement process that has since claimed BUFFER."
+  (dolist (timer (list command-timer submit-timer))
+    (when (timerp timer)
+      (cancel-timer timer)))
+  (when (processp process)
+    (dolist (property '(magnus-codex-capture-timer
+                        magnus-codex-ready-timer
+                        magnus-codex-input-retry-timer
+                        magnus-codex-input-busy-timer))
+      (ignore-errors (magnus-codex--cancel-timer process property))))
+  (let* ((current (and (buffer-live-p buffer)
+                       (get-buffer-process buffer)))
+         (owned (and (bufferp buffer)
+                     (eq buffer (magnus-instance-buffer instance))
+                     (or (null current) (eq process current)))))
+    ;; Detach first so deleting PROCESS cannot let its sentinel publish another
+    ;; transition.  `magnus-instances-update' mutates before running hooks, so a
+    ;; hook error is diagnostic and must not replace the startup failure.
+    (when owned
+      (condition-case err
+          (magnus-instances-update instance :buffer nil :status 'stopped)
+        (error
+         (message "Magnus: Codex startup rollback hook failed for %s: %s"
+                  (magnus-instance-name instance)
+                  (error-message-string err)))))
+    (when (processp process)
+      (ignore-errors (set-process-query-on-exit-flag process nil))
+      (when (process-live-p process)
+        (ignore-errors (delete-process process))))
+    ;; The buffer belongs to this allocation, but a distinct current process is
+    ;; evidence that it has been adopted as a replacement runtime.
+    (when (and (buffer-live-p buffer)
+               (let ((attached (get-buffer-process buffer)))
+                 (or (null attached) (eq attached process))))
+      (ignore-errors (kill-buffer buffer)))))
 
 (defun magnus-codex--spawn-tui (instance prompt &optional marker files-before)
   "Launch INSTANCE's native TUI with PROMPT.
@@ -325,53 +371,75 @@ When MARKER is non-nil, capture its new session against FILES-BEFORE."
          (command (magnus-codex--tui-command instance prompt))
          ;; Finish pure command construction before allocating a terminal so a
          ;; malformed instance cannot strand a vterm buffer.
-         (buffer
-          (magnus-terminal-create-buffer
-           buffer-name
-           (magnus-environment-coordination-bindings
-            (magnus-instance-id instance)
-            (magnus-instance-name instance))))
-         (process (get-buffer-process buffer)))
-    (unless (process-live-p process)
-      (kill-buffer buffer)
-      (user-error "Could not start a vterm for Codex instance `%s'"
-                  (magnus-instance-name instance)))
-    (with-current-buffer buffer
-      (setq-local magnus-codex--instance instance))
-    (magnus-instances-update instance :buffer buffer :status 'running)
-    (magnus-codex--setup-tui-sentinel instance buffer)
-    (when marker
-      (magnus-codex--watch-for-session process instance prompt files-before))
-    ;; Give vterm's login shell one tick before replacing it with Codex.
-    (run-with-timer
-     0.1 nil
-     (lambda ()
-       (when (magnus-codex--current-process-p process instance)
-         (with-current-buffer buffer
-           (vterm-send-string command)))))
-    (run-with-timer
-     0.5 nil
-     (lambda ()
-       (when (magnus-codex--current-process-p process instance)
-         (with-current-buffer buffer
-           (vterm-send-return))
-         (process-put
-          process 'magnus-codex-ready-timer
-          (run-with-timer
-           magnus-codex-tui-ready-delay nil
-           (lambda ()
-             (when (magnus-codex--current-process-p process instance)
-               (process-put process 'magnus-codex-ready-timer nil)
-               (process-put process 'magnus-codex-ready t)
-               ;; Existing queued input predates durable ready-hook deliveries.
-               ;; Defer the hook until that queue has actually drained so a
-               ;; recovered review notice cannot jump ahead of user input.
-               (process-put process 'magnus-codex-ready-hook-pending t)
-               (magnus-codex--drain-input-queue process))))))))
-    (when (and (boundp 'magnus-buffer-name)
-               (get-buffer magnus-buffer-name))
-      (magnus-status-refresh))
-    buffer))
+         buffer
+         process
+         command-timer
+         submit-timer
+         started)
+    (unwind-protect
+        (progn
+          (setq buffer
+                (magnus-terminal-create-buffer
+                 buffer-name
+                 (magnus-environment-coordination-bindings
+                  (magnus-instance-id instance)
+                  (magnus-instance-name instance))))
+          (setq process (get-buffer-process buffer))
+          ;; Outer lifecycle transactions consume this exact allocation if a
+          ;; later step fails after provider startup has returned successfully.
+          (when (and (consp magnus-process--transaction-runtime-buffer)
+                     (null (car magnus-process--transaction-runtime-buffer)))
+            (setcar magnus-process--transaction-runtime-buffer
+                    (cons buffer process)))
+          (unless (process-live-p process)
+            (user-error "Could not start a vterm for Codex instance `%s'"
+                        (magnus-instance-name instance)))
+          (with-current-buffer buffer
+            (setq-local magnus-codex--instance instance))
+          (magnus-instances-update instance :buffer buffer :status 'running)
+          (magnus-codex--setup-tui-sentinel instance buffer)
+          (when marker
+            (magnus-codex--watch-for-session
+             process instance prompt files-before))
+          ;; Give vterm's login shell one tick before replacing it with Codex.
+          (setq command-timer
+                (run-with-timer
+                 0.1 nil
+                 (lambda ()
+                   (when (magnus-codex--current-process-p process instance)
+                     (with-current-buffer buffer
+                       (vterm-send-string command))))))
+          (setq submit-timer
+                (run-with-timer
+                 0.5 nil
+                 (lambda ()
+                   (when (magnus-codex--current-process-p process instance)
+                     (with-current-buffer buffer
+                       (vterm-send-return))
+                     (process-put
+                      process 'magnus-codex-ready-timer
+                      (run-with-timer
+                       magnus-codex-tui-ready-delay nil
+                       (lambda ()
+                         (when (magnus-codex--current-process-p
+                                process instance)
+                           (process-put process 'magnus-codex-ready-timer nil)
+                           (process-put process 'magnus-codex-ready t)
+                           ;; Existing queued input predates durable ready-hook
+                           ;; deliveries.  Defer the hook until that queue has
+                           ;; actually drained so a recovered review notice
+                           ;; cannot jump ahead of user input.
+                           (process-put
+                            process 'magnus-codex-ready-hook-pending t)
+                           (magnus-codex--drain-input-queue process)))))))))
+          (when (and (boundp 'magnus-buffer-name)
+                     (get-buffer magnus-buffer-name))
+            (magnus-status-refresh))
+          (setq started t)
+          buffer)
+      (unless started
+        (magnus-codex--rollback-tui-spawn
+         instance buffer process command-timer submit-timer)))))
 
 (defun magnus-codex-start (instance &optional initial-message)
   "Start or resume Codex INSTANCE with optional INITIAL-MESSAGE."
@@ -382,7 +450,12 @@ When MARKER is non-nil, capture its new session against FILES-BEFORE."
     (user-error "Cannot find Codex executable: %s" magnus-codex-executable))
   (when-let ((old-buffer (magnus-instance-buffer instance)))
     (when (buffer-live-p old-buffer)
-      (kill-buffer old-buffer)))
+      (magnus-terminal--discard-buffer old-buffer)))
+  ;; A failed replacement must never leave INSTANCE pointing at its killed old
+  ;; terminal or claiming that a runtime is still live.
+  (unless (and (null (magnus-instance-buffer instance))
+               (eq (magnus-instance-status instance) 'stopped))
+    (magnus-instances-update instance :buffer nil :status 'stopped))
   (if (magnus-instance-session-id instance)
       (magnus-codex--spawn-tui instance initial-message)
     (let* ((marker (magnus-codex--launch-marker instance))
@@ -512,16 +585,24 @@ Return `submitted', `queued', or nil to describe this invocation."
     (with-current-buffer buffer
       (vterm-send-key "C-c"))))
 
-(defun magnus-codex--finish-stop (instance buffer force)
-  "Finish stopping INSTANCE's captured BUFFER.
-FORCE selects immediate process killing."
-  (when (buffer-live-p buffer)
-    (when-let ((process (get-buffer-process buffer)))
-      (set-process-query-on-exit-flag process nil)
-      (when (process-live-p process)
-        (if force (kill-process process) (delete-process process))))
+(defun magnus-codex--finish-stop (instance buffer process force)
+  "Finish stopping INSTANCE's captured BUFFER and exact PROCESS.
+FORCE selects immediate process killing.  A replacement process which has
+since claimed BUFFER is left running and remains attached to INSTANCE."
+  (when (processp process)
+    (set-process-query-on-exit-flag process nil)
+    (when (process-live-p process)
+      (if force (kill-process process) (delete-process process))))
+  ;; Deleting PROCESS can synchronously run its sentinel and lifecycle hooks.
+  ;; Resolve ownership only afterwards so a same-buffer replacement wins.
+  (when (and (buffer-live-p buffer)
+             (let ((attached (get-buffer-process buffer)))
+               (or (null attached) (eq attached process))))
     (kill-buffer buffer))
-  (when (eq buffer (magnus-instance-buffer instance))
+  (when (and (eq buffer (magnus-instance-buffer instance))
+             (or (not (buffer-live-p buffer))
+                 (let ((attached (get-buffer-process buffer)))
+                   (or (null attached) (eq attached process)))))
     (unless (eq (magnus-instance-status instance) 'purged)
       (magnus-instances-update instance :status 'stopped :buffer nil))))
 
@@ -539,12 +620,13 @@ FORCE kills the terminal immediately; otherwise interrupt before closing it."
       (magnus-instances-update instance :status 'stopped))
     (if (and (buffer-live-p buffer) (process-live-p process))
         (if force
-            (magnus-codex--finish-stop instance buffer t)
+            (magnus-codex--finish-stop instance buffer process t)
           (with-current-buffer buffer
             (vterm-send-key "C-c"))
           (run-with-timer 0.5 nil
-                          #'magnus-codex--finish-stop instance buffer nil))
-      (magnus-codex--finish-stop instance buffer force))))
+                          #'magnus-codex--finish-stop
+                          instance buffer process nil))
+      (magnus-codex--finish-stop instance buffer process force))))
 
 (defun magnus-codex-running-p (instance)
   "Return non-nil when Codex INSTANCE has a live native TUI."
