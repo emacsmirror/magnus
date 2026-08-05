@@ -1,9 +1,10 @@
 EMACS ?= emacs
 EL_FILES ?= $(wildcard *.el)
 TEST_FILES ?= $(wildcard test/*-tests.el)
-LINT_FILES ?= $(EL_FILES) $(wildcard test/*.el)
+LINT_FILES ?= $(EL_FILES) $(wildcard test/*.el) \
+	$(wildcard test/differential/*.el)
 
-.PHONY: lint lint-compile package-lint test clean
+.PHONY: lint lint-compile package-lint test differential clean
 
 lint:
 	@$(EMACS) --batch -L . -l lint.el -- $(LINT_FILES)
@@ -22,5 +23,8 @@ test:
 		$(foreach file,$(TEST_FILES),-l $(file)) \
 		-f ert-run-tests-batch-and-exit
 
+differential:
+	@EMACS=$(EMACS) test/differential/run.sh
+
 clean:
-	rm -f *.elc test/*.elc
+	rm -f *.elc test/*.elc test/differential/*.elc
