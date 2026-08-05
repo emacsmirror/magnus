@@ -162,7 +162,21 @@
                  :id "review-history" :project-root (file-truename root)
                  :checkpoint-token "checkpoint-token-2"
                  :lifecycle 'open :execution 'queued
-                 :rounds (list round-one round-two)))
+                 :rounds (list round-one round-two)
+                 :checkpoint-requests
+                 (list
+                  (magnus-review-checkpoint-request--create
+                   :number 1 :token "checkpoint-token-1"
+                   :events
+                   (list
+                    (magnus-review-checkpoint-event--create
+                     :kind 'round :round-number 1)))
+                  (magnus-review-checkpoint-request--create
+                   :number 2 :token "checkpoint-token-2"
+                   :events
+                   (list
+                    (magnus-review-checkpoint-event--create
+                     :kind 'round :round-number 2))))))
                (magnus-reviews (list review))
                (ready 0)
                (magnus-review-ready-hook
@@ -227,6 +241,198 @@
           (magnus-review-verdict review) 'changes-requested)
     (magnus-review-save review)
     round))
+
+(defun magnus-test-review--schema-1-object (review)
+  "Return a schema-1 manifest object preserving REVIEW's current history."
+  (magnus-review--refresh-derived-fields review)
+  (let* ((object (magnus-review--to-json review))
+         (round-objects (append (alist-get 'rounds object) nil)))
+    (setq object (assq-delete-all 'checkpoint_requests object))
+    (setf (alist-get 'schema_version object) 1
+          (alist-get 'execution object)
+          (symbol-name (magnus-review-execution review))
+          (alist-get 'verdict object)
+          (and (magnus-review-verdict review)
+               (symbol-name (magnus-review-verdict review)))
+          (alist-get 'delivery_state object)
+          (symbol-name (magnus-review-delivery-state review))
+          (alist-get 'read_state object)
+          (symbol-name (magnus-review-read-state review))
+          (alist-get 'checkpoint_token object)
+          (magnus-review-checkpoint-token review)
+          (alist-get 'checkpoint_acks object)
+          (vconcat
+           (mapcar (lambda (ack) (vector (car ack) (cdr ack)))
+                   (magnus-review-checkpoint-acks review)))
+          (alist-get 'base_oid object) (magnus-review-base-oid review)
+          (alist-get 'head_oid object) (magnus-review-head-oid review)
+          (alist-get 'previous_head_oid object)
+          (magnus-review-previous-head-oid review))
+    (setq round-objects
+          (cl-mapcar
+           (lambda (round-object round)
+             (cons
+              (cons 'checkpoint_token
+                    (magnus-review-round-checkpoint-token round))
+              round-object))
+           round-objects (magnus-review-rounds review)))
+    (setf (alist-get 'rounds object) (vconcat round-objects))
+    object))
+
+(defun magnus-test-review--write-json-object (file object)
+  "Write JSON OBJECT to FILE for a persistence-boundary fixture."
+  (let ((json-encoding-pretty-print nil))
+    (with-temp-file file
+      (insert (json-serialize object :null-object nil
+                              :false-object :json-false))
+      (insert "\n"))))
+
+(defun magnus-test-review--file-string (file)
+  "Return FILE's exact textual contents."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (buffer-string)))
+
+(ert-deftest magnus-review-schema-2-serializes-ledger-not-aggregate-caches ()
+  (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-schema-2-" t))
+               (magnus-review-directory-root storage)
+               (magnus-reviews nil)
+               (magnus-reviews-changed-hook nil))
+    (unwind-protect
+        (let* ((review
+                (magnus-review-create
+                 root "schema-author" "quick-wren"
+                 :id "schema-two-ledger" :task "Exercise schema two"
+                 :reviewer-name "keen-owl" :reviewer-provider 'codex))
+               (token (magnus-review-checkpoint-token review))
+               (same-token (magnus-review-await-checkpoint review))
+               (round
+                (magnus-review-append-round
+                 review base head :checkpoint-token token))
+               (manifest
+                (magnus-review--read-json-file
+                 (magnus-review-manifest-path review)))
+               (request (car (alist-get 'checkpoint_requests manifest)))
+               (event (car (alist-get 'events request)))
+               (round-object (car (alist-get 'rounds manifest))))
+          (should (equal same-token token))
+          (should (= (length (magnus-review-checkpoint-requests review)) 1))
+          (should (= (alist-get 'schema_version manifest) 2))
+          (dolist (field '(execution verdict delivery_state read_state
+                           checkpoint_token checkpoint_acks
+                           base_oid head_oid previous_head_oid))
+            (should-not (assq field manifest)))
+          (should-not (assq 'checkpoint_token round-object))
+          (should (= (alist-get 'number request) 1))
+          (should (equal (alist-get 'token request) token))
+          (should (equal (alist-get 'kind event) "round"))
+          (should (= (alist-get 'round_number event) 1))
+          (setq magnus-reviews nil)
+          (let* ((loaded
+                  (magnus-review-load-file
+                   (magnus-review-manifest-path review)))
+                 (loaded-round (magnus-review-latest-round loaded)))
+            (should (eq (magnus-review-execution loaded) 'queued))
+            (should (equal (magnus-review-checkpoint-token loaded) token))
+            (should (equal (magnus-review-round-checkpoint-token loaded-round)
+                           token))
+            (should (= (magnus-review-round-number loaded-round)
+                       (magnus-review-round-number round)))))
+      (delete-directory root t)
+      (delete-directory storage t))))
+
+(ert-deftest magnus-review-save-rolls-object-graph-back-in-place ()
+  (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-rollback-" t))
+               (magnus-review-directory-root storage)
+               (magnus-reviews nil)
+               (magnus-reviews-changed-hook nil))
+    (unwind-protect
+        (let* ((review
+                (magnus-review-create
+                 root "rollback-author" "quick-wren"
+                 :id "rollback-ledger" :task "Rollback failed saves"
+                 :reviewer-name "keen-owl" :reviewer-provider 'codex))
+               (request (magnus-review-current-checkpoint-request review))
+               (round
+                (magnus-review-append-round
+                 review base head
+                 :checkpoint-token
+                 (magnus-review-checkpoint-request-token request)))
+               (event (car (magnus-review-checkpoint-request-events request)))
+               (attempt (magnus-review-append-attempt review round))
+               (manifest (magnus-review-manifest-path review))
+               (before (magnus-test-review--file-string manifest)))
+          (cl-letf (((symbol-function 'magnus-review--atomic-write-string)
+                     (lambda (&rest _args) (error "replacement failed"))))
+            (should-error
+             (magnus-review-mark-attempt-running
+              review round attempt (magnus-review-attempt-token attempt))))
+          (should (eq request (magnus-review-current-checkpoint-request review)))
+          (should (eq event
+                      (car (magnus-review-checkpoint-request-events request))))
+          (should (eq round (magnus-review-latest-round review)))
+          (should (eq attempt (magnus-review-latest-attempt round)))
+          (should (eq (magnus-review-attempt-execution attempt) 'starting))
+          (should (eq (magnus-review-round-execution round) 'starting))
+          (should (eq (magnus-review-execution review) 'starting))
+          (should (equal (magnus-test-review--file-string manifest) before))
+          ;; Validation failures use the same durable snapshot and restore the
+          ;; existing request object rather than replacing it with a clone.
+          (let ((token (magnus-review-checkpoint-request-token request)))
+            (setf (magnus-review-checkpoint-request-token request) "bad")
+            (should-error (magnus-review-save review)
+                          :type 'magnus-review-error)
+            (should (eq request
+                        (magnus-review-current-checkpoint-request review)))
+            (should (equal
+                     (magnus-review-checkpoint-request-token request) token))
+            (should (equal (magnus-test-review--file-string manifest) before)))
+          ;; Appending a brand-new request and then failing replacement restores
+          ;; the old list; all pre-existing record identities remain reachable.
+          (let ((now (float-time)))
+            (setf (magnus-review-attempt-execution attempt) 'complete
+                  (magnus-review-attempt-finished-at attempt) now
+                  (magnus-review-round-execution round) 'complete
+                  (magnus-review-round-verdict round) 'comment
+                  (magnus-review-round-completed-at round) now
+                  (magnus-review-round-delivery-state round) 'pending
+                  (magnus-review-round-read-state round) 'unread)
+            (magnus-review-save review))
+          (let ((complete-bytes
+                 (magnus-test-review--file-string manifest)))
+            (cl-letf (((symbol-function 'magnus-review--atomic-write-string)
+                       (lambda (&rest _args) (error "replacement failed"))))
+              (should-error (magnus-review-await-checkpoint review)))
+            (should (= (length (magnus-review-checkpoint-requests review)) 1))
+            (should (eq request
+                        (magnus-review-current-checkpoint-request review)))
+            (should (eq event
+                        (car (magnus-review-checkpoint-request-events request))))
+            (should (eq round (magnus-review-latest-round review)))
+            (should (eq attempt (magnus-review-latest-attempt round)))
+            (should (eq (magnus-review-execution review) 'complete))
+            (should (equal (magnus-test-review--file-string manifest)
+                           complete-bytes))))
+      (delete-directory root t)
+      (delete-directory storage t))))
+
+(ert-deftest magnus-review-atomic-write-preserves-primary-error ()
+  (let* ((directory (make-temp-file "magnus-review-atomic-error-" t))
+         (target (expand-file-name "manifest.json" directory))
+         observed)
+    (unwind-protect
+        (cl-letf (((symbol-function 'write-region)
+                   (lambda (&rest _args) (error "primary write failure")))
+                  ((symbol-function 'delete-file)
+                   (lambda (&rest _args) (error "cleanup failure"))))
+          (condition-case err
+              (magnus-review--atomic-write-string target "{}\n")
+            (error (setq observed (error-message-string err))))
+          (should (string-match-p "primary write failure" observed))
+          (should-not (string-match-p "cleanup failure" observed)))
+      (delete-directory directory t))))
 
 (ert-deftest magnus-review-unchanged-checkpoint-settles-and-advances-durably ()
   (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
@@ -465,18 +671,206 @@
                  :checkpoint-token (magnus-review-checkpoint-token review))))
           (magnus-test-review--publish-fixture-round review round)
           (let ((token (magnus-review-await-checkpoint review)))
-            (setf (magnus-review-checkpoint-acks review)
-                  (list (cons token 1))
-                  ;; Reproduce the durable shape written before unchanged
-                  ;; checkpoints became terminal no-op requests.
-                  (magnus-review-execution review) 'waiting-for-checkpoint)
-            (magnus-review-save review))
+            (let ((object (magnus-test-review--schema-1-object review)))
+              ;; Reproduce the durable shape written before unchanged
+              ;; checkpoints became terminal no-op requests.
+              (setf (alist-get 'execution object) "waiting-for-checkpoint"
+                    (alist-get 'checkpoint_acks object)
+                    (vector (vector token 1)))
+              (magnus-test-review--write-json-object
+               (magnus-review-manifest-path review) object)))
           (setq magnus-reviews nil)
           (should (= (magnus-review-load-all) 1))
           (let ((loaded (magnus-review-get "legacy-acknowledged-wait")))
             (should (eq (magnus-review-execution loaded) 'complete))
             (should (eq (magnus-review-verdict loaded) 'changes-requested))
             (should (= (length (magnus-review-checkpoint-acks loaded)) 1))))
+      (delete-directory root t)
+      (delete-directory storage t))))
+
+(ert-deftest magnus-review-migrates-two-round-schema-1-history-lazily ()
+  (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-v1-two-rounds-" t))
+               (magnus-review-directory-root storage)
+               (magnus-reviews nil)
+               (magnus-reviews-changed-hook nil))
+    (unwind-protect
+        (let* ((review
+                (magnus-review-create
+                 root "fixture-author" "quick-wren"
+                 :id "schema-one-two-rounds"
+                 :task "Preserve every historical round"
+                 :reviewer-name "keen-owl" :reviewer-provider 'codex))
+               (token-one (magnus-review-checkpoint-token review))
+               (round-one
+                (magnus-review-append-round
+                 review base head :checkpoint-token token-one)))
+          ;; Mirror the live two-round manifest's first-round retry topology.
+          (dotimes (_ 3)
+            (let ((attempt (magnus-review-append-attempt review round-one)))
+              (magnus-review-fail-attempt
+               review round-one attempt "fixture retry")))
+          (magnus-test-review--publish-fixture-round review round-one)
+          (setf (magnus-review-session-id review) "stable-review-session")
+          (magnus-review-save review)
+          (with-temp-file (expand-file-name "sample.el" root)
+            (insert "(defun sample ()\n  3)\n"))
+          (magnus-test-review--git root "add" "--" "sample.el")
+          (magnus-test-review--git root "commit" "--quiet" "-m" "advance")
+          (let* ((new-head (magnus-test-review--git root "rev-parse" "HEAD"))
+                 (token-two (magnus-review-await-checkpoint review))
+                 (round-two
+                  (magnus-review-append-round
+                   review base new-head :checkpoint-token token-two)))
+            (magnus-test-review--publish-fixture-round review round-two)
+            (let* ((manifest (magnus-review-manifest-path review))
+                   (patch-one (magnus-review-round-patch-path review round-one))
+                   (patch-two (magnus-review-round-patch-path review round-two))
+                   (patch-one-before
+                    (magnus-test-review--file-string patch-one))
+                   (patch-two-before
+                    (magnus-test-review--file-string patch-two))
+                   (object (magnus-test-review--schema-1-object review)))
+              (magnus-test-review--write-json-object manifest object)
+              (let ((schema-one-bytes
+                     (magnus-test-review--file-string manifest)))
+                (setq magnus-reviews nil)
+                (should (= (magnus-review-load-all) 1))
+                ;; Loading and migration are read-only until a real transition.
+                (should (equal (magnus-test-review--file-string manifest)
+                               schema-one-bytes))
+                (let* ((loaded (magnus-review-get "schema-one-two-rounds"))
+                       (requests
+                        (magnus-review-checkpoint-requests loaded))
+                       (loaded-rounds (magnus-review-rounds loaded)))
+                  (should (= (length requests) 2))
+                  (should (equal
+                           (mapcar #'magnus-review-checkpoint-request-token
+                                   requests)
+                           (list token-one token-two)))
+                  (should (equal
+                           (mapcar
+                            (lambda (request)
+                              (mapcar
+                               #'magnus-review-checkpoint-event-kind
+                               (magnus-review-checkpoint-request-events
+                                request)))
+                            requests)
+                           '((round) (round))))
+                  (should (equal (magnus-review-session-id loaded)
+                                 "stable-review-session"))
+                  (should (= (length
+                              (magnus-review-round-attempts
+                               (nth 0 loaded-rounds)))
+                             4))
+                  (should (= (length
+                              (magnus-review-round-attempts
+                               (nth 1 loaded-rounds)))
+                             1))
+                  (should (equal (magnus-test-review--file-string patch-one)
+                                 patch-one-before))
+                  (should (equal (magnus-test-review--file-string patch-two)
+                                 patch-two-before))
+                  (magnus-review-mark-read loaded (nth 1 loaded-rounds))
+                  (let ((schema-two
+                         (magnus-review--read-json-file manifest)))
+                    (should (= (alist-get 'schema_version schema-two) 2))
+                    (should-not (assq 'execution schema-two))
+                    (should-not
+                     (assq 'checkpoint_token
+                           (nth 1 (alist-get 'rounds schema-two))))))))))
+      (delete-directory root t)
+      (delete-directory storage t))))
+
+(ert-deftest magnus-review-migrates-legacy-unchanged-then-round-token ()
+  (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-v1-dual-event-" t))
+               (magnus-review-directory-root storage)
+               (magnus-reviews nil)
+               (magnus-reviews-changed-hook nil))
+    (unwind-protect
+        (let* ((review
+                (magnus-review-create
+                 root "dual-author" "bright-crow"
+                 :id "legacy-dual-event" :task "Preserve old replay history"
+                 :reviewer-name "swift-hare" :reviewer-provider 'codex))
+               (round-one
+                (magnus-review-append-round
+                 review base head
+                 :checkpoint-token (magnus-review-checkpoint-token review))))
+          (magnus-test-review--publish-fixture-round review round-one)
+          (with-temp-file (expand-file-name "sample.el" root)
+            (insert "(defun sample ()\n  3)\n"))
+          (magnus-test-review--git root "add" "--" "sample.el")
+          (magnus-test-review--git root "commit" "--quiet" "-m" "advance")
+          (let* ((new-head (magnus-test-review--git root "rev-parse" "HEAD"))
+                 (dual-token (magnus-review-await-checkpoint review))
+                 (round-two
+                  (magnus-review-append-round
+                   review base new-head :checkpoint-token dual-token)))
+            (magnus-test-review--publish-fixture-round review round-two)
+            (let ((object (magnus-test-review--schema-1-object review)))
+              ;; f909 briefly allowed this token to acknowledge round 1 and
+              ;; later produce round 2.  Schema 2 preserves both replay scopes.
+              (setf (alist-get 'checkpoint_acks object)
+                    (vector (list dual-token 1)))
+              (let* ((migrated
+                      (magnus-review--from-json
+                       object (magnus-review-id review)
+                       (magnus-review-project-hash review)))
+                     (request
+                      (magnus-review-checkpoint-request-for-token
+                       migrated dual-token)))
+                (should (equal
+                         (mapcar #'magnus-review-checkpoint-event-kind
+                                 (magnus-review-checkpoint-request-events
+                                  request))
+                         '(unchanged round)))
+                (setq magnus-reviews (list migrated))
+                (should
+                 (= (magnus-review-round-number
+                     (magnus-review-handle-ready-marker
+                      root (list :request-id (magnus-review-id migrated)
+                                 :checkpoint-token dual-token
+                                 :base base :head head)))
+                    1))
+                (should
+                 (= (magnus-review-round-number
+                     (magnus-review-handle-ready-marker
+                      root (list :request-id (magnus-review-id migrated)
+                                 :checkpoint-token dual-token
+                                 :base base :head new-head)))
+                    2))))))
+      (delete-directory root t)
+      (delete-directory storage t))))
+
+(ert-deftest magnus-review-schema-2-rejects-broken-checkpoint-timeline ()
+  (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-bad-timeline-" t))
+               (magnus-review-directory-root storage)
+               (magnus-reviews nil)
+               (magnus-reviews-changed-hook nil))
+    (unwind-protect
+        (let* ((review
+                (magnus-review-create
+                 root "timeline-author" "quick-wren"
+                 :id "broken-timeline" :task "Reject orphan rounds"
+                 :reviewer-name "keen-owl" :reviewer-provider 'codex))
+               (_round
+                (magnus-review-append-round
+                 review base head
+                 :checkpoint-token (magnus-review-checkpoint-token review)))
+               (object
+                (magnus-review--read-json-file
+                 (magnus-review-manifest-path review)))
+               (request (car (alist-get 'checkpoint_requests object))))
+          ;; The round remains present but no request produces it.
+          (setf (alist-get 'events request) [])
+          (should-error
+           (magnus-review--from-json
+            object (magnus-review-id review)
+            (magnus-review-project-hash review))
+           :type 'magnus-review-error))
       (delete-directory root t)
       (delete-directory storage t))))
 
@@ -528,23 +922,105 @@
 (ert-deftest magnus-review-rereview-resends-waiting-checkpoint-token ()
   (let* ((token
           "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+         (request
+          (magnus-review-checkpoint-request--create
+           :number 1 :token token :requested-at 1 :events nil))
          (review
           (magnus-review--create
            :id "resend-checkpoint" :author-name "bright-crow"
            :reviewer-name "swift-hare" :lifecycle 'open
-           :execution 'waiting-for-checkpoint :checkpoint-token token))
+           :execution 'complete :checkpoint-token token
+           :checkpoint-requests (list request)))
          delivered)
     (cl-letf (((symbol-function 'magnus-review-controller--deliver-checkpoint)
-               (lambda (candidate)
+               (lambda (candidate exact-request)
                  (setq delivered
-                       (list candidate
-                             (magnus-review-checkpoint-token candidate)))
+                       (list candidate exact-request
+                             (magnus-review-checkpoint-request-token
+                              exact-request)))
                  t)))
       (should (eq (magnus-review-rereview review) review)))
-    (should (equal delivered (list review token)))
+    (should (equal delivered (list review request token)))
     (should (equal (magnus-review-checkpoint-token review) token))))
 
-(ert-deftest magnus-review-resend-settles-hot-loaded-acknowledgement ()
+(ert-deftest magnus-review-checkpoint-message-pins-the-exact-request ()
+  (let* ((request
+          (magnus-review-checkpoint-request--create
+           :number 1 :token "exact-request-token"
+           :requested-at 1 :events nil))
+         (review
+          (magnus-review--create
+           :id "exact-message" :project-root "/tmp/project"
+           :author-name "bright-crow" :task "Finish the controller"
+           :checkpoint-token "stale-aggregate-token"))
+         message)
+    (cl-letf (((symbol-function 'magnus-review-suggest-upstream-scope)
+               (lambda (_root)
+                 (list :base-oid magnus-test-review--base-oid
+                       :head-oid magnus-test-review--head-oid))))
+      (setq message
+            (magnus-review-controller--checkpoint-message review request)))
+    (should (string-match-p
+             (regexp-quote "checkpoint=exact-request-token") message))
+    (should-not (string-match-p
+                 (regexp-quote "stale-aggregate-token") message))))
+
+(ert-deftest magnus-review-checkpoint-recovery-delivers-only-pending-request ()
+  (let* ((request
+          (magnus-review-checkpoint-request--create
+           :number 1 :token "canonical-token" :requested-at 1 :events nil))
+         (review
+          (magnus-review--create
+           :id "checkpoint-recovery" :lifecycle 'open
+           ;; A deliberately stale aggregate must not suppress recovery.
+           :execution 'complete :checkpoint-requests (list request)))
+         delivered)
+    (cl-letf (((symbol-function 'magnus-review-controller--deliver-checkpoint)
+               (lambda (candidate exact-request)
+                 (setq delivered (list candidate exact-request)))))
+      (magnus-review-controller--recover-checkpoint-token review nil)
+      (should (equal delivered (list review request)))
+      (setq delivered nil)
+      (setf (magnus-review-checkpoint-request-events request)
+            (list
+             (magnus-review-checkpoint-event--create
+              :kind 'round :round-number 1 :recorded-at 2)))
+      (magnus-review-controller--recover-checkpoint-token review nil)
+      (should-not delivered))))
+
+(ert-deftest magnus-review-checkpoint-delivery-rejects-stale-request-object ()
+  (let* ((first
+          (magnus-review-checkpoint-request--create
+           :number 1 :token "old-token" :requested-at 1
+           :events
+           (list
+            (magnus-review-checkpoint-event--create
+             :kind 'round :round-number 1 :recorded-at 2))))
+         (pending
+          (magnus-review-checkpoint-request--create
+           :number 2 :token "current-token" :requested-at 3 :events nil))
+         (review
+          (magnus-review--create
+           :id "request-race"
+           :checkpoint-requests (list first pending)))
+         (author (magnus-instance--create :id "author" :name "bright-crow"))
+         messaged)
+    (cl-letf (((symbol-function 'magnus-review-controller--author-instance)
+               (lambda (_review) author))
+              ((symbol-function 'magnus-review-controller--checkpoint-message)
+               (lambda (candidate request)
+                 (setq messaged (list candidate request))
+                 "checkpoint message"))
+              ((symbol-function 'magnus-review-controller--send)
+               (lambda (&rest _args) t)))
+      (should-not
+       (magnus-review-controller--deliver-checkpoint review first))
+      (should-not messaged)
+      (should
+       (magnus-review-controller--deliver-checkpoint review pending))
+      (should (equal messaged (list review pending))))))
+
+(ert-deftest magnus-review-resend-refuses-resolved-ledger-despite-stale-cache ()
   (let* ((token
           "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
          (round
@@ -553,27 +1029,25 @@
            :base-oid "1111111111111111111111111111111111111111"
            :head-oid "2222222222222222222222222222222222222222"
            :execution 'complete))
+         (request
+          (magnus-review-checkpoint-request--create
+           :number 1 :token token :requested-at 1
+           :events
+           (list
+            (magnus-review-checkpoint-event--create
+             :kind 'unchanged :round-number 1 :recorded-at 2))))
          (review
           (magnus-review--create
            :id "hot-loaded-checkpoint" :author-name "bright-crow"
            :reviewer-name "swift-hare" :lifecycle 'open
            :execution 'waiting-for-checkpoint :checkpoint-token token
-           :checkpoint-acks (list (cons token 1)) :rounds (list round)))
-         settled)
-    (cl-letf (((symbol-function
-                'magnus-review--acknowledge-unchanged-checkpoint)
-               (lambda (candidate checkpoint base head)
-                 (setq settled (list candidate checkpoint base head))
-                 (setf (magnus-review-execution candidate) 'complete)))
-              ((symbol-function 'magnus-review-controller--deliver-checkpoint)
+           :checkpoint-acks (list (cons token 1)) :rounds (list round)
+           :checkpoint-requests (list request))))
+    (cl-letf (((symbol-function 'magnus-review-controller--deliver-checkpoint)
                (lambda (&rest _args)
-                 (ert-fail "Acknowledged request was redelivered"))))
-      (should (eq (magnus-review-rereview review) review)))
-    (should (equal settled
-                   (list review token
-                         "1111111111111111111111111111111111111111"
-                         "2222222222222222222222222222222222222222")))
-    (should (eq (magnus-review-execution review) 'complete))))
+                 (ert-fail "Resolved request was redelivered"))))
+      (should-error (magnus-review-resend-checkpoint review)
+                    :type 'user-error))))
 
 (defun magnus-test-review--raw-result (base head &optional path line)
   "Return valid structured output for BASE..HEAD, optionally anchored."
@@ -806,13 +1280,14 @@
           (should delivered)
           (should notified)
           (should (eq (magnus-review-round-execution round) 'complete))
-          (should
-           (equal
-            (alist-get
-             'execution
-             (magnus-review--read-json-file
-              (magnus-review-manifest-path review)))
-            "complete")))
+          (let* ((manifest
+                  (magnus-review--read-json-file
+                   (magnus-review-manifest-path review)))
+                 (round-object (car (alist-get 'rounds manifest))))
+            (should (= (alist-get 'schema_version manifest) 2))
+            (should-not (assq 'execution manifest))
+            (should (equal (alist-get 'execution round-object)
+                           "complete"))))
       (delete-directory root t)
       (delete-directory storage t))))
 
@@ -941,8 +1416,13 @@
          (waiting-review
           (magnus-review--create
            :id "waiting-review" :project-root "/tmp/waiting"
-           :lifecycle 'open :execution 'waiting-for-checkpoint
-           :created-at 5 :rounds nil))
+           :lifecycle 'open :execution 'complete
+           :created-at 5 :rounds nil
+           :checkpoint-requests
+           (list
+            (magnus-review-checkpoint-request--create
+             :number 1 :token "waiting-token" :requested-at 5
+             :events nil))))
          (replayed-round
           (magnus-review-round--create
            :number 1 :created-at 35 :execution 'queued))
@@ -967,6 +1447,12 @@
                (lambda (_root)
                  (setf (magnus-review-rounds waiting-review)
                        (list replayed-round)
+                       (magnus-review-checkpoint-request-events
+                        (magnus-review-current-checkpoint-request
+                         waiting-review))
+                       (list
+                        (magnus-review-checkpoint-event--create
+                         :kind 'round :round-number 1 :recorded-at 35))
                        (magnus-review-execution waiting-review) 'queued)
                  (run-hook-with-args
                   'magnus-review-ready-hook waiting-review replayed-round)))
@@ -1033,17 +1519,32 @@
                       (queued . queued)
                       (starting . running)
                       (running . running)))
-        (let ((review
-               (and (car case)
-                    (magnus-review--create
-                     :id (symbol-name (car case))
-                     :author-instance-id "author"
-                     :lifecycle 'open :execution (car case)))))
+        (let* ((execution (car case))
+               (waiting (eq execution 'waiting-for-checkpoint))
+               (review
+                (and execution
+                     (magnus-review--create
+                      :id (symbol-name execution)
+                      :author-instance-id "author"
+                      :lifecycle 'open :execution execution
+                      :rounds
+                      (unless waiting
+                        (list
+                         (magnus-review-round--create
+                          :number 1 :head-oid magnus-test-review--head-oid
+                          :execution execution)))
+                      :checkpoint-requests
+                      (when waiting
+                        (list
+                         (magnus-review-checkpoint-request--create
+                          :number 1 :token "waiting-token"
+                          :requested-at 1 :events nil)))))))
           (cl-letf (((symbol-function
                       'magnus-review-controller--matching-open-review)
                      (lambda (_author _root _task) review)))
             (let ((context (magnus-review-request-context author)))
               (should (eq (plist-get context :action) (cdr case)))
+              (should (plist-member context :state-key))
               (should (eq (plist-get context :review) review))
               (should (equal (plist-get context :root) "/tmp/project"))
               (should (equal (plist-get context :task)
@@ -1081,6 +1582,29 @@
       (magnus-review-controller--process-ready instance))
     (should (equal (nreverse attempted) '("first" "second")))
     (should (equal warnings '(("first" "resurrection delivery"))))))
+
+(ert-deftest magnus-review-process-ready-replays-canonical-pending-request ()
+  (let* ((instance
+          (magnus-instance--create
+           :id "author-id" :name "quick-wolf"))
+         (request
+          (magnus-review-checkpoint-request--create
+           :number 2 :token "canonical-token" :requested-at 2 :events nil))
+         (review
+          (magnus-review--create
+           :id "pending" :author-instance-id "author-id"
+           :lifecycle 'open
+           ;; Deliberately contradict the ledger to prove the controller does
+           ;; not use this compatibility cache as checkpoint authority.
+           :execution 'complete :checkpoint-requests (list request)))
+         delivered)
+    (cl-letf (((symbol-function 'magnus-review-list)
+               (lambda () (list review)))
+              ((symbol-function 'magnus-review-controller--deliver-checkpoint)
+               (lambda (candidate exact-request)
+                 (setq delivered (list candidate exact-request)))))
+      (magnus-review-controller--process-ready instance))
+    (should (equal delivered (list review request)))))
 
 (ert-deftest magnus-review-completion-notification-survives-delivery-error ()
   (let* ((review (magnus-review--create :id "independent-effects"))

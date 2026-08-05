@@ -938,9 +938,10 @@ the message; callers include stable idempotency keys for replay."
   ;; pending until that exact Magnus instance is resurrected.
   (magnus-instances-get (magnus-review-author-instance-id review)))
 
-(defun magnus-review-controller--checkpoint-message (review)
-  "Build REVIEW's idempotent author checkpoint request."
-  (let* ((scope
+(defun magnus-review-controller--checkpoint-message (review request)
+  "Build REVIEW's idempotent author checkpoint message for exact REQUEST."
+  (let* ((token (magnus-review-checkpoint-request-token request))
+         (scope
           (condition-case err
               (magnus-review-suggest-upstream-scope
                (magnus-review-project-root review))
@@ -954,7 +955,7 @@ the message; callers include stable idempotency keys for replay."
     (format
      (concat
       "[MAGNUS-REVIEW-CHECKPOINT request=%s checkpoint=%s]\n"
-      "Prepare the committed checkpoint for an independent review of: %s\n\n"
+      "Prepare checkpoint request #%d for an independent review of: %s\n\n"
       "Finish the coherent work that belongs to this task, run appropriate "
       "validation, and commit only your own changes. Preserve unrelated dirty "
       "work. Infer the task's upstream merge-base and current committed HEAD; "
@@ -969,24 +970,29 @@ the message; callers include stable idempotency keys for replay."
       "This request is idempotent. If that exact checkpoint was already prepared, "
       "re-emit the same marker; do not create an empty or unrelated commit.")
      (magnus-review-id review)
-     (magnus-review-checkpoint-token review)
+     token
+     (magnus-review-checkpoint-request-number request)
      (magnus-review-task review)
      (or base "not inferred")
      (or head "not inferred")
      (magnus-review-id review)
-     (magnus-review-checkpoint-token review))))
+     token)))
 
-(defun magnus-review-controller--deliver-checkpoint (review)
-  "Try to deliver REVIEW's pending checkpoint request."
-  (when (eq (magnus-review-execution review) 'waiting-for-checkpoint)
-    (when-let ((author (magnus-review-controller--author-instance review)))
-      (magnus-review-controller--send
-       author (magnus-review-controller--checkpoint-message review)))))
+(defun magnus-review-controller--deliver-checkpoint (review &optional request)
+  "Try to deliver REVIEW's exact pending checkpoint REQUEST.
+When REQUEST is nil, capture REVIEW's canonical pending request.  A supplied
+request is accepted only while it remains the canonical pending request."
+  (let ((pending (magnus-review-pending-checkpoint-request review)))
+    (when (and pending (or (null request) (eq request pending)))
+      (when-let ((author (magnus-review-controller--author-instance review)))
+        (magnus-review-controller--send
+         author
+         (magnus-review-controller--checkpoint-message review pending))))))
 
 (defun magnus-review-controller--recover-checkpoint-token (review _marker)
   "Redeliver REVIEW's canonical request after an author used a stale token."
-  (when (eq (magnus-review-execution review) 'waiting-for-checkpoint)
-    (magnus-review-controller--deliver-checkpoint review)))
+  (when-let ((request (magnus-review-pending-checkpoint-request review)))
+    (magnus-review-controller--deliver-checkpoint review request)))
 
 (defun magnus-review-resend-checkpoint (review)
   "Resend REVIEW's current checkpoint request without rotating its token."
@@ -994,27 +1000,14 @@ the message; callers include stable idempotency keys for replay."
    (list (or (and (fboundp 'magnus-review-ui-current-review)
                   (magnus-review-ui-current-review))
              (user-error "No review selected"))))
-  (let* ((latest (magnus-review-latest-round review))
-         (acknowledged
-          (magnus-review--checkpoint-ack-round-for-token
-           review (magnus-review-checkpoint-token review))))
+  (let ((request (magnus-review-pending-checkpoint-request review)))
     (cond
-     ;; Hot-loaded code has not passed through `magnus-review-load-all'.  Let
-     ;; the visible recovery action normalize the same durable legacy shape.
-     ((and (eq (magnus-review-execution review) 'waiting-for-checkpoint)
-           latest
-           (eq latest acknowledged))
-      (magnus-review--acknowledge-unchanged-checkpoint
-       review
-       (magnus-review-checkpoint-token review)
-       (magnus-review-round-base-oid latest)
-       (magnus-review-round-head-oid latest)))
-     ((not (eq (magnus-review-execution review) 'waiting-for-checkpoint))
+     ((null request)
       (user-error "Review by %s is not waiting for a checkpoint"
                   (magnus-review-reviewer-name review)))
-     ((magnus-review-controller--deliver-checkpoint review)
-      (message "Magnus: resent round %d checkpoint request to %s"
-               (1+ (length (magnus-review-rounds review)))
+     ((magnus-review-controller--deliver-checkpoint review request)
+      (message "Magnus: resent checkpoint request %d to %s"
+               (magnus-review-checkpoint-request-number request)
                (magnus-review-author-name review)))
      (t
       (message "Magnus: checkpoint request will reach %s when it resumes"
@@ -1032,27 +1025,66 @@ the message; callers include stable idempotency keys for replay."
           (string= (or (magnus-review-task review) "") task)))
    (magnus-review-list)))
 
+(defun magnus-review-controller--operation (review)
+  "Classify REVIEW's next user operation and return its stable state key.
+The returned plist contains :action and :state-key, plus the exact canonical
+:request or :round when applicable.  Checkpoint waiting is determined only by
+the schema-2 request ledger; aggregate compatibility caches are never treated
+as checkpoint authority."
+  (if (null review)
+      (list :action 'new :state-key '(new))
+    (let* ((request (magnus-review-pending-checkpoint-request review))
+           (round (magnus-review-latest-round review))
+           (attempt (and round (magnus-review-latest-attempt round)))
+           (execution
+            (or (and round (magnus-review-round-execution round))
+                (let ((legacy (magnus-review-execution review)))
+                  (unless (eq legacy 'waiting-for-checkpoint) legacy))))
+           (action
+            (cond
+             (request 'waiting)
+             ((eq execution 'complete) 'rereview)
+             ((memq execution '(failed interrupted)) 'retry)
+             ((eq execution 'queued) 'queued)
+             ((memq execution '(starting running)) 'running)
+             (t 'new)))
+           (state-key
+            (if request
+                (list
+                 'waiting
+                 (magnus-review-id review)
+                 (magnus-review-lifecycle review)
+                 (magnus-review-checkpoint-request-number request)
+                 (magnus-review-checkpoint-request-token request))
+              (list
+               action
+               (magnus-review-id review)
+               (magnus-review-lifecycle review)
+               (and round (magnus-review-round-number round))
+               execution
+               (and round (magnus-review-round-head-oid round))
+               (and attempt (magnus-review-attempt-number attempt))
+               (and attempt (magnus-review-attempt-token attempt))
+               (and attempt (magnus-review-attempt-execution attempt))))))
+      (list :action action :state-key state-key
+            :request request :round round :execution execution))))
+
 (defun magnus-review-request-context (author)
   "Return the current task-scoped review context for AUTHOR.
-The returned plist contains :root, :task, :review, and :action.  ACTION is
-one of `new', `rereview', `retry', `waiting', `queued', or `running'.  This
-is intentionally read-only so status and transient UIs can describe the exact
-operation that `magnus-review-request' would perform without starting work."
+The returned plist contains :root, :task, :review, :action, and :state-key.
+ACTION is one of `new', `rereview', `retry', `waiting', `queued', or
+`running'.  STATE-KEY snapshots the exact operation identity so transient UIs
+can reject a popup whose review changed without changing its broad ACTION."
   (let* ((root (magnus-review-git-root
                 (magnus-instance-directory author)))
          (task (magnus-review-controller--task author root))
          (review
           (magnus-review-controller--matching-open-review author root task))
-         (execution (and review (magnus-review-execution review)))
-         (action
-          (pcase execution
-            ('complete 'rereview)
-            ((or 'failed 'interrupted) 'retry)
-            ('waiting-for-checkpoint 'waiting)
-            ('queued 'queued)
-            ((or 'starting 'running) 'running)
-            (_ 'new))))
-    (list :author author :root root :task task :review review :action action)))
+         (operation (magnus-review-controller--operation review)))
+    (list :author author :root root :task task :review review
+          :action (plist-get operation :action)
+          :state-key (plist-get operation :state-key)
+          :execution (plist-get operation :execution))))
 
 ;;;###autoload
 (cl-defun magnus-review-request
@@ -1064,18 +1096,23 @@ CONTEXT, when non-nil, must be a freshly validated value returned by
   (let* ((context (or context (magnus-review-request-context author)))
          (root (plist-get context :root))
          (task (plist-get context :task))
-         (existing (plist-get context :review)))
+         (existing (plist-get context :review))
+         (operation (magnus-review-controller--operation existing)))
     (unless (eq author (plist-get context :author))
       (user-error "Review request context belongs to a different agent"))
+    (when (and (plist-member context :state-key)
+               (not (equal (plist-get context :state-key)
+                           (plist-get operation :state-key))))
+      (user-error "Review request context is stale; request it again"))
     (if existing
-        (pcase (magnus-review-execution existing)
-          ('complete (magnus-review-rereview existing))
-          ('waiting-for-checkpoint
+        (pcase (plist-get operation :action)
+          ('rereview (magnus-review-rereview existing))
+          ('waiting
            (magnus-review-resend-checkpoint existing))
-          ((or 'failed 'interrupted) (magnus-review-retry existing))
+          ('retry (magnus-review-retry existing))
           (_ (user-error "Review by %s is already %s"
                          (magnus-review-reviewer-name existing)
-                         (magnus-review-execution existing))))
+                         (plist-get operation :action))))
       (let* ((reviewer-provider
               (magnus-review-controller--provider author provider))
              (_supported
@@ -1107,7 +1144,8 @@ CONTEXT, when non-nil, must be a freshly validated value returned by
                       1200))))))
         (magnus-coord-ensure-file root)
         (magnus-coord-start-watching root)
-        (if (magnus-review-controller--deliver-checkpoint review)
+        (if (magnus-review-controller--deliver-checkpoint
+             review (magnus-review-pending-checkpoint-request review))
             (message "Magnus: %s will review %s after its committed checkpoint"
                      reviewer-name (magnus-instance-name author))
           (message "Magnus: review queued; checkpoint request will reach %s when it resumes"
@@ -1120,10 +1158,13 @@ CONTEXT, when non-nil, must be a freshly validated value returned by
    (list (or (and (fboundp 'magnus-review-ui-current-review)
                   (magnus-review-ui-current-review))
              (user-error "No review selected"))))
-  (if (eq (magnus-review-execution review) 'waiting-for-checkpoint)
+  (if (magnus-review-pending-checkpoint-request review)
       (magnus-review-resend-checkpoint review)
     (magnus-review-await-checkpoint review)
-    (magnus-review-controller--deliver-checkpoint review)
+    (let ((request (magnus-review-pending-checkpoint-request review)))
+      (unless request
+        (error "Checkpoint transition did not create a pending request"))
+      (magnus-review-controller--deliver-checkpoint review request))
     (message "Magnus: requested round %d from %s"
              (1+ (length (magnus-review-rounds review)))
              (magnus-review-author-name review))
@@ -1890,14 +1931,14 @@ Return non-nil when publication was recovered."
               review "resurrection delivery" err)))))))
   (dolist (review (magnus-review-list))
     (when (and (eq (magnus-review-lifecycle review) 'open)
-               (eq (magnus-review-execution review) 'waiting-for-checkpoint)
                (string= (magnus-review-author-instance-id review)
                         (magnus-instance-id instance)))
-      (condition-case err
-          (magnus-review-controller--deliver-checkpoint review)
-        (error
-         (magnus-review-controller--recovery-warning
-          review "resurrection checkpoint" err))))))
+      (when-let ((request (magnus-review-pending-checkpoint-request review)))
+        (condition-case err
+            (magnus-review-controller--deliver-checkpoint review request)
+          (error
+           (magnus-review-controller--recovery-warning
+            review "resurrection checkpoint" err)))))))
 
 (defun magnus-review-controller--refresh-status ()
   "Refresh the visible Magnus status buffer after review state changes."
@@ -1991,8 +2032,7 @@ Return non-nil when publication was recovered."
                   (error
                    (magnus-review-controller--recovery-warning
                     review "attempt reconciliation" err))))
-              (when (eq (magnus-review-execution review)
-                        'waiting-for-checkpoint)
+              (when (magnus-review-pending-checkpoint-request review)
                 (cl-pushnew (magnus-review-project-root review) watcher-roots
                             :test #'string=)))
             (unless (eq (magnus-review-lifecycle review) 'archived)

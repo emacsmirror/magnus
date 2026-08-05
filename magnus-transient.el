@@ -67,8 +67,8 @@
           (plist-get context :root)
           (plist-get context :task)
           (and review (magnus-review-id review))
-          (and review (magnus-review-execution review))
-          (plist-get context :action))))
+          (plist-get context :action)
+          (plist-get context :state-key))))
 
 (defun magnus-transient--validated-review-request-context (context)
   "Return a fresh equivalent of CONTEXT or reject a stale popup."
@@ -121,11 +121,17 @@
 (defun magnus-transient--review-request-action-description ()
   "Describe what RET will do in the request transient."
   (let* ((context (magnus-transient--current-review-request-context))
-         (review (plist-get context :review)))
+         (review (plist-get context :review))
+         (execution
+          (or (plist-get context :execution)
+              (and review
+                   (plist-get
+                    (magnus-review-controller--operation review)
+                    :execution)))))
     (pcase (plist-get context :action)
       ('new "Start independent review")
       ('rereview "Request the next review round")
-      ('retry (if (eq (magnus-review-execution review) 'interrupted)
+      ('retry (if (eq execution 'interrupted)
                   "Retry interrupted review"
                 "Retry failed review"))
       ('waiting "Resend current checkpoint request")
@@ -232,25 +238,33 @@ review actions."
     (setq magnus-transient--review-request-context nil)
     (magnus-status-refresh)))
 
-(defvar magnus-transient--review nil
-  "Review currently targeted by the review action transient.")
+(defvar magnus-transient--review-action-context nil
+  "Immutable identity snapshot for the visible review action transient.")
 
-(defvar magnus-transient--review-round nil
-  "Round currently targeted by the review action transient.")
+(defun magnus-transient--make-review-action-context (review &optional round)
+  "Return a pinned action context for REVIEW and optional ROUND."
+  (let ((operation (magnus-review-controller--operation review)))
+    (list :review-id (magnus-review-id review)
+          :round-number (and round (magnus-review-round-number round))
+          :action (plist-get operation :action)
+          :state-key (copy-tree (plist-get operation :state-key))
+          :reviewer-name (magnus-review-reviewer-name review)
+          :author-name (magnus-review-author-name review))))
 
 (defun magnus-transient--review-description ()
   "Return a heading for the current review action transient."
-  (if magnus-transient--review
+  (if magnus-transient--review-action-context
       (format "Review: %s → %s"
-              (magnus-review-reviewer-name magnus-transient--review)
-              (magnus-review-author-name magnus-transient--review))
+              (plist-get magnus-transient--review-action-context
+                         :reviewer-name)
+              (plist-get magnus-transient--review-action-context
+                         :author-name))
     "No review selected"))
 
 (defun magnus-transient--review-rereview-description ()
   "Describe the selected review's checkpoint action."
-  (if (and magnus-transient--review
-           (eq (magnus-review-execution magnus-transient--review)
-               'waiting-for-checkpoint))
+  (if (eq (plist-get magnus-transient--review-action-context :action)
+          'waiting)
       "Resend checkpoint request"
     "Request re-review"))
 
@@ -270,49 +284,87 @@ review actions."
   "Open actions for REVIEW and optional ROUND.
 When called from the status buffer, use the review at point."
   (interactive)
-  (setq magnus-transient--review
+  (setq review
         (or review (magnus-status--get-review-at-point)
-            (user-error "Put point on a review first"))
-        magnus-transient--review-round round)
+            (user-error "Put point on a review first")))
+  (setq magnus-transient--review-action-context
+        (magnus-transient--make-review-action-context review round))
   (transient-setup #'magnus-review-actions-menu))
+
+(defun magnus-transient--review-actions-active-p ()
+  "Return non-nil while invoking a suffix of the review action transient."
+  (eq transient-current-command 'magnus-review-actions-menu))
+
+(defun magnus-transient--review-action-review (&optional validate)
+  "Resolve the action transient's pinned review, optionally VALIDATE its state."
+  (let* ((context magnus-transient--review-action-context)
+         (id (plist-get context :review-id))
+         (review (and id (magnus-review-get id))))
+    (unless review
+      (user-error "The selected review is no longer loaded"))
+    (when (and validate
+               (not (equal
+                     (plist-get context :state-key)
+                     (plist-get
+                      (magnus-review-controller--operation review)
+                      :state-key))))
+      (user-error "Review state changed; close this popup and press v again"))
+    review))
+
+(defun magnus-transient--review-action-round (review)
+  "Resolve the action transient's pinned round within fresh REVIEW."
+  (when-let ((number
+              (plist-get magnus-transient--review-action-context
+                         :round-number)))
+    (let ((round (nth (1- number) (magnus-review-rounds review))))
+      (unless (and round (= (magnus-review-round-number round) number))
+        (user-error "The selected review round is no longer available"))
+      round)))
 
 (defun magnus-transient--selected-review ()
   "Return the review selected by transient context or status point."
   (if (derived-mode-p 'magnus-status-mode)
       (or (magnus-status--get-review-at-point)
           (user-error "Put point on a review first"))
-    (or magnus-transient--review
-        (user-error "No review selected"))))
+    (magnus-transient--review-action-review)))
+
+(defun magnus-transient--review-for-mutation ()
+  "Return the pinned review for a popup mutation, rejecting stale state."
+  (if (magnus-transient--review-actions-active-p)
+      (magnus-transient--review-action-review t)
+    (magnus-transient--selected-review)))
 
 (defun magnus-transient-review-open ()
   "Open the selected review in its Magit-style reader."
   (interactive)
-  (if (derived-mode-p 'magnus-status-mode)
-      (progn
-        ;; The main dispatch also appears on instance rows; keep its labeled
-        ;; review action honest instead of accidentally visiting that instance.
-        (magnus-transient--selected-review)
-        (magnus-status-visit))
-    (magnus-review-ui-open
-     (magnus-transient--selected-review)
-     magnus-transient--review-round)))
+  (if (magnus-transient--review-actions-active-p)
+      (let ((review (magnus-transient--review-action-review)))
+        (magnus-review-ui-open
+         review (magnus-transient--review-action-round review)))
+    (if (derived-mode-p 'magnus-status-mode)
+        (progn
+          ;; The main dispatch also appears on instance rows; keep its labeled
+          ;; review action honest instead of accidentally visiting that instance.
+          (magnus-transient--selected-review)
+          (magnus-status-visit))
+      (magnus-review-ui-open (magnus-transient--selected-review) nil))))
 
 (defun magnus-transient-review-rereview ()
   "Request a new committed checkpoint for the selected review."
   (interactive)
-  (magnus-review-rereview (magnus-transient--selected-review))
+  (magnus-review-rereview (magnus-transient--review-for-mutation))
   (magnus-status-refresh))
 
 (defun magnus-transient-review-retry ()
   "Retry the selected review's latest failed or interrupted round."
   (interactive)
-  (magnus-review-retry (magnus-transient--selected-review))
+  (magnus-review-retry (magnus-transient--review-for-mutation))
   (magnus-status-refresh))
 
 (defun magnus-transient-review-interrupt ()
   "Interrupt the selected review's running headless attempt."
   (interactive)
-  (let ((review (magnus-transient--selected-review)))
+  (let ((review (magnus-transient--review-for-mutation)))
     (when (yes-or-no-p
            (format "Interrupt the review by %s? "
                    (magnus-review-reviewer-name review)))
@@ -322,14 +374,15 @@ When called from the status buffer, use the review at point."
 (defun magnus-transient-review-delivery ()
   "Retry delivery of the selected completed review to its author."
   (interactive)
-  (magnus-review-retry-delivery (magnus-transient--selected-review)
-                                magnus-transient--review-round)
-  (magnus-status-refresh))
+  (let ((review (magnus-transient--review-for-mutation)))
+    (magnus-review-retry-delivery
+     review (magnus-transient--review-action-round review))
+    (magnus-status-refresh)))
 
 (defun magnus-transient-review-archive ()
   "Archive the selected durable review without deleting its reports."
   (interactive)
-  (let ((review (magnus-transient--selected-review)))
+  (let ((review (magnus-transient--review-for-mutation)))
     (if (eq (magnus-review-lifecycle review) 'archived)
         (user-error "Review is already archived")
       (when (yes-or-no-p
