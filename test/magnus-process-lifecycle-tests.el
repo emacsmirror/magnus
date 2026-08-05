@@ -341,7 +341,8 @@ When AGENT is non-nil, include its pre-existing Active Work row."
            (first-timer (timer-create))
            (second-timer (timer-create))
            (timers (list first-timer second-timer))
-           cancelled)
+           cancelled
+           terminal-environment)
       (unwind-protect
           (cl-letf
               (((symbol-value 'magnus-claude-executable) "claude")
@@ -349,7 +350,9 @@ When AGENT is non-nil, include its pre-existing Active Work row."
                ((symbol-function 'magnus-process--list-sessions)
                 (lambda (_directory) nil))
                ((symbol-function 'magnus-terminal-create-buffer)
-                (lambda (_name) terminal))
+                (lambda (_name &optional environment)
+                  (setq terminal-environment environment)
+                  terminal))
                ((symbol-function 'vterm-send-string) #'ignore)
                ((symbol-function 'magnus-process--setup-sentinel) #'ignore)
                ((symbol-function 'run-with-timer)
@@ -359,8 +362,14 @@ When AGENT is non-nil, include its pre-existing Active Work row."
                ((symbol-function 'magnus-process--watch-for-session)
                 (lambda (&rest _arguments) (error "watch setup failed"))))
             (let ((err (should-error (magnus-process--spawn instance))))
-              (should (string-match-p "watch setup failed"
+            (should (string-match-p "watch setup failed"
                                       (error-message-string err))))
+            (should
+             (equal terminal-environment
+                    (list
+                     (format "MAGNUS_COORD_WRITER_ID=%s"
+                             (magnus-instance-id instance))
+                     "MAGNUS_COORD_WRITER_NAME=failed-spawn")))
             (should-not (buffer-live-p terminal))
             (should-not (magnus-instance-buffer instance))
             (should (eq (magnus-instance-status instance) 'stopped))

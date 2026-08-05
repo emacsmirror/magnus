@@ -382,7 +382,12 @@ When MARKER is non-nil, capture its new session against FILES-BEFORE."
          (command (magnus-codex--tui-command instance prompt))
          ;; Finish pure command construction before allocating a terminal so a
          ;; malformed instance cannot strand a vterm buffer.
-         (buffer (magnus-terminal-create-buffer buffer-name))
+         (buffer
+          (magnus-terminal-create-buffer
+           buffer-name
+           (magnus-terminal-coordination-environment
+            (magnus-instance-id instance)
+            (magnus-instance-name instance))))
          (process (get-buffer-process buffer)))
     (unless (process-live-p process)
       (kill-buffer buffer)

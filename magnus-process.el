@@ -236,7 +236,12 @@ When INITIAL-MESSAGE is non-nil, include it in the native TUI's first turn."
     (unwind-protect
         (progn
           ;; Create vterm buffer.
-          (setq buffer (magnus-terminal-create-buffer buffer-name))
+          (setq buffer
+                (magnus-terminal-create-buffer
+                 buffer-name
+                 (magnus-terminal-coordination-environment
+                  (magnus-instance-id instance)
+                  (magnus-instance-name instance))))
           (magnus-instances-update instance
                                    :buffer buffer
                                    :status 'running)
@@ -763,7 +768,12 @@ Replaces slashes, spaces, tildes, and underscores with hyphens."
          (buffer-name (format "*claude:%s*" name))
          (default-directory directory))
     ;; Create vterm buffer
-    (let ((buffer (magnus-terminal-create-buffer buffer-name)))
+    (let ((buffer
+           (magnus-terminal-create-buffer
+            buffer-name
+            (magnus-terminal-coordination-environment
+             (magnus-instance-id instance)
+             (magnus-instance-name instance)))))
       (magnus-instances-update instance
                                :buffer buffer
                                :status 'running)

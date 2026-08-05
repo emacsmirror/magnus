@@ -150,13 +150,15 @@ DATE defaults to the original deterministic test fixture date."
                     directory "shared-terminal" 'codex))
          (terminal (magnus-test--codex-tui instance))
          (buffer (car terminal))
-         requested-name)
+         requested-name
+         requested-environment)
     (unwind-protect
         (let ((magnus-instances-changed-hook nil))
           (cl-letf
               (((symbol-function 'magnus-terminal-create-buffer)
-                (lambda (name)
-                  (setq requested-name name)
+                (lambda (name &optional environment)
+                  (setq requested-name name
+                        requested-environment environment)
                   buffer))
                ((symbol-function 'magnus-process--create-vterm-buffer)
                 (lambda (&rest _arguments)
@@ -167,6 +169,12 @@ DATE defaults to the original deterministic test fixture date."
             (should (eq (magnus-codex--spawn-tui instance "Inspect this")
                         buffer))
             (should (equal requested-name "*codex:shared-terminal*"))
+            (should
+             (equal requested-environment
+                    (list
+                     (format "MAGNUS_COORD_WRITER_ID=%s"
+                             (magnus-instance-id instance))
+                     "MAGNUS_COORD_WRITER_NAME=shared-terminal")))
             (should (eq (magnus-instance-buffer instance) buffer))
             (should (eq (magnus-instance-status instance) 'running))))
       (magnus-test--delete-terminal terminal)

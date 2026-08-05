@@ -15,6 +15,7 @@
 ;;; Code:
 
 (require 'transient)
+(require 'subr-x)
 (require 'magnus-instances)
 (require 'magnus-process)
 (require 'magnus-review)
@@ -38,6 +39,7 @@
 (declare-function magnus-doctor "magnus-doctor")
 
 (defvar magnus-review-ui-action-function)
+(defvar magnus--creation-task)
 
 (defvar magnus-transient--review-request-context nil
   "Cached task-scoped context for the visible review request transient.")
@@ -161,7 +163,9 @@ review actions."
 (transient-define-prefix magnus-dispatch ()
   "Magnus command dispatcher."
   ["Instance Actions"
-   ("c" "Create instance" magnus-status-create)
+   ("c" "Create Claude agent" magnus-status-create)
+   ("X" "Create Codex agent" magnus-transient-create-codex)
+   ("h" "Create headless Claude task" magnus-transient-create-headless)
    ("k" "Archive instance" magnus-status-archive)
    ("R" "Resurrect purged" magnus-status-resurrect-purged)
    ("r" "Rename instance" magnus-status-rename)
@@ -395,49 +399,34 @@ When called from the status buffer, use the review at point."
         (message "Archived review by %s"
                  (magnus-review-reviewer-name review))))))
 
-;;; Create instance menu
+;;; Create instance commands
 
-(transient-define-prefix magnus-create-dispatch ()
-  "Create a new Claude Code instance."
-  ["Create Instance"
-   ("c" "In current directory" magnus-transient-create-current-dir)
-   ("d" "Choose directory" magnus-transient-create-choose-dir)
-   ("p" "In project root" magnus-transient-create-project-root)
-   ("h" "Headless (fire-and-forget)" magnus-transient-create-headless)])
+(defun magnus-transient--creation-directory ()
+  "Return the most relevant directory for a status-buffer creation action."
+  (or (when-let ((instance (ignore-errors
+                             (magnus-status--get-instance-at-point))))
+        (magnus-instance-directory instance))
+      (when-let ((instance (car (magnus-instances-list))))
+        (magnus-instance-directory instance))
+      default-directory))
 
-(defun magnus-transient-create-current-dir ()
-  "Create instance in current directory."
+(defun magnus-transient-create-codex ()
+  "Create a Codex agent in the selected status row's project."
   (interactive)
-  (magnus-process-create default-directory)
-  (magnus-status-refresh))
-
-(defun magnus-transient-create-choose-dir ()
-  "Create instance in a chosen directory."
-  (interactive)
-  (let ((dir (read-directory-name "Directory: " nil nil t)))
-    (magnus-process-create dir)
+  (let* ((task (read-string "Initial Codex task (RET to skip): "))
+         (initial-message (unless (string-empty-p task) task))
+         (magnus--creation-task initial-message))
+    (magnus-process-create
+     (magnus-transient--creation-directory) nil 'codex initial-message)
     (magnus-status-refresh)))
-
-(defun magnus-transient-create-project-root ()
-  "Create instance in the current project root."
-  (interactive)
-  (let ((root (magnus-project-root)))
-    (if root
-        (progn
-          (magnus-process-create root)
-          (magnus-status-refresh))
-      (user-error "Not in a project"))))
 
 (defun magnus-transient-create-headless ()
   "Create a headless (fire-and-forget) Claude Code instance.
 Prompts for a task description, uses directory from instance at point
-or `default-directory'."
+or the best status-buffer project directory."
   (interactive)
   (let* ((prompt (read-string "Task prompt: "))
-         (dir (if-let ((instance (ignore-errors
-                                   (magnus-status--get-instance-at-point))))
-                  (magnus-instance-directory instance)
-                default-directory)))
+         (dir (magnus-transient--creation-directory)))
     (magnus-process-create-headless prompt dir)
     (magnus-status-refresh)))
 
