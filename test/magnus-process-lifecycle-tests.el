@@ -282,6 +282,13 @@ When AGENT is non-nil, include its pre-existing Active Work row."
               (should (eq (plist-get request :purpose) 'agent))
               (should (equal (plist-get request :allowed-tools)
                              "Read Write Edit"))
+              (should
+               (equal
+                (plist-get request :environment-bindings)
+                (list
+                 (format "MAGNUS_COORD_WRITER_ID=%s"
+                         (magnus-instance-id instance))
+                 "MAGNUS_COORD_WRITER_NAME=runner-agent")))
               (should (string-match-p "Implement it"
                                       (plist-get request :prompt)))
               (should (eq (plist-get request :buffer) buffer))

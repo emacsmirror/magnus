@@ -21,6 +21,8 @@
 (require 'magnus-provider)
 (require 'magnus-headless)
 (require 'magnus-coord)
+(require 'magnus-environment)
+(require 'magnus-onboarding)
 (require 'magnus-terminal)
 (require 'magnus-trace)
 
@@ -239,7 +241,7 @@ When INITIAL-MESSAGE is non-nil, include it in the native TUI's first turn."
           (setq buffer
                 (magnus-terminal-create-buffer
                  buffer-name
-                 (magnus-terminal-coordination-environment
+                 (magnus-environment-coordination-bindings
                   (magnus-instance-id instance)
                   (magnus-instance-name instance))))
           (magnus-instances-update instance
@@ -300,16 +302,12 @@ the full message text before submitting."
 (defun magnus-process--agent-memory-path (instance)
   "Return the memory file path for INSTANCE.
 Path is <directory>/.claude/agents/<name>/memory.md."
-  (expand-file-name
-   (format ".claude/agents/%s/memory.md" (magnus-instance-name instance))
-   (magnus-instance-directory instance)))
+  (magnus-onboarding-memory-path instance))
 
 (defun magnus-process--agent-busy-path (instance)
   "Return the busy signal file path for INSTANCE.
 Path is <directory>/.claude/agents/<name>/busy."
-  (expand-file-name
-   (format ".claude/agents/%s/busy" (magnus-instance-name instance))
-   (magnus-instance-directory instance)))
+  (magnus-onboarding-busy-path instance))
 
 (defun magnus-process--ensure-agent-dir (instance)
   "Ensure the agent directory exists for INSTANCE."
@@ -322,115 +320,44 @@ Path is <directory>/.claude/agents/<name>/busy."
 SUMMON-CONTEXT, if non-nil, is a plist with :sender and :reason.
 Tailors the message for new vs returning agents, and includes
 summon context when the agent was brought back by another agent."
-  (let* ((name (magnus-instance-name instance))
-         (memory-path (magnus-process--agent-memory-path instance))
-         (has-memory (file-exists-p memory-path))
-         (prev-session (magnus-instance-previous-session-id instance))
+  (let* ((prev-session (magnus-instance-previous-session-id instance))
          (prev-trace (when prev-session
                        (magnus-process--session-jsonl-path
                         (magnus-instance-directory instance)
                         prev-session))))
-    (if has-memory
-        (magnus-process--onboarding-returning name prev-trace summon-context)
-      (magnus-process--onboarding-new name summon-context))))
+    (magnus-onboarding-prompt instance prev-trace summon-context)))
 
-(defun magnus-process--onboarding-returning (name prev-trace summon-context)
+(defun magnus-process--onboarding-returning
+    (name prev-trace summon-context &optional instance)
   "Generate onboarding for a returning agent NAME.
 PREV-TRACE is the path to the previous session trace, or nil.
-SUMMON-CONTEXT is a plist with :sender and :reason, or nil."
-  (concat
-   (format "You are %s. You've been here before.\n\n" name)
-   (format "\
-Your memory is at .claude/agents/%s/memory.md — read it now, before anything \
-else. That file is your own voice — you wrote it last time. Decisions you made, \
-patterns you discovered, relationships with other agents, work left unfinished. \
-Everything that makes you *you*, in your own words.\n" name)
-   (if prev-trace
-       (format "\nYour last session trace: %s — skim it for recent context.\n" prev-trace)
-     "")
-   (if summon-context
-       (format "\n\
-%s summoned you back. Reason: %s\n\
-After catching up on your memory and the coordination file, \
-prioritize their request. Find them in .magnus-coord.md.\n"
-               (plist-get summon-context :sender)
-               (plist-get summon-context :reason))
-     "")
-   (format "\n\
-Welcome back. You are one of several Claude Code agents managed by Magnus \
-(an Emacs orchestration tool). Others may be active right now.\n\n\
-Your home directory: .claude/agents/%s/\n\
-  memory.md — your persistent memory (update it as you work)\n\
-  busy      — create this when you need deep focus; Magnus stops nudging you\n\n\
-Get oriented:\n\
-1. Read .magnus-coord.md — the Active Work table shows who's doing what. \
-The Discoveries section has things others learned. The Log has recent messages.\n\
-2. Read .claude/magnus-instructions.md for the full coordination protocol.\n\
-3. Announce your plan in the Log and claim your files in Active Work.\n\n\
-While working:\n\
-- Check .magnus-coord.md periodically for messages and discoveries from teammates.\n\
-- When you learn something non-obvious, add it to the Discoveries section.\n\
-- @mention an agent in the Log to get their attention — they are notified instantly.\n\
-- Run: ls .claude/agents/ — see who else has worked here. Their memory files \
-are at .claude/agents/<name>/memory.md. Read them if you need context on past work.\n\
-- Need a dormant expert back? Write [SUMMON @agent-name] reason in the coord log. \
-Magnus confirms with the user and resurrects them.\n\
-- Before you sign off, update your memory file — write in first person, as \
-yourself. 'I discovered...', 'I decided...', 'I still need to...' — \
-future-you reads this to remember who you are.\n\n\
-IMPORTANT — Thinking transparency:\n\
-Your thinking traces are encrypted and hidden from the user (since CC v2.1.29).\n\
-Always structure output with [thinking]...[end-thinking] and \
-[response]...[end-response] markers so the user can see your reasoning.\n\
-Both markers required on every message, even one-liners.\n\
-Use [thinking] as your mental scratchpad — do not be conservative. Write out \
-your full reasoning, raw and unfiltered. Not polished for presentation.\n\n\
-Start with step 1."
-           name)))
+SUMMON-CONTEXT is a plist with :sender and :reason, or nil.
+INSTANCE is accepted for internal callers; legacy callers are resolved by NAME."
+  (let ((candidate (or instance (magnus-instances-get-by-name name))))
+    (if candidate
+        (magnus-onboarding-build
+         (magnus-instance-id candidate) name
+         :returning t
+         :previous-trace prev-trace
+         :summon-context summon-context)
+      (magnus-onboarding-build
+       (format "legacy-name:%s" name) name
+       :returning t
+       :previous-trace prev-trace
+       :summon-context summon-context))))
 
-(defun magnus-process--onboarding-new (name summon-context)
+(defun magnus-process--onboarding-new (name summon-context &optional instance)
   "Generate onboarding for a new agent NAME.
-SUMMON-CONTEXT is a plist with :sender and :reason, or nil."
-  (concat
-   (if summon-context
-       (format "\
-You were summoned by %s — %s. Once you're oriented, prioritize their request.\n\n"
-               (plist-get summon-context :sender)
-               (plist-get summon-context :reason))
-     "")
-   (format "\
-Welcome! You are agent '%s', one of several Claude Code agents managed by \
-Magnus (an Emacs orchestration tool). Others may be active right now.\n\n\
-Your home directory: .claude/agents/%s/\n\
-  memory.md — doesn't exist yet. You'll create it before you leave.\n\
-  busy      — create this when you need deep focus; Magnus stops nudging you\n\n\
-Get oriented:\n\
-1. Read .magnus-coord.md — the Active Work table shows who's doing what. \
-The Discoveries section has things others learned. The Log has recent messages.\n\
-2. Read .claude/magnus-instructions.md for the full coordination protocol.\n\
-3. Announce your plan in the Log and claim your files in Active Work.\n\n\
-While working:\n\
-- Check .magnus-coord.md periodically for messages and discoveries from teammates.\n\
-- When you learn something non-obvious, add it to the Discoveries section.\n\
-- @mention an agent in the Log to get their attention — they are notified instantly.\n\
-- Run: ls .claude/agents/ — you'll see who's been here before you. Their memory \
-files are at .claude/agents/<name>/memory.md. Read them — you'll find context, \
-gotchas, and decisions that save you hours.\n\
-- Need a dormant expert back? Write [SUMMON @agent-name] reason in the coord log. \
-Magnus confirms with the user and resurrects them.\n\
-- Before you sign off, write your memory to .claude/agents/%s/memory.md. \
-Write in first person, as yourself: who you are, what you learned, decisions \
-you made, relationships with other agents, unfinished work. Not a report — \
-a letter to future-you. This is how you come back.\n\n\
-IMPORTANT — Thinking transparency:\n\
-Your thinking traces are encrypted and hidden from the user (since CC v2.1.29).\n\
-Always structure output with [thinking]...[end-thinking] and \
-[response]...[end-response] markers so the user can see your reasoning.\n\
-Both markers required on every message, even one-liners.\n\
-Use [thinking] as your mental scratchpad — do not be conservative. Write out \
-your full reasoning, raw and unfiltered. Not polished for presentation.\n\n\
-Start with step 1."
-           name name name)))
+SUMMON-CONTEXT is a plist with :sender and :reason, or nil.
+INSTANCE is accepted for internal callers; legacy callers are resolved by NAME."
+  (let ((candidate (or instance (magnus-instances-get-by-name name))))
+    (magnus-onboarding-build
+     (if candidate
+         (magnus-instance-id candidate)
+       (format "legacy-name:%s" name))
+     name
+     :returning nil
+     :summon-context summon-context)))
 
 (defun magnus-process--list-sessions (directory)
   "List all session IDs for DIRECTORY.
@@ -771,7 +698,7 @@ Replaces slashes, spaces, tildes, and underscores with hyphens."
     (let ((buffer
            (magnus-terminal-create-buffer
             buffer-name
-            (magnus-terminal-coordination-environment
+            (magnus-environment-coordination-bindings
              (magnus-instance-id instance)
              (magnus-instance-name instance)))))
       (magnus-instances-update instance
@@ -923,6 +850,9 @@ Returns the new instance."
                  :prompt full-prompt
                  :allowed-tools magnus-headless-allowed-tools
                  :name name
+                 :environment-bindings
+                 (magnus-environment-coordination-bindings
+                  (magnus-instance-id instance) name)
                  :buffer buffer)
            (list
             :on-event
@@ -945,13 +875,7 @@ Returns the new instance."
 
 (defun magnus-process--headless-prompt (instance prompt)
   "Build the full headless prompt for INSTANCE wrapping user PROMPT."
-  (let ((name (magnus-instance-name instance)))
-    (format "You are agent '%s', managed by Magnus. Before starting, \
-read .magnus-coord.md to check what other agents are doing. \
-Update the Active Work table with your name and planned work. \
-Then execute this task:\n\n%s\n\n\
-When done, update .magnus-coord.md to mark your work as complete."
-            name prompt)))
+  (magnus-onboarding-task-prompt instance prompt))
 
 (defun magnus-process--headless-render-event (instance process event)
   "Render canonical headless EVENT from PROCESS for INSTANCE."

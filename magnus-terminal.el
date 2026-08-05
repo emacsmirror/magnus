@@ -16,8 +16,7 @@
 
 ;;; Code:
 
-(require 'cl-lib)
-(require 'subr-x)
+(require 'magnus-environment)
 
 (declare-function vterm-mode "vterm" ())
 (declare-function vterm-send-key "vterm" (key &optional shift meta ctrl))
@@ -27,27 +26,13 @@
 WRITER-ID is the durable instance identity and WRITER-NAME is its display
 name.  Keeping this provider-neutral prevents Claude and Codex terminals from
 acquiring subtly different coordination identities."
-  (list (format "MAGNUS_COORD_WRITER_ID=%s" writer-id)
-        (format "MAGNUS_COORD_WRITER_NAME=%s" writer-name)))
+  (magnus-environment-coordination-bindings writer-id writer-name))
 
 (defun magnus-terminal--process-environment (bindings)
   "Return `process-environment' with string BINDINGS applied.
 Each binding must have the form NAME=VALUE.  Later bindings replace inherited
 values with the same NAME without mutating the caller's environment."
-  (let ((environment (copy-sequence process-environment)))
-    (dolist (binding bindings)
-      (unless (and (stringp binding)
-                   (not (string-match-p "\0" binding))
-                   (string-match
-                    "\\`\\([A-Za-z_][A-Za-z0-9_]*\\)=" binding))
-        (error "Invalid terminal environment binding: %S" binding))
-      (let ((prefix (concat (match-string 1 binding) "=")))
-        (setq environment
-              (cons binding
-                    (cl-remove-if
-                     (lambda (entry) (string-prefix-p prefix entry))
-                     environment)))))
-    environment))
+  (magnus-environment-overlay process-environment bindings))
 
 (defun magnus-terminal--discard-buffer (buffer)
   "Discard partially initialized terminal BUFFER and its process."

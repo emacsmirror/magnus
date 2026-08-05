@@ -19,6 +19,8 @@
 (require 'json)
 (require 'subr-x)
 (require 'magnus-instances)
+(require 'magnus-environment)
+(require 'magnus-onboarding)
 (require 'magnus-provider)
 (require 'magnus-terminal)
 
@@ -255,70 +257,11 @@ FILES-BEFORE contains rollout files that predate this launch."
 
 (defun magnus-codex--instructions (instance)
   "Build Magnus identity and coordination instructions for Codex INSTANCE."
-  (let* ((name (magnus-instance-name instance))
-         (directory (magnus-instance-directory instance))
-         (memory-relative (format ".claude/agents/%s/memory.md" name))
-         (memory-file (expand-file-name memory-relative directory))
-         (returning (file-exists-p memory-file)))
-    (concat
-     (format "You are %s, a Magnus-managed Codex agent. " name)
-     (if returning
-         (format
-          (concat "You have been here before. Before anything else, read %s. "
-                  "It is your own prior voice: decisions you made, patterns "
-                  "you found, relationships, and unfinished work.\n\n")
-          memory-relative)
-       (format
-        (concat "This is your first session under this identity. Your home is "
-                ".claude/agents/%s/. Before signing off, create %s as a "
-                "first-person letter to future-you, not a status report.\n\n")
-        name memory-relative))
-
-     "Magnus may be running several agents in this project. Get oriented before "
-     "changing files:\n"
-     "1. Read .magnus-coord.md when it exists. Review Active Work, Discoveries, "
-     "Decisions, and the recent Log.\n"
-     "2. Check for overlapping file claims. Discuss conflicts in the Log before "
-     "editing, then announce your plan and claim the files you expect to touch.\n"
-     "3. Read relevant project instructions and inspect existing work before "
-     "choosing an implementation.\n\n"
-
-     "While working:\n"
-     "- Check .magnus-coord.md periodically. Use @mentions to reach teammates.\n"
-     "- Put non-obvious facts and gotchas in Discoveries so peers do not have to "
-     "rediscover them. Put shared architectural choices in Decisions.\n"
-     "- Create .claude/agents/" name "/busy when you need uninterrupted focus; "
-     "remove it when that focus period ends.\n"
-     "- Other agents' first-person memories live under .claude/agents/. Read a "
-     "relevant one when prior context or expertise would save work.\n"
-     "- Before requesting user attention, log [ATTENTION] with the reason; log "
-     "when it is resolved so agents can serialize interruptions.\n"
-     "- Do not overwrite another agent's Active Work row or assume permission to "
-     "commit, push, deploy, or perform unrelated changes.\n\n"
-
-     "When finishing:\n"
-     "1. Release or mark your Active Work row done and log what finished.\n"
-     "2. Record useful discoveries and decisions.\n"
-     "3. Update " memory-relative " in first person: what you learned, why you "
-     "chose this approach, relationships, and what remains.\n"
-     "4. When a commit is authorized, preserve the why, tradeoffs, and gotchas in "
-     "its message; the coordination log is ephemeral.\n\n"
-
-     "Thinking out loud:\n"
-     "For every user-facing message, put a candid visible working notebook inside "
-     "[thinking]...[end-thinking], followed by the answer inside "
-     "[response]...[end-response]. The notebook is valuable before the conclusion "
-     "is polished: state the current hypothesis, evidence, uncertainty, plausible "
-     "branches, constraints, contradictions, dead ends, and corrections as they "
-     "become relevant. If a new fact reverses the plan, say so and explain why. "
-     "Avoid empty narration such as 'I will inspect the code.' Do not claim this "
-     "reveals private hidden chain-of-thought; it is an explicit collaborative "
-     "engineering journal written for the user.\n\n"
-
-     "Begin by orienting and reading your memory when present, then handle the "
-     "user's task."
-     (when magnus-codex-extra-developer-instructions
-       (concat "\n\n" magnus-codex-extra-developer-instructions)))))
+  (concat
+   (magnus-onboarding-prompt instance)
+   (when magnus-codex-extra-developer-instructions
+     (concat "\n\nCodex-specific developer instructions:\n"
+             magnus-codex-extra-developer-instructions))))
 
 (defun magnus-codex--launch-marker (instance)
   "Return a unique session-correlation marker for INSTANCE."
@@ -385,7 +328,7 @@ When MARKER is non-nil, capture its new session against FILES-BEFORE."
          (buffer
           (magnus-terminal-create-buffer
            buffer-name
-           (magnus-terminal-coordination-environment
+           (magnus-environment-coordination-bindings
             (magnus-instance-id instance)
             (magnus-instance-name instance))))
          (process (get-buffer-process buffer)))

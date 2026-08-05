@@ -35,6 +35,10 @@
       (setq spec
             (plist-put spec :success-requires
                        (plist-get request :fixture-success-requires))))
+    (when (plist-member request :fixture-environment)
+      (setq spec
+            (plist-put spec :environment
+                       (plist-get request :fixture-environment))))
     spec))
 
 (magnus-provider-register
@@ -165,6 +169,78 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
           (magnus-test-headless--wait (lambda () completion))
           (should (plist-get completion :success-p)))
       (when (and process (process-live-p process))
+        (magnus-headless-cancel process t)))))
+
+(ert-deftest magnus-headless-overlays-identity-after-provider-filtering ()
+  (let* ((original-environment
+          '("CLAUDECODE=nested" "KEEP=yes"
+            "MAGNUS_COORD_WRITER_ID=old-writer"))
+         (process-environment (copy-sequence original-environment))
+         (provider-environment
+          (cl-remove-if
+           (lambda (entry) (string-prefix-p "CLAUDECODE=" entry))
+           process-environment))
+         (command
+          (concat
+           "printf '{\"type\":\"result\",\"value\":"
+           "\"%s|%s|%s\"}\\n' "
+           "\"${CLAUDECODE-unset}\" "
+           "\"$MAGNUS_COORD_WRITER_ID\" "
+           "\"$MAGNUS_COORD_WRITER_NAME\""))
+         (request
+          (append
+           (magnus-test-headless--request command)
+           (list :purpose 'agent
+                 :fixture-environment provider-environment
+                 :environment-bindings
+                 '("MAGNUS_COORD_WRITER_ID=writer-uuid"
+                   "MAGNUS_COORD_WRITER_NAME=swift-hare"))))
+         completion
+         process)
+    (unwind-protect
+        (progn
+          (setq process
+                (magnus-headless-start
+                 'magnus-test-headless-generic request
+                 (list :on-complete
+                       (lambda (_process result)
+                         (setq completion result)))))
+          (magnus-test-headless--wait (lambda () completion))
+          (should (plist-get completion :success-p))
+          (should (equal (plist-get completion :structured-result)
+                         "unset|writer-uuid|swift-hare"))
+          (should (equal process-environment original-environment)))
+      (when process
+        (magnus-headless-cancel process t)))))
+
+(ert-deftest magnus-headless-review-without-bindings-keeps-provider-scope ()
+  (let* ((original-environment '("CALLER_ONLY=yes"))
+         (process-environment (copy-sequence original-environment))
+         (command
+          (concat
+           "printf '{\"type\":\"result\",\"value\":\"%s|%s\"}\\n' "
+           "\"$REVIEW_ONLY\" "
+           "\"${MAGNUS_COORD_WRITER_ID-unset}\""))
+         (request
+          (append
+           (magnus-test-headless--request command)
+           '(:fixture-environment ("REVIEW_ONLY=yes"))))
+         completion
+         process)
+    (unwind-protect
+        (progn
+          (setq process
+                (magnus-headless-start
+                 'magnus-test-headless request
+                 (list :on-complete
+                       (lambda (_process result)
+                         (setq completion result)))))
+          (magnus-test-headless--wait (lambda () completion))
+          (should (plist-get completion :success-p))
+          (should (equal (plist-get completion :structured-result)
+                         "yes|unset"))
+          (should (equal process-environment original-environment)))
+      (when process
         (magnus-headless-cancel process t)))))
 
 (ert-deftest magnus-headless-frames-partial-jsonl ()

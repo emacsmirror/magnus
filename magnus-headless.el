@@ -28,6 +28,8 @@
 ;;   :schema      Optional JSON Schema as JSON text or an encodable Lisp value
 ;;   :schema-file Optional existing JSON Schema file
 ;;   :buffer      Optional live display buffer to associate with the process
+;;   :environment-bindings Optional NAME=VALUE bindings over the provider's
+;;                         filtered launch environment
 ;;
 ;; Provider adapters may define additional keys.  Review adapters currently use
 ;; :base, :head, :title, and :name.  When :schema is supplied without
@@ -65,6 +67,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'subr-x)
+(require 'magnus-environment)
 (require 'magnus-provider)
 
 (defcustom magnus-headless-stderr-limit (* 256 1024)
@@ -107,6 +110,8 @@ The complete stream remains available through the :on-stderr callback."
       (user-error "A non-empty headless prompt is required"))
     (unless (memq purpose magnus-headless--purposes)
       (user-error "Unknown headless purpose: %s" purpose))
+    (magnus-environment-validate-bindings
+     (plist-get request :environment-bindings))
     (when (and buffer (not (buffer-live-p buffer)))
       (user-error "Headless display buffer is not live"))))
 
@@ -451,8 +456,14 @@ remains with the caller."
                              (expand-file-name
                               (plist-get prepared :directory))))
                  (default-directory directory)
+                 ;; Provider filtering is authoritative.  Apply request-local
+                 ;; identity only after it, and never mutate either source.
                  (process-environment
-                  (or (plist-get spec :environment) process-environment))
+                  (magnus-environment-overlay
+                   (if (plist-member spec :environment)
+                       (plist-get spec :environment)
+                     process-environment)
+                   (plist-get prepared :environment-bindings)))
                  (name (or (plist-get spec :name)
                            (format "magnus-headless-%s-%d"
                                    provider
