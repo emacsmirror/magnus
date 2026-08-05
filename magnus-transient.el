@@ -162,62 +162,62 @@ review actions."
 ;;;###autoload (autoload 'magnus-dispatch "magnus-transient" nil t)
 (transient-define-prefix magnus-dispatch ()
   "Magnus command dispatcher."
-  ["Instance Actions"
-   ("c" "Create Claude agent" magnus-status-create)
-   ("X" "Create Codex agent" magnus-transient-create-codex)
-   ("h" "Create headless Claude task" magnus-transient-create-headless)
-   ("k" "Archive instance" magnus-status-archive)
-   ("R" "Resurrect purged" magnus-status-resurrect-purged)
-   ("r" "Rename archived instance" magnus-status-rename)
-   ("s" "Suspend instance" magnus-status-suspend)
-   ("S" "Resume instance" magnus-status-resume)
-   ("d" "Change directory" magnus-status-chdir)
-   ("m" "Send message" magnus-status-send-message)
-   ("t" "Thinking trace" magnus-status-trace)
-   ("P" "Archive all instances" magnus-status-archive-all)]
-  ["Independent Reviews"
-   ("v" magnus-review-request-dispatch
+  [1 "Instance Actions"
+   (1 "c" "Create Claude agent" magnus-status-create)
+   (1 "X" "Create Codex agent" magnus-transient-create-codex)
+   (1 "h" "Create headless Claude task" magnus-transient-create-headless)
+   (1 "k" "Archive instance" magnus-status-archive)
+   (1 "R" "Resurrect purged" magnus-status-resurrect-purged)
+   (1 "r" "Rename archived instance" magnus-status-rename)
+   (1 "s" "Suspend instance" magnus-status-suspend)
+   (1 "S" "Resume instance" magnus-status-resume)
+   (1 "d" "Change directory" magnus-status-chdir)
+   (1 "m" "Send message" magnus-status-send-message)
+   (1 "t" "Thinking trace" magnus-status-trace)
+   (1 "P" "Archive all instances" magnus-status-archive-all)]
+  [1 "Independent Reviews"
+   (1 "v" magnus-review-request-dispatch
     :description magnus-transient--main-review-description)
-   ("o" "Open completed review at point" magnus-transient-review-open)
-   ("V" "Actions for review at point" magnus-review-actions)]
-  ["Context (shared notes)"
-   ("x" "Open context buffer" magnus-context)
-   ("e" "Export to file" magnus-context-export-for-agent)
-   ("w" "Copy to clipboard" magnus-context-copy-for-agent)]
-  ["Coordination (agent communication)"
-   ("J" "Open generated current view" magnus-status-coordination-current)
-   ("C" "Open legacy ingress file" magnus-status-coordination)
-   ("I" "Open agent instructions" magnus-transient-open-instructions)
-   ("F" "Session retrospective" magnus-retro)]
-  ["Attention (permission requests)"
-   ("a" "Next in attention queue" magnus-attention-next)
-   ("A" "Show attention queue" magnus-attention-show-queue)
-   ("T" "Toggle attention monitoring" magnus-attention-toggle)
-   ("H" "Toggle health monitoring" magnus-health-toggle)
-   ("z" "Toggle Do Not Disturb" magnus-coord-toggle-dnd)]
-  ["Navigation"
-   ("RET" "Visit item" magnus-status-visit)
-   ("n" "Next item" magnus-status-next)
-   ("p" "Previous item" magnus-status-previous)]
-  ["Buffer"
-   ("g" "Refresh" magnus-status-refresh)
-   ("D" "Diagnose installation" magnus-doctor)
-   ("q" "Quit" quit-window)])
+   (1 "o" "Open completed review at point" magnus-transient-review-open)
+   (1 "V" "Actions for review at point" magnus-review-actions)]
+  [1 "Context (shared notes)"
+   (1 "x" "Open context buffer" magnus-context)
+   (1 "e" "Export to file" magnus-context-export-for-agent)
+   (1 "w" "Copy to clipboard" magnus-context-copy-for-agent)]
+  [1 "Coordination (agent communication)"
+   (1 "J" "Open generated current view" magnus-status-coordination-current)
+   (1 "C" "Open legacy ingress file" magnus-status-coordination)
+   (1 "I" "Open agent instructions" magnus-transient-open-instructions)
+   (1 "F" "Session retrospective" magnus-retro)]
+  [1 "Attention (permission requests)"
+   (1 "a" "Next in attention queue" magnus-attention-next)
+   (1 "A" "Show attention queue" magnus-attention-show-queue)
+   (1 "T" "Toggle attention monitoring" magnus-attention-toggle)
+   (1 "H" "Toggle health monitoring" magnus-health-toggle)
+   (1 "z" "Toggle Do Not Disturb" magnus-coord-toggle-dnd)]
+  [1 "Navigation"
+   (1 "RET" "Visit item" magnus-status-visit)
+   (1 "n" "Next item" magnus-status-next)
+   (1 "p" "Previous item" magnus-status-previous)]
+  [1 "Buffer"
+   (1 "g" "Refresh" magnus-status-refresh)
+   (1 "D" "Diagnose installation" magnus-doctor)
+   (1 "q" "Quit" quit-window)])
 
 ;;; Durable reviews
 
 (transient-define-prefix magnus-review-request-menu ()
   "Request a durable independent review for the instance at point."
-  [:description magnus-transient--review-request-heading
-   ("RET" magnus-transient-request-review
+  [1 :description magnus-transient--review-request-heading
+   (1 "RET" magnus-transient-request-review
     :description magnus-transient--review-request-action-description
     :inapt-if magnus-transient--review-request-busy-p)]
-  [:description magnus-transient--review-options-heading
+  [1 :description magnus-transient--review-options-heading
    :if magnus-transient--review-request-new-p
-   ("p" "Provider" "--provider="
+   (1 "p" "Provider" "--provider="
     :choices ("opposite" "claude" "codex"))
-   ("m" "Model" "--model=")
-   ("e" "Effort" "--effort="
+   (1 "m" "Model" "--model=")
+   (1 "e" "Effort" "--effort="
     :choices ("low" "medium" "high" "xhigh" "max"))])
 
 (defun magnus-transient-request-review ()
@@ -277,15 +277,15 @@ review actions."
 
 (transient-define-prefix magnus-review-actions-menu ()
   "Actions for one durable review."
-  ["Review"
+  [1 "Review"
    :description magnus-transient--review-description
-   ("RET" "Open" magnus-transient-review-open)
-   ("r" magnus-transient-review-rereview
+   (1 "RET" "Open" magnus-transient-review-open)
+   (1 "r" magnus-transient-review-rereview
     :description magnus-transient--review-rereview-description)
-   ("t" "Retry failed round" magnus-transient-review-retry)
-   ("i" "Interrupt running review" magnus-transient-review-interrupt)
-   ("d" "Retry author delivery" magnus-transient-review-delivery)
-   ("k" "Archive" magnus-transient-review-archive)])
+   (1 "t" "Retry failed round" magnus-transient-review-retry)
+   (1 "i" "Interrupt running review" magnus-transient-review-interrupt)
+   (1 "d" "Retry author delivery" magnus-transient-review-delivery)
+   (1 "k" "Archive" magnus-transient-review-archive)])
 
 (defun magnus-review-actions (&optional review round)
   "Open actions for REVIEW and optional ROUND.
@@ -435,17 +435,17 @@ or the best status-buffer project directory."
 
 (transient-define-prefix magnus-instance-dispatch ()
   "Actions for the instance at point."
-  ["Instance"
+  [1 "Instance"
    :description magnus-transient--instance-description
-   ("RET" "Visit" magnus-status-visit)
-   ("k" "Archive" magnus-status-archive)
-   ("R" "Resurrect" magnus-status-resurrect-purged)
-   ("r" "Rename archived" magnus-status-rename)
-   ("s" "Suspend" magnus-status-suspend)
-   ("S" "Resume" magnus-status-resume)
-   ("d" "Change directory" magnus-status-chdir)
-   ("m" "Send message" magnus-status-send-message)
-   ("t" "Thinking trace" magnus-status-trace)])
+   (1 "RET" "Visit" magnus-status-visit)
+   (1 "k" "Archive" magnus-status-archive)
+   (1 "R" "Resurrect" magnus-status-resurrect-purged)
+   (1 "r" "Rename archived" magnus-status-rename)
+   (1 "s" "Suspend" magnus-status-suspend)
+   (1 "S" "Resume" magnus-status-resume)
+   (1 "d" "Change directory" magnus-status-chdir)
+   (1 "m" "Send message" magnus-status-send-message)
+   (1 "t" "Thinking trace" magnus-status-trace)])
 
 (defun magnus-transient--instance-description ()
   "Return description for current instance."
