@@ -110,8 +110,8 @@
       (should-error (magnus-review-load-all) :type 'user-error))
     (should (equal magnus-reviews (list sentinel)))))
 
-(ert-deftest magnus-review-task-inference-prefers-durable-author-identity ()
-  "Duplicate display names cannot attribute another writer's task."
+(ert-deftest magnus-review-task-inference-uses-markdown-display-name ()
+  "The author's Markdown row supplies the inferred review task."
   (let ((author
          (magnus-instance--create
           :id "exact-author" :name "same-name" :directory default-directory)))
@@ -119,10 +119,8 @@
                (lambda (_root)
                  (list
                   :active
-                  (list (list :agent "same-name" :writer-id "other-author"
-                              :area "wrong task")
-                        (list :agent "same-name" :writer-id "exact-author"
-                              :area "right task"))))))
+                  (list (list :agent "someone-else" :area "wrong task")
+                        (list :agent "same-name" :area "right task"))))))
       (should (equal (magnus-review-controller--task
                       author default-directory)
                      "right task")))))
@@ -184,6 +182,60 @@
                    :checkpoint-token "round.1:abc"
                    :base magnus-test-review--base-oid
                    :head magnus-test-review--head-oid))))))
+
+(ert-deftest magnus-review-ready-marker-requires-exact-oid-widths ()
+  "Only exact SHA-1 and SHA-256 widths may reach checkpoint dispatch."
+  (let* ((oid-40 (make-string 40 ?a))
+         (oid-41 (make-string 41 ?b))
+         (oid-63 (make-string 63 ?c))
+         (oid-64 (make-string 64 ?d))
+         (valid
+          (concat
+           (format
+            "[REVIEW-READY request=sha1 checkpoint=one base=%s head=%s]\n"
+            oid-40 oid-40)
+           (format
+            "[REVIEW-READY request=sha256 checkpoint=two base=%s head=%s]\n"
+            oid-64 oid-64)))
+         (invalid
+          (mapconcat
+           #'identity
+           (list
+            (format
+             "[REVIEW-READY request=base41 checkpoint=a base=%s head=%s]"
+             oid-41 oid-40)
+            (format
+             "[REVIEW-READY request=base63 checkpoint=b base=%s head=%s]"
+             oid-63 oid-64)
+            (format
+             "[REVIEW-READY request=head41 checkpoint=c base=%s head=%s]"
+             oid-40 oid-41)
+            (format
+             "[REVIEW-READY request=head63 checkpoint=d base=%s head=%s]"
+             oid-64 oid-63))
+           "\n")))
+    (should (= (length (magnus-coord--extract-review-ready valid)) 2))
+    (should-not (magnus-coord--extract-review-ready invalid))
+    (let* ((directory (make-temp-file "magnus-review-oid-width-" t))
+           (file (expand-file-name magnus-coord-file directory))
+           (magnus-coord--processed-review-ready nil)
+           (magnus-coord--review-ready-retries
+            (make-hash-table :test #'equal))
+           (dispatches 0)
+           (magnus-coord-review-ready-hook
+            (list (lambda (&rest _arguments) (cl-incf dispatches)))))
+      (unwind-protect
+          (progn
+            (with-temp-file file (insert invalid))
+            (magnus-coord--check-new-review-ready directory)
+            (should (= dispatches 0))
+            (should (= (hash-table-count
+                        magnus-coord--review-ready-retries)
+                       0))
+            (should-not
+             (alist-get directory magnus-coord--processed-review-ready
+                        nil nil #'equal)))
+        (delete-directory directory t)))))
 
 (ert-deftest magnus-review-ready-marker-rejects-ambiguous-checkpoints ()
   (should-not
@@ -312,41 +364,6 @@
           (should (= ready 1)))
       (delete-directory root t))))
 
-(ert-deftest magnus-review-event-requires-the-exact-author-identity ()
-  "Durable events cannot spend another agent's checkpoint token."
-  (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
-               (storage (make-temp-file "magnus-review-writer-id-" t))
-               (magnus-review-directory-root storage)
-               (magnus-reviews nil)
-               (magnus-reviews-changed-hook nil))
-    (unwind-protect
-        (let* ((review
-                (magnus-review-create
-                 root "author-uuid" "bright-crow"
-                 :id "writer-bound-review"
-                 :task "Bind the checkpoint to its author"
-                 :reviewer-name "keen-owl"
-                 :reviewer-provider 'codex))
-               (marker
-                (list :request-id (magnus-review-id review)
-                      :checkpoint-token (magnus-review-checkpoint-token review)
-                      :base base :head head :writer-id "other-uuid")))
-          (should-error
-           (magnus-review-handle-ready-marker root marker)
-           :type 'magnus-review-checkpoint-rejected)
-          (should-not (magnus-review-rounds review))
-          (should (eq (magnus-review-execution review)
-                      'waiting-for-checkpoint))
-          ;; The old Markdown protocol carries no durable writer ID and stays
-          ;; valid for compatibility with already-running agents.
-          (setq marker (copy-sequence marker))
-          (setq marker (plist-put marker :writer-id nil))
-          (should
-           (magnus-review-round-p
-            (magnus-review-handle-ready-marker root marker))))
-      (delete-directory root t)
-      (delete-directory storage t))))
-
 (ert-deftest magnus-review-ready-marker-requires-current-committed-work ()
   (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
                (storage (make-temp-file "magnus-review-committed-ready-" t))
@@ -388,22 +405,15 @@
       (delete-directory root t)
       (delete-directory storage t))))
 
-(ert-deftest magnus-review-event-for-unloaded-request-remains-retryable ()
-  "Durable checkpoint evidence survives a missing or unreadable manifest."
+(ert-deftest magnus-review-marker-for-unknown-request-is-a-no-op ()
+  "A stale Markdown marker cannot break the project coordination watcher."
   (let ((magnus-reviews nil)
         (marker
          (list :request-id "temporarily-unloaded-review"
                :checkpoint-token "checkpoint-token-unknown"
                :base "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-               :head "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-               :writer-id "author-uuid")))
-    (should-error
-     (magnus-review-handle-ready-marker default-directory marker)
-     :type 'magnus-review-error)
-    ;; The legacy ingress retains its historical ignore-unknown behavior.
-    (should-not
-     (magnus-review-handle-ready-marker
-     default-directory (plist-put (copy-sequence marker) :writer-id nil)))))
+               :head "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")))
+    (should-not (magnus-review-handle-ready-marker default-directory marker))))
 
 (ert-deftest magnus-review-archive-releases-coordination-watch ()
   "Archiving the sole pending review releases its project poller."
@@ -451,6 +461,93 @@
     (magnus-review--create
      :id id :project-root root
      :project-hash (magnus-review-compute-project-hash root))))
+
+(ert-deftest magnus-review-dirty-status-excludes-only-control-files ()
+  "Coordination writes stay out of scope without hiding source changes."
+  (pcase-let* ((`(,root ,_base ,_head) (magnus-test-review--repository))
+               (coordination (expand-file-name ".magnus-coord.md" root))
+               (instructions
+                (expand-file-name ".claude/magnus-instructions.md" root))
+               (source (expand-file-name "sample.el" root)))
+    (unwind-protect
+        (progn
+          (make-directory (file-name-directory instructions) t)
+          (with-temp-file coordination (insert "untracked coordination\n"))
+          (with-temp-file instructions (insert "untracked instructions\n"))
+          (should-not (magnus-review-worktree-dirty-status root))
+          (magnus-test-review--git
+           root "add" "--" ".magnus-coord.md"
+           ".claude/magnus-instructions.md")
+          (magnus-test-review--git root "commit" "--quiet" "-m" "controls")
+          (with-temp-file coordination (insert "tracked coordination change\n"))
+          (with-temp-file instructions (insert "tracked instruction change\n"))
+          (should-not (magnus-review-worktree-dirty-status root))
+          (with-temp-file source (insert "real source change\n"))
+          (let ((status (magnus-review-worktree-dirty-status root)))
+            (should status)
+            (should (string-match-p "sample\\.el" status))
+            (should-not (string-match-p "magnus-coord" status))
+            (should-not (string-match-p "magnus-instructions" status))))
+      (delete-directory root t))))
+
+(ert-deftest magnus-review-dirty-status-honors-custom-control-paths ()
+  "Customized project-local control files remain outside review scope."
+  (pcase-let* ((`(,root ,_base ,_head) (magnus-test-review--repository))
+               (magnus-coord-file "state/team-coordination.md")
+               (magnus-coord-instructions-file
+                ".agents/shared-guidance.md")
+               (coordination (expand-file-name magnus-coord-file root))
+               (instructions
+                (expand-file-name magnus-coord-instructions-file root))
+               (source (expand-file-name "sample.el" root)))
+    (unwind-protect
+        (progn
+          (make-directory (file-name-directory coordination) t)
+          (make-directory (file-name-directory instructions) t)
+          (with-temp-file coordination (insert "untracked coordination\n"))
+          (with-temp-file instructions (insert "untracked instructions\n"))
+          (should
+           (equal
+            (magnus-review--control-pathspecs root)
+            '(":(top,literal,exclude)state/team-coordination.md"
+              ":(top,literal,exclude).agents/shared-guidance.md")))
+          (should-not (magnus-review-worktree-dirty-status root))
+          (magnus-test-review--git
+           root "add" "--" magnus-coord-file magnus-coord-instructions-file)
+          (magnus-test-review--git
+           root "commit" "--quiet" "-m" "custom controls")
+          (with-temp-file coordination (insert "tracked coordination change\n"))
+          (with-temp-file instructions (insert "tracked instruction change\n"))
+          (should-not (magnus-review-worktree-dirty-status root))
+          (with-temp-file source (insert "real source change\n"))
+          (let ((status (magnus-review-worktree-dirty-status root)))
+            (should status)
+            (should (string-match-p "sample\\.el" status))))
+      (delete-directory root t))))
+
+(ert-deftest magnus-review-dirty-status-rejects-outside-control-paths ()
+  "An out-of-tree customization cannot hide an in-project path."
+  (pcase-let* ((`(,root ,_base ,_head) (magnus-test-review--repository))
+               (magnus-coord-file "../outside-control.md")
+               (magnus-coord-instructions-file
+                ".agents/shared-guidance.md")
+               (instructions
+                (expand-file-name magnus-coord-instructions-file root))
+               (unrelated (expand-file-name "outside-control.md" root)))
+    (unwind-protect
+        (progn
+          (make-directory (file-name-directory instructions) t)
+          (with-temp-file instructions (insert "generated guidance\n"))
+          (with-temp-file unrelated (insert "real project data\n"))
+          (should
+           (equal
+            (magnus-review--control-pathspecs root)
+            '(":(top,literal,exclude).agents/shared-guidance.md")))
+          (let ((status (magnus-review-worktree-dirty-status root)))
+            (should status)
+            (should (string-match-p "outside-control\\.md" status))
+            (should-not (string-match-p "shared-guidance" status))))
+      (delete-directory root t))))
 
 (ert-deftest magnus-review-ensure-checkout-creates-reuses-and-updates ()
   (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
@@ -1117,8 +1214,8 @@
               (should (eq (magnus-review-execution review)
                           'waiting-for-checkpoint))
               (should (= (length (magnus-review-rounds review)) 1))
-              ;; The direct marker below models the ignored durable event
-              ;; transport, not this untracked legacy-ingress test fixture.
+              ;; Remove the replay fixture before directly exercising the
+              ;; newly requested checkpoint.
               (delete-file file)
               (let ((round-two
                      (magnus-review-handle-ready-marker
@@ -1215,9 +1312,9 @@
          (review
           (magnus-review--create
            :id "resend-checkpoint" :author-name "bright-crow"
-           :reviewer-name "swift-hare" :lifecycle 'open
+           :reviewer-name "swift-hare" :lifecycle 'open :project-root "/project/"
            :checkpoint-requests (list request)))
-         delivered)
+         delivered watched)
     (cl-letf (((symbol-function 'magnus-review-controller--deliver-checkpoint)
                (lambda (candidate exact-request)
                  (setq delivered
@@ -1225,12 +1322,123 @@
                              (magnus-review-checkpoint-request-token
                               exact-request)))
                  t))
+              ((symbol-function 'magnus-coord-start-watching)
+               (lambda (root) (setq watched root)))
               ((symbol-function
                 'magnus-review-controller--require-committed-work)
                #'ignore))
       (should (eq (magnus-review-rereview review) review)))
     (should (equal delivered (list review request token)))
+    (should (equal watched "/project/"))
     (should (equal (magnus-review-checkpoint-token review) token))))
+
+(ert-deftest magnus-review-rereview-reacquires-checkpoint-watcher ()
+  "A completed review cannot create an unwatched follow-up request."
+  (let* ((settled
+          (magnus-review-checkpoint-request--create
+           :number 1 :token "settled" :requested-at 1 :events '(settled)))
+         (attempt
+          (magnus-review-attempt--create :number 1 :execution 'complete))
+         (round
+          (magnus-review-round--create :number 1 :attempts (list attempt)))
+         (review
+          (magnus-review--create
+           :id "rereview-watcher" :project-root "/project/"
+           :author-name "bright-crow" :reviewer-name "swift-hare"
+           :lifecycle 'open :checkpoint-requests (list settled)
+           :rounds (list round)))
+         watched delivered)
+    (cl-letf (((symbol-function 'magnus-review-save) #'ignore)
+              ((symbol-function
+                'magnus-review-controller--require-committed-work)
+               #'ignore)
+              ((symbol-function 'magnus-coord-start-watching)
+               (lambda (root) (setq watched root)))
+              ((symbol-function 'magnus-review-controller--deliver-checkpoint)
+               (lambda (candidate request)
+                 (setq delivered (list candidate request))
+                 t))
+              ((symbol-function 'message) #'ignore))
+      (should (eq (magnus-review-rereview review) review)))
+    (should (equal watched "/project/"))
+    (should (eq (car delivered) review))
+    (should (eq (cadr delivered)
+                (magnus-review-pending-checkpoint-request review)))
+    (should (= (length (magnus-review-checkpoint-requests review)) 2))))
+
+(ert-deftest magnus-review-resend-recovers-existing-marker-before-delivery ()
+  "A missing watcher may settle the request before resend can deliver it."
+  (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-resend-recovery-" t))
+               (magnus-review-directory-root storage)
+               (magnus-reviews nil)
+               (magnus-reviews-changed-hook nil)
+               (magnus-review-ready-hook nil)
+               (magnus-review-checkpoint-mismatch-hook nil)
+               (magnus-instances nil)
+               (magnus-coord--watched-dirs nil)
+               (magnus-coord--file-mtimes nil)
+               (magnus-coord--states nil)
+               (magnus-coord--processed-mentions nil)
+               (magnus-coord--processed-dms nil)
+               (magnus-coord--processed-summons nil)
+               (magnus-coord--processed-review-ready nil)
+               (magnus-coord--review-ready-retries
+                (make-hash-table :test #'equal))
+               (magnus-coord--poll-timer nil)
+               (dirty-checks 0)
+               (stale-deliveries 0)
+               (notice nil)
+               (result nil))
+    (unwind-protect
+        (let* ((review
+                (magnus-review-create
+                 root "resend-author-id" "bright-crow"
+                 :id "resend-recovery" :task "Recover the durable marker"
+                 :reviewer-name "swift-hare" :reviewer-provider 'codex))
+               (request (magnus-review-pending-checkpoint-request review))
+               (file (magnus-coord-file-path root))
+               (magnus-coord-review-ready-hook
+                (list #'magnus-review-handle-ready-marker)))
+          (with-temp-file file
+            (insert
+             (format
+              (concat "[REVIEW-READY request=%s checkpoint=%s "
+                      "base=%s head=%s]\n")
+              (magnus-review-id review)
+              (magnus-review-checkpoint-request-token request)
+              base head)))
+          (cl-letf (((symbol-function 'magnus-coord--start-poll-timer)
+                     #'ignore)
+                    ((symbol-function
+                      'magnus-review-controller--require-committed-work)
+                     (lambda (_directory) (cl-incf dirty-checks)))
+                    ((symbol-function
+                      'magnus-review-controller--deliver-checkpoint)
+                     (lambda (_review _request)
+                       (cl-incf stale-deliveries)
+                       t))
+                    ((symbol-function 'message)
+                     (lambda (format-string &rest arguments)
+                       (setq notice
+                             (apply #'format format-string arguments)))))
+            (setq result (magnus-review-resend-checkpoint review)))
+          (should (eq result review))
+          (should-not (magnus-review-pending-checkpoint-request review))
+          (should (= (length (magnus-review-rounds review)) 1))
+          (should (equal (magnus-review-base-oid review) base))
+          (should (equal (magnus-review-head-oid review) head))
+          (should (= dirty-checks 0))
+          (should (= stale-deliveries 0))
+          (should
+           (equal notice
+                  "Magnus: checkpoint state advanced while its watcher recovered"))
+          (should-not magnus-coord--watched-dirs)
+          (should-not
+           (assoc (magnus-coord--normalized-directory root)
+                  magnus-coord--states)))
+      (delete-directory root t)
+      (delete-directory storage t))))
 
 (ert-deftest magnus-review-checkpoint-message-pins-the-exact-request ()
   (let* ((request
@@ -1251,21 +1459,70 @@
             (magnus-review-controller--checkpoint-message review request)))
     (should (string-match-p
              (regexp-quote "checkpoint=exact-request-token") message))
-    (should (string-match-p (regexp-quote "`review.ready'") message))
+    (should (string-match-p (regexp-quote ".magnus-coord.md") message))
+    (should (string-match-p (regexp-quote "[REVIEW-READY") message))
+    (should (string-match-p (regexp-quote "at the top of the Log") message))
+    (should (string-match-p (regexp-quote "immediately below") message))
     (should (string-match-p
              (regexp-quote
-              "\"checkpoint_token\":\"exact-request-token\"")
+              "Do not modify source files or create another commit")
              message))
     (should (string-match-p
-             (regexp-quote "$MAGNUS_COORD_WRITER_ID") message))
-    (should (string-match-p (regexp-quote "author-uuid") message))
-    (should (string-match-p
              (regexp-quote
-              "Do not modify files or create another commit")
+              "The sole permitted edit is the checkpoint marker")
              message))
     (should (string-match-p
              (regexp-quote "tell the user to ask you to commit first")
              message))))
+
+(ert-deftest magnus-review-checkpoint-message-uses-custom-control-paths ()
+  "Checkpoint guidance quotes configured paths and permits only its marker."
+  (let* ((directory (make-temp-file "magnus-review-custom-paths-" t))
+         (magnus-coord-file "control/team journal.md")
+         (magnus-coord-instructions-file
+          ".agents/magnus shared instructions.md")
+         (request
+          (magnus-review-checkpoint-request--create
+           :number 1 :token "custom-path-token"
+           :requested-at 1 :events nil))
+         (review
+          (magnus-review--create
+           :id "custom-path-message" :project-root directory
+           :author-instance-id "author-uuid"
+           :author-name "bright-crow" :task "Finish the controller"))
+         message)
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'magnus-review-suggest-upstream-scope)
+                     (lambda (_root)
+                       (list :base-oid magnus-test-review--base-oid
+                             :head-oid magnus-test-review--head-oid))))
+            (setq message
+                  (magnus-review-controller--checkpoint-message
+                   review request)))
+          (should
+           (string-match-p
+            (regexp-quote (prin1-to-string magnus-coord-file)) message))
+          (should
+           (string-match-p
+            (regexp-quote (prin1-to-string
+                           magnus-coord-instructions-file))
+            message))
+          (should-not (string-match-p (regexp-quote ".magnus-coord.md")
+                                      message))
+          (should-not
+           (string-match-p
+            (regexp-quote ".claude/magnus-instructions.md") message))
+          (should
+           (string-match-p
+            (regexp-quote "Do not modify source files or create another commit")
+            message))
+          (should
+           (string-match-p
+            (regexp-quote "The sole permitted edit is the checkpoint marker")
+            message))
+          (should (string-match-p (regexp-quote "[REVIEW-READY") message)))
+      (delete-directory directory t))))
 
 (ert-deftest magnus-review-checkpoint-recovery-delivers-only-pending-request ()
   (let* ((request

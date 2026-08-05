@@ -32,8 +32,7 @@
               (dolist (identity (cdr entry))
                 (should (string-match-p (regexp-quote identity) prompt)))
               (dolist (guidance
-                       '(".magnus-coord/current.md"
-                         "legacy .magnus-coord.md"
+                       '(".magnus-coord.md"
                          ".claude/magnus-instructions.md"
                          "AGENTS.md"
                          "[thinking]...[end-thinking]"
@@ -44,6 +43,33 @@
                 (should (string-match-p (regexp-quote guidance) prompt)))
               (should-not (string-match-p "encrypted and hidden" prompt))
               (should-not (string-match-p "raw and unfiltered" prompt)))))
+      (delete-directory directory t))))
+
+(ert-deftest magnus-onboarding-provider-wrappers-use-custom-project-paths ()
+  "Both providers receive safely quoted paths configured for the instance root."
+  (let* ((directory (make-temp-file "magnus-onboarding-custom-paths-" t))
+         (magnus-coord-file "control/team journal.md")
+         (magnus-coord-instructions-file
+          ".agents/magnus shared instructions.md")
+         (claude
+          (magnus-test-onboarding--instance
+           "claude-custom-uuid" "swift-hare" directory 'claude))
+         (codex
+          (magnus-test-onboarding--instance
+           "codex-custom-uuid" "keen-owl" directory 'codex))
+         (quoted-journal (prin1-to-string magnus-coord-file))
+         (quoted-instructions
+          (prin1-to-string magnus-coord-instructions-file)))
+    (unwind-protect
+        (dolist (prompt (list (magnus-process--onboarding-message claude)
+                              (magnus-codex--instructions codex)))
+          (should (string-match-p (regexp-quote quoted-journal) prompt))
+          (should (string-match-p (regexp-quote quoted-instructions) prompt))
+          (should-not (string-match-p (regexp-quote ".magnus-coord.md")
+                                      prompt))
+          (should-not
+           (string-match-p
+            (regexp-quote ".claude/magnus-instructions.md") prompt)))
       (delete-directory directory t))))
 
 (ert-deftest magnus-onboarding-preserves-returning-and-summon-context ()
@@ -80,11 +106,12 @@
   ;; convention as long as they remain one safe path segment.
   (should (magnus-instances-valid-name-p "Wise Deer ☃")))
 
-(ert-deftest magnus-onboarding-legacy-wrapper-never-invents-an-event-writer ()
+(ert-deftest magnus-onboarding-legacy-wrapper-never-invents-an-instance-id ()
   (let ((prompt (magnus-process--onboarding-new "legacy-agent" nil)))
-    (should (string-match-p "No durable writer UUID was supplied" prompt))
+    (should (string-match-p "No durable Magnus UUID was available" prompt))
     (should (string-match-p "Do not invent one" prompt))
-    (should (string-match-p "only through legacy \\.magnus-coord\\.md" prompt))))
+    (should (string-match-p "display name in the shared coordination file"
+                            prompt))))
 
 (provide 'magnus-onboarding-tests)
 ;;; magnus-onboarding-tests.el ends here

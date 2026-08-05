@@ -5,8 +5,8 @@
 
 Magnus is a Magit-inspired control room for Claude Code and Codex agents in
 Emacs. It keeps each interactive agent in its native terminal UI, gives the
-team durable identities and coordination state, and can send committed work to
-a fresh model for an independent review.
+team durable identities and a shared coordination journal, and can send
+committed work to a fresh model for an independent review.
 
 No background server, Magnus-specific plugin, or agent skill is required.
 Magnus launches the provider CLIs directly and supplies a shared onboarding and
@@ -21,7 +21,7 @@ review the result. Magnus makes that workflow feel native to Emacs:
 - run Claude Code and Codex side by side in `vterm`;
 - switch, message, suspend, archive, and resurrect named agents;
 - see health, attention, active work, and reviews in one `*magnus*` buffer;
-- coordinate concurrent writers without a shared mutable-state bottleneck;
+- coordinate agents through a shared project journal;
 - run durable, headless, cross-provider reviews of exact Git evidence;
 - read findings in a folding Magit-style diff rather than a raw model transcript;
 - retain agent memory, provider sessions, reviews, and shared project context.
@@ -113,7 +113,7 @@ output remain available.
 Each Magnus instance has:
 
 - a friendly display name such as `swift-fox`;
-- a durable UUID used as its coordination writer identity;
+- a durable UUID that survives archive, resurrection, and rename;
 - provider session metadata used to resume archived work;
 - a first-person memory at `.claude/agents/NAME/memory.md`;
 - the same provider-neutral onboarding and authorization boundaries.
@@ -131,9 +131,6 @@ allows only one unresolved fresh Claude launch per physical project in that
 Emacs session. That serialized compatibility path prevents its concurrent
 launches from claiming each other's history.
 
-Magnus passes `MAGNUS_COORD_WRITER_ID` and `MAGNUS_COORD_WRITER_NAME` only to
-the agent process. It does not mutate Emacs's global process environment.
-
 Emacs normally consumes `ESC` as a Meta prefix. In Magnus terminal buffers,
 `C-g` sends Escape to either provider's TUI.
 
@@ -143,13 +140,17 @@ Put point on an author agent in `*magnus*` and press `v RET`. Magnus then:
 
 1. requires a clean author worktree, otherwise telling you to ask the instance
    to commit first;
-2. asks the author to publish its current committed checkpoint and records the
-   exact base and head Git object IDs;
+2. asks the author to publish a `REVIEW-READY` checkpoint marker in
+   `.magnus-coord.md`, then records the exact base and head Git object IDs;
 3. assigns a durable reviewer identity, reusing existing expertise matching
    when possible;
 4. chooses the provider opposite the author by default;
 5. runs the reviewer headlessly and stores a structured, line-addressed report;
 6. notifies the author where the durable notes live.
+
+The clean-worktree gate excludes only Magnus's configured coordination journal
+and generated instruction file, because publishing a checkpoint must not reject
+itself. Any tracked or untracked project work still blocks the review.
 
 The request popup offers optional provider (`p`), model (`m`), and reasoning
 effort (`e`) overrides. Reviews run one at a time by default, keeping laptop
@@ -192,75 +193,46 @@ The review actions popup can request another round, resend a checkpoint request,
 retry a failed round, interrupt a running reviewer, retry delivery, or archive
 the review. Manual interruption remains durable until you explicitly retry.
 
-## Coordination without shared-file collisions
+## Shared coordination journal
 
-New Magnus agents publish immutable JSON events to their own inbox:
+Agents coordinate through `.magnus-coord.md` in the project root. It contains
+the complete coordination protocol and durable project record in four
+human-readable sections:
+
+- **Active Work** records each agent's current area, status, and files;
+- **Discoveries** preserves project facts and gotchas worth sharing;
+- **Decisions** records choices that should outlive a conversation;
+- **Log** carries announcements, mentions, direct messages, and review
+  checkpoints.
+
+The Log has one ordering invariant: newest first. Agents insert each new entry
+immediately below the Log heading's comments and blank preamble; they do not
+append at the bottom. Magnus normalizes that storage order to chronological
+order for status and retrospective readers.
+
+Magnus writes the protocol instructions to
+`.claude/magnus-instructions.md`, and the shared onboarding tells both
+providers to read them and the coordination journal. Nothing has to be
+installed into a Claude or Codex plugin or skill directory.
+
+Magnus watches the journal while a project is active. New mentions, direct
+messages, and summons are delivered to the addressed live agent. Periodic
+reminders ask agents to check the journal, update Active Work, and share useful
+discoveries; bounded housekeeping keeps the Log readable.
+
+Review checkpoints use an exact marker inserted at the top of the Log:
 
 ```text
-.magnus-coord/
-├── writers/
-│   ├── WRITER-UUID-A/
-│   │   ├── EVENT-ID.json
-│   │   └── ...
-│   └── WRITER-UUID-B/
-│       └── EVENT-ID.json
-└── current.md
+[REVIEW-READY request=REQUEST-ID checkpoint=TOKEN base=BASE-OID head=HEAD-OID]
 ```
 
-Each writer owns one monotonically sequenced event stream. Writers never
-replace one another's files, so two agents can announce work, record a
-discovery, or acknowledge a review checkpoint concurrently without a
-last-writer-wins rewrite of shared state.
+Magnus accepts the marker only for the pending review request and its exact
+committed Git scope. Unresolved markers are retried after transient failures
+and survive an Emacs restart through the journal itself.
 
-Magnus validates and reduces those events into
-`.magnus-coord/current.md`. This file is a generated, human-readable view of
-active work, discoveries, decisions, and recent log messages. It is read-only
-state: agents and users should not edit it. Retention is bounded and old event
-evidence is garbage-collected only after a current projection is safely
-written.
-
-For Magnus-managed writers, a lifecycle overlay reconciles the generated
-Active Work view with the live registry. A stopped or archived agent, or one
-moved to another project, cannot remain visibly active merely because its final
-`active.clear` was never written. The underlying durable event evidence is
-retained.
-
-The recognized event operations are:
-
-- append a log message;
-- set or clear the writer's active work;
-- put or remove a discovery or decision;
-- publish the exact Git checkpoint for a pending review.
-
-Magnus writes the current event schema and atomic-publication instructions to
-`.claude/magnus-instructions.md`. The shared onboarding tells both providers to
-read that file and the current projection. Nothing has to be installed into a
-Claude or Codex plugin/skill directory.
-
-On Git worktrees, registration adds `/.magnus-coord/` and the generated
-`.claude/magnus-instructions.md` to that repository's local
-`.git/info/exclude`. This keeps newly generated, untracked coordination
-artifacts out of ordinary `git add -A` and review diffs without changing the
-project's tracked `.gitignore`.
-
-Conversational log effects notify live agents only after Magnus begins watching
-a project; startup does not replay old chatter. The generated current view is
-the durable catch-up path. In contrast, unresolved `review.ready` evidence is
-replayed and settled exactly so a review checkpoint survives an Emacs restart.
-
-### Legacy compatibility
-
-`.magnus-coord.md` remains a compatibility ingress for agents and tools using
-the pre-0.2 shared-file protocol. Magnus reads it alongside event state and
-continues to deliver legacy mentions, direct messages, summons, and review-ready
-markers. New agents use immutable events; `.magnus-coord/current.md` is the
-canonical generated view.
-
-Press `J` to read that generated current view and `C` to inspect or maintain
-the legacy ingress. A manual `g` in `*magnus*` polls every active or watched
-project, retries transient event-store reads, and re-arms exhausted checkpoint
-delivery. Automatic presentation refreshes deliberately avoid that filesystem
-work.
+Press `C` to open `.magnus-coord.md`. A manual `g` in `*magnus*` polls every
+active or watched project and re-arms exhausted checkpoint delivery. Automatic
+presentation refreshes deliberately avoid that filesystem work.
 
 ## Status-buffer commands
 
@@ -280,8 +252,7 @@ These commands are bound directly in `*magnus*`:
 | `m` | Send a message to an agent |
 | `t` | Open the provider trace |
 | `x` | Open shared project context |
-| `J` | Open the generated current coordination view |
-| `C` | Open the legacy coordination ingress |
+| `C` | Open the shared coordination journal |
 | `a` / `A` | Visit the next attention request / show the queue |
 | `P` | Archive all agents |
 | `z` | Toggle Do Not Disturb |
@@ -300,8 +271,7 @@ The `?` dispatcher additionally exposes:
 | `h` | Create a headless Claude task |
 | `o` | Open the completed review at point |
 | `D` | Run `magnus-doctor` |
-| `J` | Open generated `.magnus-coord/current.md` |
-| `C` | Open legacy `.magnus-coord.md` |
+| `C` | Open shared `.magnus-coord.md` |
 | `I` | Open generated agent coordination instructions |
 | `H` / `T` | Toggle health / attention monitoring |
 
@@ -373,9 +343,9 @@ Magnus keeps durable user data under `~/.magnus/` by default:
 
 Run `M-x magnus-doctor`, or press `? D`, for read-only checks of the Emacs
 version, required libraries, provider CLIs, Git, durable storage paths, and
-registered agent directories. It also reports transient coordination reads and
-bounded review-checkpoint retries. If a checkpoint retry is exhausted, fix the
-reported cause and press `g` in `*magnus*` to re-arm the exact durable evidence.
+registered agent directories. It also reports bounded review-checkpoint
+retries. If a checkpoint retry is exhausted, fix the reported cause and press
+`g` in `*magnus*` to re-arm the exact durable marker.
 
 ## Useful customization
 
@@ -415,9 +385,8 @@ reported cause and press `g` in `*magnus*` to re-arm the exact durable evidence.
 (setq magnus-trace-read-chunk-bytes (* 64 1024))
 (setq magnus-trace-max-record-bytes (* 1024 1024))
 
-;; Coordination retention and reminders.
-(setq magnus-coord-state-log-limit 25)
-(setq magnus-coord-state-knowledge-limit 100)
+;; Coordination journal housekeeping and reminders.
+(setq magnus-coord-log-max-entries 25)
 (setq magnus-coord-reminder-interval 600) ; nil disables reminders
 ```
 
@@ -439,9 +408,8 @@ CI installs package dependencies and runs all four checks on Emacs 28.1, 29.4,
 and 30.2.
 
 The implementation keeps provider transport, terminal setup, headless
-execution, durable reviews, coordination storage/reduction/runtime, and UI in
-separate modules. See the Commentary section at the top of each `.el` file for
-that module's boundary.
+execution, durable reviews, coordination, and UI in separate modules. See the
+Commentary section at the top of each `.el` file for that module's boundary.
 
 ## License
 

@@ -27,6 +27,7 @@
          (magnus-coord--processed-dms nil)
          (magnus-coord--processed-summons nil)
          (magnus-coord--processed-review-ready nil)
+         (magnus-coord--states nil)
          (magnus-coord--review-ready-retries
           (make-hash-table :test #'equal))
          (magnus-process--legacy-session-launches
@@ -45,8 +46,60 @@ When AGENT is non-nil, include its pre-existing Active Work row."
       (insert "|-------|------|--------|-------|\n")
       (when agent
         (insert (format "| %s | existing | in-progress | old.el |\n"
-                        agent))))
+                        agent)))
+      (insert "\n## Log\n\n"
+              "<!-- Agents insert newest messages below this comment. -->\n\n"))
     file))
+
+(defun magnus-test-process-lifecycle--coord-state-from-file (directory)
+  "Return coordination state read directly from DIRECTORY's shared file."
+  (magnus-coord--parse-content (magnus-coord--read-content directory)))
+
+(defun magnus-test-process-lifecycle--prepare-row-rollback
+    (directory name pre-existing started-at)
+  "Prepare watched coordination state for NAME's rollback test.
+When PRE-EXISTING is non-nil, seed NAME's Active Work row."
+  (magnus-test-process-lifecycle--coord-file
+   directory (and pre-existing name))
+  (magnus-coord-add-log directory "peer" "Shared history")
+  (let ((key
+         (magnus-test-process-lifecycle--claim-coord directory started-at)))
+    (magnus-coord--cache-content key (magnus-coord--read-content key))
+    key))
+
+(defun magnus-test-process-lifecycle--publish-attempt-row
+    (directory instance started-at)
+  "Publish INSTANCE's attempted row and log, then refresh its watched cache."
+  (let ((name (magnus-instance-name instance))
+        (key (magnus-test-process-lifecycle--coord-key directory)))
+    (magnus-coord-update-active
+     directory name "attempt" "in-progress" '("attempt.el"))
+    (magnus-coord-add-log directory name "Attempt joined")
+    (magnus-test-process-lifecycle--claim-coord directory started-at)
+    (magnus-coord--cache-content key (magnus-coord--read-content key))))
+
+(defun magnus-test-process-lifecycle--assert-row-rollback
+    (directory name pre-existing started-at)
+  "Assert NAME rollback in DIRECTORY preserved only pre-existing ownership."
+  (let* ((key (magnus-test-process-lifecycle--coord-key directory))
+         (direct
+          (magnus-test-process-lifecycle--coord-state-from-file directory))
+         (cached (alist-get key magnus-coord--states nil nil #'equal))
+         (direct-names
+          (mapcar (lambda (entry) (plist-get entry :agent))
+                  (plist-get direct :active)))
+         (cached-names
+          (mapcar (lambda (entry) (plist-get entry :agent))
+                  (plist-get cached :active)))
+         (messages
+          (mapcar (lambda (entry) (plist-get entry :message))
+                  (plist-get direct :log))))
+    (should (eq (not (null (member name direct-names))) pre-existing))
+    (should (equal cached-names direct-names))
+    (should (member "Shared history" messages))
+    (should (member "Attempt joined" messages))
+    (should (member key magnus-coord--watched-dirs))
+    (should (= (gethash key magnus-coord--session-start-times) started-at))))
 
 (defun magnus-test-process-lifecycle--coord-key (directory)
   "Return DIRECTORY's canonical coordination ownership key."
@@ -116,7 +169,7 @@ When AGENT is non-nil, include its pre-existing Active Work row."
 (ert-deftest magnus-process-create-rolls-back-coordination-registration-failure ()
   (magnus-test-process-lifecycle--isolated
     (let ((directory (make-temp-file "magnus-create-coord-" t))
-          spawn-called)
+          cleared spawn-called)
       (unwind-protect
           (progn
             (magnus-test-process-lifecycle--coord-file directory)
@@ -128,8 +181,7 @@ When AGENT is non-nil, include its pre-existing Active Work row."
                       (puthash key 42 magnus-coord--session-start-times))
                     (error "coord registration failed")))
                  ((symbol-function 'magnus-coord-clear-agent)
-                  (lambda (&rest _arguments)
-                    (error "rollback must not rewrite legacy ingress")))
+                  (lambda (dir name) (setq cleared (list dir name))))
                  ((symbol-function 'magnus-process--spawn)
                   (lambda (&rest _arguments) (setq spawn-called t))))
               (let ((err (should-error
@@ -140,6 +192,9 @@ When AGENT is non-nil, include its pre-existing Active Work row."
               (should-not magnus-coord--watched-dirs)
               (should-not
                (gethash directory magnus-coord--session-start-times))
+              (should (magnus-coord--same-directory-p
+                       (car cleared) directory))
+              (should (equal (cadr cleared) "broken-coord"))
               (should-not spawn-called)))
         (delete-directory directory t)))))
 
@@ -226,6 +281,120 @@ When AGENT is non-nil, include its pre-existing Active Work row."
           (kill-buffer terminal))
         (delete-directory directory t)))))
 
+(ert-deftest magnus-process-create-rolls-back-only-its-active-row ()
+  "Failed creation removes its new row but preserves a row it inherited."
+  (dolist (pre-existing '(nil t))
+    (magnus-test-process-lifecycle--isolated
+      (let* ((directory (make-temp-file "magnus-create-row-rollback-" t))
+             (name "create-row-owner")
+             (started-at 101))
+        (unwind-protect
+            (progn
+              (magnus-test-process-lifecycle--prepare-row-rollback
+               directory name pre-existing started-at)
+              (cl-letf
+                  (((symbol-function 'magnus-coord-register-agent)
+                    (lambda (project candidate)
+                      (magnus-test-process-lifecycle--publish-attempt-row
+                       project candidate 999)))
+                   ((symbol-function 'magnus-process--spawn)
+                    (lambda (_candidate) (error "create starter failed"))))
+                (should-error
+                 (magnus-process-create directory name)
+                 :type 'error))
+              (magnus-test-process-lifecycle--assert-row-rollback
+               directory name pre-existing started-at)
+              (should-not magnus-instances))
+          (delete-directory directory t))))))
+
+(ert-deftest magnus-process-resurrect-rolls-back-only-its-active-row ()
+  "Failed resurrection preserves only a pre-existing same-name row."
+  (dolist (pre-existing '(nil t))
+    (magnus-test-process-lifecycle--isolated
+      (let* ((directory (make-temp-file "magnus-resurrect-row-rollback-" t))
+             (name "resurrect-row-owner")
+             (started-at 202)
+             (instance (magnus-instances-create directory name 'codex)))
+        (unwind-protect
+            (progn
+              (setq magnus-instances (list instance))
+              (magnus-instances-update
+               instance :status 'purged :session-id "resume-session"
+               :purged-at 123.0)
+              (magnus-test-process-lifecycle--prepare-row-rollback
+               directory name pre-existing started-at)
+              (cl-letf
+                  (((symbol-function 'magnus-provider-external-p)
+                    (lambda (_candidate) t))
+                   ((symbol-function 'magnus-coord-register-agent)
+                    (lambda (project candidate)
+                      (magnus-test-process-lifecycle--publish-attempt-row
+                       project candidate 999)))
+                   ((symbol-function 'magnus-provider-call)
+                    (lambda (candidate operation &rest _arguments)
+                      (pcase operation
+                        ('resume (error "resurrection starter failed"))
+                        ('stop
+                         (magnus-instances-update
+                          candidate :status 'stopped :buffer nil))))))
+                (should-error
+                 (magnus-process-resurrect-purged instance)
+                 :type 'error))
+              (magnus-test-process-lifecycle--assert-row-rollback
+               directory name pre-existing started-at)
+              (should (eq (magnus-instance-status instance) 'purged))
+              (should (equal (magnus-instance-session-id instance)
+                             "resume-session")))
+          (delete-directory directory t))))))
+
+(ert-deftest magnus-process-chdir-rolls-back-only-its-destination-row ()
+  "Failed moves preserve destination history and only inherited same-name rows."
+  (dolist (pre-existing '(nil t))
+    (magnus-test-process-lifecycle--isolated
+      (let* ((old-directory
+              (make-temp-file "magnus-chdir-row-source-" t))
+             (new-directory
+              (make-temp-file "magnus-chdir-row-destination-" t))
+             (name "chdir-row-owner")
+             (started-at 303)
+             (instance (magnus-instances-create old-directory name 'codex)))
+        (unwind-protect
+            (progn
+              (setq magnus-instances (list instance))
+              (magnus-instances-update
+               instance :status 'running :session-id "source-session")
+              (magnus-test-process-lifecycle--claim-coord old-directory 11)
+              (magnus-test-process-lifecycle--prepare-row-rollback
+               new-directory name pre-existing started-at)
+              (cl-letf
+                  (((symbol-function 'magnus-provider-external-p)
+                    (lambda (_candidate) t))
+                   ((symbol-function 'magnus-process--ensure-agent-dir)
+                    #'ignore)
+                   ((symbol-function 'magnus-coord-register-agent)
+                    (lambda (project candidate)
+                      (magnus-test-process-lifecycle--publish-attempt-row
+                       project candidate 999)))
+                   ((symbol-function 'magnus-provider-call)
+                    (lambda (candidate operation &rest _arguments)
+                      (pcase operation
+                        ('stop
+                         (magnus-instances-update
+                          candidate :status 'stopped :buffer nil))
+                        ('start (error "destination starter failed"))))))
+                (should-error
+                 (magnus-process-chdir instance new-directory)
+                 :type 'error))
+              (magnus-test-process-lifecycle--assert-row-rollback
+               new-directory name pre-existing started-at)
+              (should (equal (magnus-instance-directory instance)
+                             old-directory))
+              (should (eq (magnus-instance-status instance) 'stopped))
+              (should (equal (magnus-instance-session-id instance)
+                             "source-session")))
+          (delete-directory old-directory t)
+          (delete-directory new-directory t))))))
+
 (ert-deftest magnus-process-create-keeps-successful-acquisition-order ()
   (magnus-test-process-lifecycle--isolated
     (let ((directory (make-temp-file "magnus-create-success-" t))
@@ -289,7 +458,7 @@ When AGENT is non-nil, include its pre-existing Active Work row."
            (instance (magnus-instances-create directory "runner-agent"))
            (magnus-headless-allowed-tools "Read Write Edit")
            (magnus-buffer-name " *magnus-status-not-present*")
-           provider request callbacks process buffer)
+           provider request callbacks process buffer logged)
       (unwind-protect
           (let ((magnus-instances-changed-hook nil))
             (cl-letf
@@ -305,7 +474,9 @@ When AGENT is non-nil, include its pre-existing Active Work row."
                                   "magnus-headless-runner")
                            :buffer (plist-get selected-request :buffer)
                            :noquery t))
-                    process)))
+                    process))
+                 ((symbol-function 'magnus-coord-add-log)
+                  (lambda (&rest arguments) (setq logged arguments))))
               (setq buffer
                     (magnus-process--spawn-headless
                      instance "Implement it"))
@@ -313,13 +484,7 @@ When AGENT is non-nil, include its pre-existing Active Work row."
               (should (eq (plist-get request :purpose) 'agent))
               (should (equal (plist-get request :allowed-tools)
                              "Read Write Edit"))
-              (should
-               (equal
-                (plist-get request :environment-bindings)
-                (list
-                 (format "MAGNUS_COORD_WRITER_ID=%s"
-                         (magnus-instance-id instance))
-                 "MAGNUS_COORD_WRITER_NAME=runner-agent")))
+              (should-not (plist-member request :environment-bindings))
               (should (string-match-p "Implement it"
                                       (plist-get request :prompt)))
               (should (eq (plist-get request :buffer) buffer))
@@ -337,6 +502,10 @@ When AGENT is non-nil, include its pre-existing Active Work row."
                        '(:success-p t :status exit
                          :process-event "finished"))
               (should (eq (magnus-instance-status instance) 'finished))
+              (should
+               (equal logged
+                      (list directory "runner-agent"
+                            "Headless task finished")))
               (with-current-buffer buffer
                 (should (string-match-p "Process finished"
                                         (buffer-string))))))
@@ -353,14 +522,18 @@ When AGENT is non-nil, include its pre-existing Active Work row."
          (process (make-pipe-process
                    :name (generate-new-buffer-name "magnus-headless-purged")
                    :buffer buffer :noquery t))
-         (magnus-buffer-name " *magnus-status-not-present*"))
+         (magnus-buffer-name " *magnus-status-not-present*")
+         logged)
     (unwind-protect
         (let ((magnus-instances-changed-hook nil))
           (magnus-instances-update instance :buffer buffer :status 'purged)
-          (magnus-process--headless-complete
-           instance process
-           '(:success-p t :status exit :process-event "finished"))
-          (should (eq (magnus-instance-status instance) 'purged)))
+          (cl-letf (((symbol-function 'magnus-coord-add-log)
+                     (lambda (&rest arguments) (setq logged arguments))))
+            (magnus-process--headless-complete
+             instance process
+             '(:success-p t :status exit :process-event "finished")))
+          (should (eq (magnus-instance-status instance) 'purged))
+          (should-not logged))
       (when (process-live-p process)
         (delete-process process))
       (when (buffer-live-p buffer)
@@ -407,12 +580,7 @@ When AGENT is non-nil, include its pre-existing Active Work row."
             (let ((err (should-error (magnus-process--spawn instance))))
             (should (string-match-p "watch setup failed"
                                       (error-message-string err))))
-            (should
-             (equal terminal-environment
-                    (list
-                     (format "MAGNUS_COORD_WRITER_ID=%s"
-                             (magnus-instance-id instance))
-                     "MAGNUS_COORD_WRITER_NAME=failed-spawn")))
+            (should-not terminal-environment)
             (should-not (buffer-live-p terminal))
             (should-not (magnus-instance-buffer instance))
             (should (eq (magnus-instance-status instance) 'stopped))
@@ -1900,7 +2068,8 @@ When AGENT is non-nil, include its pre-existing Active Work row."
                          :buffer old-buffer :noquery t))
            (replacement
             (generate-new-buffer " *magnus-headless-replacement*"))
-           (magnus-buffer-name " *magnus-status-not-present*"))
+           (magnus-buffer-name " *magnus-status-not-present*")
+           logged)
       (unwind-protect
           (progn
             (magnus-instances-update
@@ -1909,12 +2078,15 @@ When AGENT is non-nil, include its pre-existing Active Work row."
             (delete-process old-process)
             (magnus-instances-update
              instance :status 'running :buffer replacement)
-            (magnus-process--headless-complete
-             instance old-process
-             '(:success-p t :status exit :process-event "finished")
-             old-buffer)
+            (cl-letf (((symbol-function 'magnus-coord-add-log)
+                       (lambda (&rest arguments) (setq logged arguments))))
+              (magnus-process--headless-complete
+               instance old-process
+               '(:success-p t :status exit :process-event "finished")
+               old-buffer))
             (should (eq (magnus-instance-buffer instance) replacement))
             (should (eq (magnus-instance-status instance) 'running))
+            (should-not logged)
             (with-current-buffer replacement
               (should-not (string-match-p "Process finished"
                                           (buffer-string)))))
@@ -1935,7 +2107,8 @@ When AGENT is non-nil, include its pre-existing Active Work row."
              :name (generate-new-buffer-name "magnus-old-headless-owner")
              :buffer buffer :noquery t))
            replacement-process
-           (magnus-buffer-name " *magnus-status-not-present*"))
+           (magnus-buffer-name " *magnus-status-not-present*")
+           logged)
       (unwind-protect
           (progn
             (magnus-instances-update
@@ -1946,11 +2119,14 @@ When AGENT is non-nil, include its pre-existing Active Work row."
                           "magnus-new-headless-owner")
                    :buffer buffer :noquery t))
             (should (eq (get-buffer-process buffer) replacement-process))
-            (magnus-process--headless-complete
-             instance old-process
-             '(:success-p t :status exit :process-event "finished")
-             buffer)
+            (cl-letf (((symbol-function 'magnus-coord-add-log)
+                       (lambda (&rest arguments) (setq logged arguments))))
+              (magnus-process--headless-complete
+               instance old-process
+               '(:success-p t :status exit :process-event "finished")
+               buffer))
             (should (eq (magnus-instance-status instance) 'running))
+            (should-not logged)
             (with-current-buffer buffer
               (should-not (string-match-p "Process finished"
                                           (buffer-string)))))
@@ -2008,19 +2184,26 @@ When AGENT is non-nil, include its pre-existing Active Work row."
             (make-pipe-process
              :name (generate-new-buffer-name "magnus-killed-headless-output")
              :buffer buffer :noquery t))
-           (magnus-buffer-name " *magnus-status-not-present*"))
+           (magnus-buffer-name " *magnus-status-not-present*")
+           logged)
       (unwind-protect
           (progn
             (magnus-instances-update
              instance :status 'running :buffer buffer)
             (kill-buffer buffer)
-            (magnus-process--headless-complete
-             instance process
-             '(:success-p t :status exit :process-event "finished")
-             buffer)
+            (cl-letf (((symbol-function 'magnus-coord-add-log)
+                       (lambda (&rest arguments) (setq logged arguments))))
+              (magnus-process--headless-complete
+               instance process
+               '(:success-p t :status exit :process-event "finished")
+               buffer))
             (should-not (buffer-live-p buffer))
             (should (eq (magnus-instance-buffer instance) buffer))
-            (should (eq (magnus-instance-status instance) 'finished)))
+            (should (eq (magnus-instance-status instance) 'finished))
+            (should
+             (equal logged
+                    (list (magnus-instance-directory instance)
+                          "killed-output" "Headless task finished"))))
         (when (process-live-p process)
           (delete-process process))
         (when (buffer-live-p buffer)

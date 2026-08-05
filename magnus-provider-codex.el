@@ -19,7 +19,6 @@
 (require 'json)
 (require 'subr-x)
 (require 'magnus-instances)
-(require 'magnus-environment)
 (require 'magnus-onboarding)
 (require 'magnus-provider)
 (require 'magnus-terminal)
@@ -379,11 +378,7 @@ When MARKER is non-nil, capture its new session against FILES-BEFORE."
     (unwind-protect
         (progn
           (setq buffer
-                (magnus-terminal-create-buffer
-                 buffer-name
-                 (magnus-environment-coordination-bindings
-                  (magnus-instance-id instance)
-                  (magnus-instance-name instance))))
+                (magnus-terminal-create-buffer buffer-name))
           (setq process (get-buffer-process buffer))
           ;; Outer lifecycle transactions consume this exact allocation if a
           ;; later step fails after provider startup has returned successfully.

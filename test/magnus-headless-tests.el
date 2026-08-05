@@ -171,10 +171,10 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
       (when (and process (process-live-p process))
         (magnus-headless-cancel process t)))))
 
-(ert-deftest magnus-headless-overlays-identity-after-provider-filtering ()
+(ert-deftest magnus-headless-overlays-bindings-after-provider-filtering ()
   (let* ((original-environment
           '("CLAUDECODE=nested" "KEEP=yes"
-            "MAGNUS_COORD_WRITER_ID=old-writer"))
+            "MAGNUS_TEST_ID=old-value"))
          (process-environment (copy-sequence original-environment))
          (provider-environment
           (cl-remove-if
@@ -185,16 +185,16 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
            "printf '{\"type\":\"result\",\"value\":"
            "\"%s|%s|%s\"}\\n' "
            "\"${CLAUDECODE-unset}\" "
-           "\"$MAGNUS_COORD_WRITER_ID\" "
-           "\"$MAGNUS_COORD_WRITER_NAME\""))
+           "\"$MAGNUS_TEST_ID\" "
+           "\"$MAGNUS_TEST_NAME\""))
          (request
           (append
            (magnus-test-headless--request command)
            (list :purpose 'agent
                  :fixture-environment provider-environment
                  :environment-bindings
-                 '("MAGNUS_COORD_WRITER_ID=writer-uuid"
-                   "MAGNUS_COORD_WRITER_NAME=swift-hare"))))
+                 '("MAGNUS_TEST_ID=new-value"
+                   "MAGNUS_TEST_NAME=fixture"))))
          completion
          process)
     (unwind-protect
@@ -208,7 +208,7 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
           (magnus-test-headless--wait (lambda () completion))
           (should (plist-get completion :success-p))
           (should (equal (plist-get completion :structured-result)
-                         "unset|writer-uuid|swift-hare"))
+                         "unset|new-value|fixture"))
           (should (equal process-environment original-environment)))
       (when process
         (magnus-headless-cancel process t)))))
@@ -220,7 +220,7 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
           (concat
            "printf '{\"type\":\"result\",\"value\":\"%s|%s\"}\\n' "
            "\"$REVIEW_ONLY\" "
-           "\"${MAGNUS_COORD_WRITER_ID-unset}\""))
+           "\"${MAGNUS_TEST_ID-unset}\""))
          (request
           (append
            (magnus-test-headless--request command)

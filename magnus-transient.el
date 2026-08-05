@@ -185,8 +185,7 @@ review actions."
    (1 "e" "Export to file" magnus-context-export-for-agent)
    (1 "w" "Copy to clipboard" magnus-context-copy-for-agent)]
   [1 "Coordination (agent communication)"
-   (1 "J" "Open generated current view" magnus-status-coordination-current)
-   (1 "C" "Open legacy ingress file" magnus-status-coordination)
+   (1 "C" "Open coordination file" magnus-status-coordination)
    (1 "I" "Open agent instructions" magnus-transient-open-instructions)
    (1 "F" "Session retrospective" magnus-retro)]
   [1 "Attention (permission requests)"

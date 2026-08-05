@@ -55,16 +55,5 @@ or earlier values with the same NAME.  Neither input list is modified."
                      result)))))
     result))
 
-(defun magnus-environment-coordination-bindings (writer-id writer-name)
-  "Return coordination bindings for WRITER-ID and WRITER-NAME.
-WRITER-ID is a durable Magnus instance UUID.  WRITER-NAME is its display name."
-  (dolist (value (list writer-id writer-name))
-    (unless (and (stringp value)
-                 (not (string-empty-p value))
-                 (not (string-match-p "[\0\n\r]" value)))
-      (error "Invalid Magnus coordination identity: %S" value)))
-  (list (format "MAGNUS_COORD_WRITER_ID=%s" writer-id)
-        (format "MAGNUS_COORD_WRITER_NAME=%s" writer-name)))
-
 (provide 'magnus-environment)
 ;;; magnus-environment.el ends here

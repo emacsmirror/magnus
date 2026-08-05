@@ -719,12 +719,8 @@ shown beneath unrelated code."
               (entry
                (seq-find
                 (lambda (candidate)
-                  (let ((writer-id (plist-get candidate :writer-id)))
-                    (if writer-id
-                        (string= writer-id (magnus-instance-id author))
-                      ;; Legacy Markdown rows have only a display name.
-                      (string= (plist-get candidate :agent)
-                               (magnus-instance-name author)))))
+                  (string= (plist-get candidate :agent)
+                           (magnus-instance-name author)))
                 (plist-get parsed :active))))
          (when-let ((area (and entry (plist-get entry :area))))
            (unless (string-empty-p (string-trim area)) area)))
@@ -812,11 +808,13 @@ the message; callers include stable idempotency keys for replay."
 
 (defun magnus-review-controller--checkpoint-message (review request)
   "Build REVIEW's idempotent author checkpoint message for exact REQUEST."
-  (let* ((token (magnus-review-checkpoint-request-token request))
+  (let* ((root (magnus-review-project-root review))
+         (journal (magnus-coord-display-file root))
+         (instructions (magnus-coord-display-instructions-file root))
+         (token (magnus-review-checkpoint-request-token request))
          (scope
           (condition-case err
-              (magnus-review-suggest-upstream-scope
-               (magnus-review-project-root review))
+              (magnus-review-suggest-upstream-scope root)
             (error
              (message "Magnus: could not suggest checkpoint range for %s: %s"
                       (magnus-review-author-name review)
@@ -828,22 +826,18 @@ the message; callers include stable idempotency keys for replay."
      (concat
       "[MAGNUS-REVIEW-CHECKPOINT request=%s checkpoint=%s]\n"
       "Prepare checkpoint request #%d for an independent review of: %s\n\n"
-      "Magnus reviews committed work only. Do not modify files or create "
-      "another commit for this checkpoint. If the "
-      "worktree is now dirty, stop and tell the user to ask you to commit "
-      "first. Infer the task's upstream merge-base and current committed HEAD; "
+      "Magnus reviews committed work only. Do not modify source files or create "
+      "another commit for this checkpoint. The sole permitted edit is the "
+      "checkpoint marker requested below. Treat %S and generated instructions "
+      "%S as Magnus control files; if any other worktree path is dirty, stop "
+      "and tell the user to ask you to commit first. Infer the task's upstream "
+      "merge-base and current committed HEAD; "
       "Magnus's current suggestion is base=%s head=%s. Verify them yourself.\n\n"
-      "Then publish exactly one immutable `review.ready' event using the "
-      "protocol in .claude/magnus-instructions.md. Use your next durable "
-      "writer_sequence and full object IDs (never abbreviations). Its payload "
-      "must be exactly:\n"
-      "{\"request_id\":\"%s\",\"checkpoint_token\":\"%s\","
-      "\"base\":\"<FULL_BASE_OID>\",\"head\":\"<FULL_HEAD_OID>\"}\n"
-      "The event writer_id must be $MAGNUS_COORD_WRITER_ID, which Magnus "
-      "expects to equal %s. If this is an already-running legacy session with "
-      "no MAGNUS_COORD_WRITER_ID, use the old fallback instead: append "
+      "Then insert exactly one marker at the top of the Log in %S, "
+      "immediately below its comments and blank preamble, "
+      "using full object IDs (never abbreviations):\n"
       "[REVIEW-READY request=%s checkpoint=%s base=<FULL_BASE_OID> "
-      "head=<FULL_HEAD_OID>] to the Log in .magnus-coord.md.\n\n"
+      "head=<FULL_HEAD_OID>]\n\n"
       "The checkpoint token is an opaque Magnus correlation token: copy it "
       "exactly. "
       "Never generate, hash, derive, or replace it. "
@@ -853,11 +847,11 @@ the message; callers include stable idempotency keys for replay."
      token
      (magnus-review-checkpoint-request-number request)
      (magnus-review-task review)
+     journal
+     instructions
      (or base "not inferred")
      (or head "not inferred")
-     (magnus-review-id review)
-     token
-     (or (magnus-review-author-instance-id review) "<unknown>")
+     journal
      (magnus-review-id review)
      token)))
 
@@ -887,14 +881,23 @@ request is accepted only while it remains the canonical pending request."
     (unless request
       (user-error "Review by %s is not waiting for a checkpoint"
                   (magnus-review-reviewer-name review)))
-    (magnus-review-controller--require-committed-work
-     (magnus-review-project-root review))
-    (if (magnus-review-controller--deliver-checkpoint review request)
-      (message "Magnus: resent checkpoint request %d to %s"
-               (magnus-review-checkpoint-request-number request)
-               (magnus-review-author-name review))
-      (message "Magnus: checkpoint request will reach %s when it resumes"
-               (magnus-review-author-name review))))
+    ;; A manual resend is also a recovery action: restore the durable Markdown
+    ;; watcher before asking the author to publish its checkpoint marker.
+    (magnus-coord-start-watching (magnus-review-project-root review))
+    ;; Watcher acquisition synchronously replays durable markers.  That replay
+    ;; may accept this exact request, so never dirty-check or deliver a stale
+    ;; capture after coordination state has already advanced.
+    (if (not (eq request
+                 (magnus-review-pending-checkpoint-request review)))
+        (message "Magnus: checkpoint state advanced while its watcher recovered")
+      (magnus-review-controller--require-committed-work
+       (magnus-review-project-root review))
+      (if (magnus-review-controller--deliver-checkpoint review request)
+          (message "Magnus: resent checkpoint request %d to %s"
+                   (magnus-review-checkpoint-request-number request)
+                   (magnus-review-author-name review))
+        (message "Magnus: checkpoint request will reach %s when it resumes"
+                 (magnus-review-author-name review)))))
   review)
 
 (defun magnus-review-controller--matching-open-review (author root task)
@@ -1063,6 +1066,10 @@ CONTEXT, when non-nil, must be a freshly validated value returned by
     (magnus-review-controller--require-committed-work
      (magnus-review-project-root review))
     (magnus-review-await-checkpoint review)
+    ;; A previous round may have released the project's last watcher.  Acquire
+    ;; durable checkpoint observation before asking the author to publish the
+    ;; next marker.
+    (magnus-coord-start-watching (magnus-review-project-root review))
     (let ((request (magnus-review-pending-checkpoint-request review)))
       (unless request
         (error "Checkpoint transition did not create a pending request"))

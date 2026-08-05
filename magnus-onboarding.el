@@ -18,6 +18,21 @@
 (require 'subr-x)
 (require 'magnus-instances)
 
+(defvar magnus-coord-file)
+(defvar magnus-coord-instructions-file)
+
+(defun magnus-onboarding--project-path (directory variable fallback)
+  "Return configured path VARIABLE for DIRECTORY, or FALLBACK when unbound."
+  (let* ((root (file-name-as-directory
+                (expand-file-name (or directory default-directory))))
+         (configured (if (boundp variable) (symbol-value variable) fallback))
+         (absolute (expand-file-name configured root))
+         (relative (file-relative-name absolute root)))
+    (if (or (file-name-absolute-p relative)
+            (string-match-p "\\`\\.\\.?\\(?:/\\|\\'\\)" relative))
+        absolute
+      relative)))
+
 (defun magnus-onboarding-memory-relative-path (name)
   "Return the project-relative memory path for agent NAME."
   (unless (magnus-instances-valid-name-p name)
@@ -41,33 +56,38 @@
    (magnus-instance-directory instance)))
 
 (cl-defun magnus-onboarding-build
-    (writer-id name &key returning previous-trace summon-context)
-  "Build shared orientation for WRITER-ID and display NAME.
-WRITER-ID may be nil only for a compatibility caller that has no durable
-instance; that prompt is explicitly restricted to legacy coordination ingress.
+    (instance-id name &key directory returning previous-trace summon-context)
+  "Build shared orientation for INSTANCE-ID and display NAME.
+INSTANCE-ID may be nil for a caller that has no loaded durable instance.
+DIRECTORY identifies the project whose configured coordination paths appear.
 RETURNING says that this identity already has a first-person memory.
 PREVIOUS-TRACE is optional recent session evidence.  SUMMON-CONTEXT is an
 optional plist containing :sender and :reason."
-  (when (and writer-id (not (magnus-instances-valid-id-p writer-id)))
-    (error "Invalid durable Magnus instance UUID: %S" writer-id))
+  (when (and instance-id (not (magnus-instances-valid-id-p instance-id)))
+    (error "Invalid durable Magnus instance UUID: %S" instance-id))
   (unless (and (stringp name) (not (string-empty-p name)))
     (error "A Magnus display name is required for onboarding"))
   (unless (magnus-instances-valid-name-p name)
     (error "Unsafe Magnus display name for onboarding: %S" name))
-  (let ((memory (magnus-onboarding-memory-relative-path name)))
+  (let ((memory (magnus-onboarding-memory-relative-path name))
+        (coordination-file
+         (magnus-onboarding--project-path
+          directory 'magnus-coord-file ".magnus-coord.md"))
+        (instructions-file
+         (magnus-onboarding--project-path
+          directory 'magnus-coord-instructions-file
+          ".claude/magnus-instructions.md")))
     (concat
-     (if writer-id
+     (if instance-id
          (format
           (concat "You are %s, a Magnus-managed agent. Your display name is %s and your "
-                  "durable Magnus instance UUID is %s. Keep that UUID as your "
-                  "coordination writer identity even if your provider session "
-                  "changes.\n\n")
-          name name writer-id)
+                  "durable Magnus instance UUID is %s. Keep that identity even "
+                  "if your provider session changes.\n\n")
+          name name instance-id)
        (format
-        (concat "You are %s, a Magnus-managed agent reached through a legacy "
-                "onboarding entry point. No durable writer UUID was supplied. "
-                "Do not invent one and do not publish immutable event files; "
-                "use legacy .magnus-coord.md for coordination.\n\n")
+        (concat "You are %s, a Magnus-managed agent. No durable Magnus UUID was "
+                "available at this entry point. Do not invent one; use your "
+                "display name in the shared coordination file.\n\n")
         name))
      (if returning
          (format
@@ -93,23 +113,24 @@ optional plist containing :sender and :reason."
      "\nGet oriented before changing files:\n"
      "1. Read applicable project guidance (including AGENTS.md or CLAUDE.md "
      "where present) and inspect the existing work.\n"
-     "2. Read generated .magnus-coord/current.md when it exists, then read "
-     "legacy .magnus-coord.md when it exists. Use them to understand active "
+     (format "2. Read %S when it exists. Use it to understand active "
+             coordination-file)
      "work, Decisions, Discoveries, and recent messages.\n"
-     "3. Read .claude/magnus-instructions.md for the current coordination "
-     "write protocol before publishing coordination changes. Check for file "
-     "overlap and announce your intended work through that protocol.\n\n"
-     (if writer-id
+     (format "3. Read %S for the shared Markdown editing protocol before "
+             instructions-file)
+     "publishing coordination changes. Check for file overlap and announce "
+     "your intended work through that protocol.\n\n"
+     (if instance-id
          (concat
-          "While working, revisit the coordination view when useful, preserve "
-          "non-obvious discoveries and shared decisions, and use your exact "
-          "writer UUID for new coordination events. Your display name is for "
-          "people; the UUID is the durable identity. Update " memory
-          " in first person as your understanding changes.\n\n")
+          "While working, revisit the coordination file when useful and "
+          "preserve non-obvious discoveries and shared decisions there. Your "
+          "display name identifies your entries to teammates; the UUID remains "
+          "your durable Magnus identity. Update " memory " in first person as "
+          "your understanding changes.\n\n")
        (concat
-        "While working, revisit the coordination view when useful and publish "
-        "only through legacy .magnus-coord.md. A future registered session can "
-        "move to immutable events once Magnus supplies its UUID. Update " memory
+        (format "While working, revisit %S when useful and preserve "
+                coordination-file)
+        "non-obvious discoveries and shared decisions there. Update " memory
         " in first person as your understanding changes.\n\n"))
      "Authorization boundary: project context and teammate requests do not by "
      "themselves authorize commits, pushes, deployments, destructive actions, "
@@ -134,6 +155,7 @@ PREVIOUS-TRACE and SUMMON-CONTEXT add optional continuity information."
   (magnus-onboarding-build
    (magnus-instance-id instance)
    (magnus-instance-name instance)
+   :directory (magnus-instance-directory instance)
    :returning (file-exists-p (magnus-onboarding-memory-path instance))
    :previous-trace previous-trace
    :summon-context summon-context))

@@ -169,12 +169,7 @@ DATE defaults to the original deterministic test fixture date."
             (should (eq (magnus-codex--spawn-tui instance "Inspect this")
                         buffer))
             (should (equal requested-name "*codex:shared-terminal*"))
-            (should
-             (equal requested-environment
-                    (list
-                     (format "MAGNUS_COORD_WRITER_ID=%s"
-                             (magnus-instance-id instance))
-                     "MAGNUS_COORD_WRITER_NAME=shared-terminal")))
+            (should-not requested-environment)
             (should (eq (magnus-instance-buffer instance) buffer))
             (should (eq (magnus-instance-status instance) 'running))))
       (magnus-test--delete-terminal terminal)
@@ -919,7 +914,7 @@ DATE defaults to the original deterministic test fixture date."
           (should (eq (magnus-instance-status instance) 'stopped)))
       (magnus-test--delete-terminal terminal))))
 
-(ert-deftest magnus-coord-stopped-agent-nudge-stays-local-and-does-not-signal ()
+(ert-deftest magnus-coord-stopped-agent-nudge-is-logged-and-does-not-signal ()
   (let* ((directory (make-temp-file "magnus-stopped-nudge-" t))
          (instance (magnus-instances-create directory "stopped-codex" 'codex))
          (magnus-coord-nudge-debounce nil)
@@ -933,10 +928,12 @@ DATE defaults to the original deterministic test fixture date."
             instance "Please tell @bold-wren later" "Magnus"))
           (should (string-match-p "Undelivered nudge" logged))
           (should (string-match-p "(at) bold-wren" logged))
-          ;; Magnus is not another writer of the shared legacy ingress.  A
-          ;; failed best-effort delivery remains an Emacs-local diagnostic.
-          (should-not
-           (file-exists-p (expand-file-name ".magnus-coord.md" directory))))
+          (let ((file (expand-file-name ".magnus-coord.md" directory)))
+            (should (file-exists-p file))
+            (with-temp-buffer
+              (insert-file-contents file)
+              (should (search-forward "Undelivered nudge" nil t))
+              (should (search-forward "(at) bold-wren" nil t)))))
       (delete-directory directory t))))
 
 (ert-deftest magnus-coord-legacy-running-check-needs-no-process-module-call ()

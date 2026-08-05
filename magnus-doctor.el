@@ -19,15 +19,16 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'magnus-instances)
-(require 'magnus-coord-runtime)
+
+(declare-function magnus-coord-review-retry-diagnostics
+                  "magnus-coord" (directory))
+(declare-function magnus-coord-watched-directories "magnus-coord" ())
+(declare-function magnus-coord-pending-review-directories "magnus-coord" ())
 
 (defvar magnus-state-file)
 (defvar magnus-review-directory-root)
 (defvar magnus-claude-executable)
 (defvar magnus-codex-executable)
-(declare-function magnus-coord-review-retry-diagnostics
-                  "magnus-coord" (directory))
-(declare-function magnus-coord-watched-directories "magnus-coord" ())
 
 (cl-defstruct (magnus-doctor-check
                (:constructor magnus-doctor-check--create))
@@ -151,35 +152,30 @@ its parent is the location Magnus needs to create or replace a file in."
    (magnus-instances-list)))
 
 (defun magnus-doctor--active-project-directories ()
-  "Return normalized unique roots owned by active agents or review watchers."
+  "Return roots owned by active agents, pending reviews, or live watchers."
   (let (directories)
-    (dolist (instance (magnus-instances-active-list))
-      (let ((directory (magnus-instance-directory instance)))
-        (when (and (stringp directory) (not (string-empty-p directory)))
-          (cl-pushnew (file-name-as-directory
-                       (file-truename (expand-file-name directory)))
-                      directories :test #'equal))))
-    (when (fboundp 'magnus-coord-watched-directories)
-      (dolist (directory (magnus-coord-watched-directories))
-        (when (and (stringp directory) (not (string-empty-p directory)))
-          (cl-pushnew (file-name-as-directory
-                       (file-truename (expand-file-name directory)))
-                      directories :test #'equal))))
+    (cl-labels
+        ((add-directory
+          (directory)
+          (when (and (stringp directory) (not (string-empty-p directory)))
+            (cl-pushnew (file-name-as-directory
+                         (file-truename (expand-file-name directory)))
+                        directories :test #'equal))))
+      (dolist (instance (magnus-instances-active-list))
+        (add-directory (magnus-instance-directory instance)))
+      ;; Discover pending reviews independently of their watcher. Otherwise a
+      ;; failed watcher startup erases the very project Doctor must diagnose.
+      (when (fboundp 'magnus-coord-pending-review-directories)
+        (dolist (directory (magnus-coord-pending-review-directories))
+          (add-directory directory)))
+      (when (fboundp 'magnus-coord-watched-directories)
+        (dolist (directory (magnus-coord-watched-directories))
+          (add-directory directory))))
     (nreverse directories)))
 
 (defun magnus-doctor--coordination-detail (diagnostics)
-  "Summarize problems in cached coordination DIAGNOSTICS."
+  "Summarize review checkpoint retry DIAGNOSTICS."
   (let (parts)
-    (dolist (entry '((:refresh-error . "refresh error: %s")
-                     (:projection-error . "projection error: %s")
-                     (:gc-error . "GC error: %s")
-                     (:gc-deferred . "GC deferred: %s")))
-      (when-let ((value (plist-get diagnostics (car entry))))
-        (push (format (cdr entry) value) parts)))
-    (when (plist-get diagnostics :projection-dirty)
-      (push "generated projection is dirty" parts))
-    (when (plist-get diagnostics :retrying-transient-read)
-      (push "retrying a transient event-store read" parts))
     (let ((pending (or (plist-get diagnostics :pending-review-retry-count) 0))
           (exhausted (or (plist-get diagnostics :exhausted-review-count) 0)))
       (when (> pending 0)
@@ -196,63 +192,50 @@ its parent is the location Magnus needs to create or replace a file in."
             (when last-error (format " (%s)" last-error))
             "; press g in *magnus* to re-arm")
            parts))))
-    (dolist (entry '((:revision-issues . "revision")
-                     (:state-issues . "state")
-                     (:gc-issues . "GC")))
-      (let ((count (length (plist-get diagnostics (car entry)))))
-        (when (> count 0)
-          (push (format "%d %s issue%s"
-                        count (cdr entry) (if (= count 1) "" "s"))
-                parts))))
     (if parts
         (string-join (nreverse parts) "; ")
-      "Cached runtime has no recorded issues.")))
+      "No review checkpoint retries are pending.")))
 
 (defun magnus-doctor--coordination-check (directory)
-  "Return a read-only coordination runtime check for DIRECTORY."
+  "Return a read-only coordination watcher check for DIRECTORY."
   (condition-case error-data
-      (let* ((runtime (magnus-coord-runtime-diagnostics directory))
-             (retry
+      (let* ((retry
               (and (fboundp 'magnus-coord-review-retry-diagnostics)
                    (magnus-coord-review-retry-diagnostics directory)))
-             (diagnostics (append runtime retry))
-             (running (plist-get diagnostics :running))
-             (hard-error
-              (or (plist-get diagnostics :refresh-error)
-                  (plist-get diagnostics :projection-error)
-                  (plist-get diagnostics :gc-error)
-                  (> (or (plist-get diagnostics :exhausted-review-count) 0)
-                     0)))
-             (soft-error
-              (or (plist-get diagnostics :projection-dirty)
-                  (plist-get diagnostics :revision-issues)
-                  (plist-get diagnostics :state-issues)
-                  (plist-get diagnostics :retrying-transient-read)
-                  (> (or (plist-get diagnostics :pending-review-retry-count) 0)
-                     0)
-                  (plist-get diagnostics :gc-deferred)
-                  (plist-get diagnostics :gc-issues)))
+             (diagnostics (or retry '()))
+             (watched
+              (and (fboundp 'magnus-coord-watched-directories)
+                   (member (directory-file-name directory)
+                           (mapcar #'directory-file-name
+                                   (magnus-coord-watched-directories)))))
+             (pending
+              (or (plist-get diagnostics :pending-review-retry-count) 0))
+             (exhausted
+              (or (plist-get diagnostics :exhausted-review-count) 0))
              (label (abbreviate-file-name directory))
              (id (intern (concat "coordination-"
                                  (secure-hash 'sha1 directory)))))
         (cond
-         (hard-error
+         ((> exhausted 0)
           (magnus-doctor--check
-           id 'error (format "Coordination runtime failed for %s" label)
+           id 'error
+           (format "Coordination checkpoint retries exhausted for %s" label)
            (magnus-doctor--coordination-detail diagnostics)))
-         ((not running)
+         ((> pending 0)
           (magnus-doctor--check
-           id 'warning (format "Coordination runtime is idle for %s" label)
-           (concat "No cached runtime exists. Magnus Doctor did not start "
-                   "or refresh one because diagnostics are read-only.")))
-         (soft-error
+           id 'warning
+           (format "Coordination checkpoint retries pending for %s" label)
+           (magnus-doctor--coordination-detail diagnostics)))
+         (watched
           (magnus-doctor--check
-           id 'warning (format "Coordination runtime has issues for %s" label)
+           id 'ok (format "Coordination watcher is active for %s" label)
            (magnus-doctor--coordination-detail diagnostics)))
          (t
           (magnus-doctor--check
-           id 'ok (format "Coordination runtime is healthy for %s" label)
-           (magnus-doctor--coordination-detail diagnostics)))))
+           id 'warning (format "Coordination watcher is idle for %s" label)
+           (concat "No watcher is serving this active agent or review. "
+                   "Magnus Doctor does not start one because diagnostics "
+                   "are read-only.")))))
     (error
      (magnus-doctor--check
       (intern (concat "coordination-" (secure-hash 'sha1 directory)))
@@ -262,7 +245,7 @@ its parent is the location Magnus needs to create or replace a file in."
       (error-message-string error-data)))))
 
 (defun magnus-doctor--coordination-checks ()
-  "Return cache-only diagnostics for agent- and review-owned projects."
+  "Return read-only diagnostics for agent- and review-owned projects."
   (mapcar #'magnus-doctor--coordination-check
           (magnus-doctor--active-project-directories)))
 

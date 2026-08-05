@@ -614,11 +614,42 @@ This is intended for raw JSONL and stderr streams; it never follows symlinks."
           t)
       (magnus-review-git-error nil))))
 
+(defvar magnus-coord-file)
+(defvar magnus-coord-instructions-file)
+
+(defun magnus-review--control-pathspecs (project-root)
+  "Return literal Git exclusions for Magnus control files in PROJECT-ROOT.
+Customized coordination paths outside the worktree are ignored: an exclusion
+must never broaden Git's scope or conceal an unrelated project path."
+  (let ((root (file-name-as-directory (expand-file-name project-root)))
+        paths)
+    (dolist (configured
+             (list (if (boundp 'magnus-coord-file)
+                       magnus-coord-file
+                     ".magnus-coord.md")
+                   (if (boundp 'magnus-coord-instructions-file)
+                       magnus-coord-instructions-file
+                     ".claude/magnus-instructions.md")))
+      (when (and (stringp configured)
+                 (not (string-empty-p configured))
+                 (not (string-match-p "[\0\n\r]" configured)))
+        (let* ((absolute (expand-file-name configured root))
+               (relative (file-relative-name absolute root)))
+          (when (and (not (file-name-absolute-p relative))
+                     (not (string-match-p
+                           "\\`\\.\\.?\\(?:/\\|\\'\\)" relative)))
+            (push (concat ":(top,literal,exclude)" relative) paths)))))
+    (delete-dups (nreverse paths))))
+
 (defun magnus-review-worktree-dirty-status (project-root)
-  "Return porcelain status for PROJECT-ROOT, or nil when it is clean."
-  (let ((status (magnus-review--git-output
-                 project-root "status" "--porcelain=v1"
-                 "--untracked-files=normal")))
+  "Return reviewable porcelain status for PROJECT-ROOT, or nil when clean.
+Magnus's coordination file and generated instructions are control-plane state:
+publishing a checkpoint must not make its own committed-work gate fail."
+  (let ((status
+         (apply #'magnus-review--git-output
+                project-root "status" "--porcelain=v1"
+                "--untracked-files=normal" "--" "."
+                (magnus-review--control-pathspecs project-root))))
     (unless (string-empty-p status) status)))
 
 (defun magnus-review--managed-worktree-dirty-status (checkout)
@@ -2092,8 +2123,6 @@ round-specific path; without it, use the legacy shared path."
 (defun magnus-review-handle-ready-marker (directory marker)
   "Validate a coordination review-ready MARKER emitted in DIRECTORY.
 MARKER is a plist with :request-id, :checkpoint-token, :base, and :head strings.
-Event-backed markers also carry :writer-id; that durable identity must match
-the review author.  Legacy Markdown markers omit it and remain supported.
 A new valid marker appends an immutable round and runs
 `magnus-review-ready-hook'.  An unchanged re-review checkpoint is acknowledged
 without duplicating the round or launching a model, and finishes that pending
@@ -2108,26 +2137,12 @@ startup recovery can continue launching it idempotently."
          (token (plist-get marker :checkpoint-token))
          (base (plist-get marker :base))
          (head (plist-get marker :head))
-         (writer-id (plist-get marker :writer-id))
          (review (and request-id (magnus-review-get request-id))))
-    ;; An immutable event may outlive a temporarily unreadable review manifest.
-    ;; Do not acknowledge and garbage-collect that evidence merely because the
-    ;; durable registry could not load its request during this Emacs session.
-    ;; Legacy Markdown has historically treated unknown requests as no-ops and
-    ;; remains compatible because it carries no writer identity.
-    (when (and writer-id (null review))
-      (magnus-review--signal
-       "Event-backed review request is not loaded: %s"
-       (or request-id "<missing>")))
+    ;; Coordination markers have historically treated unknown requests as
+    ;; no-ops.  A marker can outlive an archived or otherwise absent manifest,
+    ;; so consuming the shared Markdown must not turn that into a project-wide
+    ;; watcher failure.
     (when review
-      (when (and writer-id
-                 (not (and (stringp writer-id)
-                           (string= writer-id
-                                    (magnus-review-author-instance-id
-                                     review)))))
-        (signal
-         'magnus-review-checkpoint-rejected
-         (list "Review-ready event came from a different agent identity")))
       (unless (stringp token)
         (magnus-review--signal "Review-ready checkpoint token is missing"))
       (unless (and (magnus-review--valid-oid-p base)
@@ -2167,9 +2182,9 @@ startup recovery can continue launching it idempotently."
                    (magnus-review--checkpoint-event-round
                     review (car (last events))))))
         (cond
-         ;; The event ledger is replay authority.  Historical Git objects need
-         ;; not still resolve in the source repository once their exact scope
-         ;; is linked to an immutable round.
+         ;; The checkpoint ledger is replay authority.  Historical Git objects
+         ;; need not still resolve in the source repository once their exact
+         ;; scope is linked to an immutable round.
          (matching-event
           (when (and (eq (magnus-review-checkpoint-event-kind matching-event)
                          'round)
@@ -2182,7 +2197,7 @@ startup recovery can continue launching it idempotently."
          ;; Once a token binds to a real round or an acknowledged no-progress
          ;; scope, it can never identify another Git scope.  This is a permanent
          ;; protocol rejection rather than a transient handler failure: retrying
-         ;; the immutable marker cannot repair it and used to create a noisy
+         ;; the same marker cannot repair it and used to create a noisy
          ;; timer loop on every startup.
          ;; If a newer request is genuinely waiting, redeliver that canonical
          ;; token so an author recovering from compaction can still proceed.

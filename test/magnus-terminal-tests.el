@@ -53,7 +53,7 @@
     (should (equal sent '("<escape>")))))
 
 (ert-deftest magnus-terminal-applies-isolated-process-environment ()
-  (let ((process-environment '("KEEP=yes" "MAGNUS_COORD_WRITER_ID=old"))
+  (let ((process-environment '("KEEP=yes" "MAGNUS_TEST_ID=old"))
         observed
         buffer)
     (cl-letf (((symbol-function 'vterm-mode)
@@ -62,16 +62,16 @@
       (setq buffer
             (magnus-terminal-create-buffer
              " *magnus-environment*"
-             '("MAGNUS_COORD_WRITER_ID=new"
-               "MAGNUS_COORD_WRITER_NAME=swift-hare"))))
+             '("MAGNUS_TEST_ID=new"
+               "MAGNUS_TEST_NAME=fixture"))))
     (unwind-protect
         (progn
           (should (member "KEEP=yes" observed))
-          (should (member "MAGNUS_COORD_WRITER_ID=new" observed))
-          (should (member "MAGNUS_COORD_WRITER_NAME=swift-hare" observed))
-          (should-not (member "MAGNUS_COORD_WRITER_ID=old" observed))
+          (should (member "MAGNUS_TEST_ID=new" observed))
+          (should (member "MAGNUS_TEST_NAME=fixture" observed))
+          (should-not (member "MAGNUS_TEST_ID=old" observed))
           (should (equal process-environment
-                         '("KEEP=yes" "MAGNUS_COORD_WRITER_ID=old"))))
+                         '("KEEP=yes" "MAGNUS_TEST_ID=old"))))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 

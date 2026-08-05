@@ -21,7 +21,6 @@
 (require 'magnus-provider)
 (require 'magnus-headless)
 (require 'magnus-coord)
-(require 'magnus-environment)
 (require 'magnus-onboarding)
 (require 'magnus-terminal)
 (require 'magnus-trace)
@@ -235,44 +234,37 @@ same-buffer process replacement."
       (setf (magnus-instance-buffer instance) nil
             (magnus-instance-status instance) 'stopped))))
 
-(defun magnus-process--rollback-coordination
-    (directory attempted watcher-existed
-               session-start-existed session-start-value)
-  "Roll back coordination state acquired for a failed creation.
-ATTEMPTED says registration began.  WATCHER-EXISTED and the session-start
-arguments snapshot project state from before this creation."
-  (when attempted
-    ;; Immutable-event registration never owns or rewrites legacy ingress.
-    ;; Restore only runtime state this registration changed.  In particular,
-    ;; never stop a watcher that was already serving another project agent.
-    (condition-case err
-        (if session-start-existed
-            (puthash directory session-start-value
-                     magnus-coord--session-start-times)
-          (remhash directory magnus-coord--session-start-times))
-      (error
-       (message "Magnus: session-state rollback failed for %s: %s"
-                directory (error-message-string err))))
-    (when (and (not watcher-existed)
-               (member directory magnus-coord--watched-dirs))
-      (condition-case err
-          (magnus-coord-stop-watching directory)
-        (error
-         (message "Magnus: watcher rollback failed for %s: %s"
-                  directory (error-message-string err)))))))
+(defun magnus-process--coord-row-existed-p (directory name)
+  "Return non-nil when DIRECTORY already has an Active Work row for NAME.
+Read the shared file directly so a watched-but-stale cache cannot authorize
+destructive rollback. If the snapshot is ambiguous, return non-nil and leave
+the row untouched."
+  (let ((file (magnus-coord-file-path directory)))
+    (and
+     (file-exists-p file)
+     (condition-case err
+         (with-temp-buffer
+           (insert-file-contents file)
+           (cl-some
+            (lambda (entry)
+              (string= (or (plist-get entry :agent) "") name))
+            (plist-get (magnus-coord--parse-buffer) :active)))
+       (error
+        (message "Magnus: preserving ambiguous coordination row for %s: %s"
+                 name (error-message-string err))
+        t)))))
 
 (defun magnus-process--rollback-creation
     (instance directory coordination-attempted runtime-attempted external
-              runtime-owner watcher-existed
-              session-start-existed session-start-value)
+              runtime-owner coordination-snapshot)
   "Release resources acquired by one failed INSTANCE creation transaction."
   ;; Reverse acquisition order: runtime, coordination, registry.
   (when runtime-attempted
     (magnus-process--discard-created-runtime
      instance external runtime-owner))
-  (magnus-process--rollback-coordination
-   directory coordination-attempted watcher-existed
-   session-start-existed session-start-value)
+  (when coordination-attempted
+    (magnus-process--restore-coord-ownership
+     directory coordination-snapshot))
   (when (memq instance (magnus-instances-list))
     (condition-case err
         (magnus-instances-remove instance)
@@ -290,12 +282,9 @@ release only the runtime, coordination state, and registry entry acquired by
 this call.  Return INSTANCE after successful startup."
   (let* ((directory (magnus-instance-directory instance))
          (project-key (magnus-coord--normalized-directory directory))
-         (missing (make-symbol "missing-session-start"))
-         (session-start-value
-          (gethash project-key magnus-coord--session-start-times missing))
-         (session-start-existed (not (eq session-start-value missing)))
-         (watcher-existed
-          (and (member project-key magnus-coord--watched-dirs) t))
+         (coordination-snapshot
+          (magnus-process--coord-ownership-snapshot
+           project-key (magnus-instance-name instance)))
          coordination-attempted
          runtime-attempted
          (magnus-process--transaction-runtime-buffer (list nil))
@@ -314,8 +303,8 @@ this call.  Return INSTANCE after successful startup."
       (unless committed
         (magnus-process--rollback-creation
          instance project-key coordination-attempted runtime-attempted external
-         (car magnus-process--transaction-runtime-buffer) watcher-existed
-         session-start-existed session-start-value)))))
+         (car magnus-process--transaction-runtime-buffer)
+         coordination-snapshot)))))
 
 (defun magnus-process-create (&optional directory name provider initial-message)
   "Create a new agent instance.
@@ -380,11 +369,7 @@ When INITIAL-MESSAGE is non-nil, include it in the native TUI's first turn."
                   (magnus-process--list-sessions directory)))
           ;; Create vterm buffer.
           (setq buffer
-                (magnus-terminal-create-buffer
-                 buffer-name
-                 (magnus-environment-coordination-bindings
-                  (magnus-instance-id instance)
-                  (magnus-instance-name instance))))
+                (magnus-terminal-create-buffer buffer-name))
           (setq owner-process (get-buffer-process buffer))
           (magnus-process--record-transaction-runtime buffer owner-process)
           (with-current-buffer buffer
@@ -498,11 +483,13 @@ INSTANCE is accepted for internal callers; legacy callers are resolved by NAME."
     (if candidate
         (magnus-onboarding-build
          (magnus-instance-id candidate) name
+         :directory (magnus-instance-directory candidate)
          :returning t
          :previous-trace prev-trace
          :summon-context summon-context)
       (magnus-onboarding-build
        nil name
+       :directory default-directory
        :returning t
        :previous-trace prev-trace
        :summon-context summon-context))))
@@ -517,6 +504,9 @@ INSTANCE is accepted for internal callers; legacy callers are resolved by NAME."
          (magnus-instance-id candidate)
        nil)
      name
+     :directory (if candidate
+                    (magnus-instance-directory candidate)
+                  default-directory)
      :returning nil
      :summon-context summon-context)))
 
@@ -799,8 +789,8 @@ The session ID is preserved so the agent can be resurrected later
                                  :status 'purged
                                  :buffer nil
                                  :purged-at (float-time))
-        ;; Lifecycle-aware coordination projection must see the archived
-        ;; status before the last owner releases the project runtime.
+        ;; Record the archived status before the last agent releases the
+        ;; project's coordination watcher.
         (magnus-coord-unregister-agent
          (magnus-instance-directory instance) instance))
     ;; Graceful stop (same as kill, but we keep the instance)
@@ -818,7 +808,7 @@ The session ID is preserved so the agent can be resurrected later
                              :status 'purged
                              :buffer nil
                              :purged-at (float-time))
-    ;; Keep projection ordering identical across local and external providers.
+    ;; Keep coordination ordering identical across local and external providers.
     (magnus-coord-unregister-agent
      (magnus-instance-directory instance) instance))
   ;; Index expertise tags asynchronously for every provider.
@@ -836,7 +826,8 @@ nudge the agent to re-read it."
                                  (magnus-coord--instructions-stale-p
                                   instructions-file)))
          (coord-snapshot
-          (magnus-process--coord-ownership-snapshot directory))
+          (magnus-process--coord-ownership-snapshot
+           directory (magnus-instance-name instance)))
          (original-status (magnus-instance-status instance))
          (original-buffer (magnus-instance-buffer instance))
          (original-purged-at (magnus-instance-purged-at instance))
@@ -851,9 +842,8 @@ nudge the agent to re-read it."
                   (magnus-instance-name instance)))
     (unwind-protect
         (progn
-          ;; Acquire project ownership while the instance is still hidden from
-          ;; lifecycle-aware projection, then expose it immediately before its
-          ;; provider runtime starts.
+          ;; Acquire project coordination while the instance is still archived,
+          ;; then expose it immediately before its provider runtime starts.
           (setq coordination-attempted t)
           (magnus-coord-register-agent directory instance)
           (magnus-instances-update instance :status 'running :purged-at nil)
@@ -908,8 +898,11 @@ nudge the agent to re-read it."
              (magnus-coord-nudge-agent
               current-instance
               (format
-               "The coordination protocol has been updated. Please re-read %s for the latest event schema and engineering-journal guidance."
-               magnus-coord-instructions-file)
+               (concat
+                "The coordination protocol has been updated. Please re-read "
+                "%S for the latest shared-file protocol and "
+                "engineering-journal guidance.")
+               (magnus-coord-display-instructions-file directory))
               "Magnus"))))))
     instance))
 
@@ -948,30 +941,54 @@ Sends SIGCONT to continue the process."
   "Return non-nil if INSTANCE is suspended."
   (eq (magnus-instance-status instance) 'suspended))
 
-(defun magnus-process--coord-ownership-snapshot (directory)
-  "Snapshot Magnus coordination ownership for DIRECTORY.
-The returned plist is intentionally limited to process-owned runtime state;
-durable writer directories and instructions are safe provisioning artifacts."
-  (let* ((directory (magnus-coord--normalized-directory directory))
-         (missing (make-symbol "missing-session-start"))
+(defun magnus-process--coord-ownership-snapshot
+    (directory &optional agent-name)
+  "Snapshot coordination ownership and AGENT-NAME's row in DIRECTORY."
+  (setq directory (magnus-coord--normalized-directory directory))
+  (let* ((missing (make-symbol "missing-session-start"))
          (session-start
           (gethash directory magnus-coord--session-start-times missing)))
     (list :watching (and (member directory magnus-coord--watched-dirs) t)
           :session-start-present (not (eq session-start missing))
-          :session-start session-start)))
+          :session-start session-start
+          :agent-name agent-name
+          :row-existed
+          (and agent-name
+               (magnus-process--coord-row-existed-p directory agent-name)))))
 
 (defun magnus-process--restore-coord-ownership (directory snapshot)
-  "Restore DIRECTORY's coordination runtime ownership from SNAPSHOT.
-This removes only a watcher acquired by the failed transaction and preserves
-pre-existing ownership shared with another agent."
+  "Restore DIRECTORY's coordination ownership from SNAPSHOT.
+A same-name Active Work row is removed only when it did not exist before the
+failed attempt. Shared log history remains as an audit trail."
   (setq directory (magnus-coord--normalized-directory directory))
-  (if (plist-get snapshot :session-start-present)
-      (puthash directory (plist-get snapshot :session-start)
-               magnus-coord--session-start-times)
-    (remhash directory magnus-coord--session-start-times))
+  (let ((agent-name (plist-get snapshot :agent-name)))
+    (when (and agent-name (not (plist-get snapshot :row-existed)))
+      (condition-case err
+          (when (file-exists-p (magnus-coord-file-path directory))
+            (magnus-coord-clear-agent directory agent-name)
+            ;; Keep an existing watcher's presentation cache truthful without
+            ;; consuming messages or resetting checkpoint retries.
+            (when (member directory magnus-coord--watched-dirs)
+              (magnus-coord--cache-content
+               directory (magnus-coord--read-content directory))))
+        (error
+         (message "Magnus: coordination row rollback failed for %s: %s"
+                  agent-name (error-message-string err))))))
+  (condition-case err
+      (if (plist-get snapshot :session-start-present)
+          (puthash directory (plist-get snapshot :session-start)
+                   magnus-coord--session-start-times)
+        (remhash directory magnus-coord--session-start-times))
+    (error
+     (message "Magnus: session-state rollback failed for %s: %s"
+              directory (error-message-string err))))
   (when (and (not (plist-get snapshot :watching))
              (member directory magnus-coord--watched-dirs))
-    (magnus-coord-stop-watching directory)))
+    (condition-case err
+        (magnus-coord-stop-watching directory)
+      (error
+       (message "Magnus: watcher rollback failed for %s: %s"
+                directory (error-message-string err))))))
 
 (defun magnus-process--stop-local-for-chdir (instance)
   "Synchronously stop INSTANCE's local terminal before a directory move."
@@ -1042,7 +1059,8 @@ stopped so callers can retry or explicitly resurrect it."
       (let* ((old-session-id
               (or (magnus-instance-session-id instance) original-session-id))
              (new-coord-snapshot
-              (magnus-process--coord-ownership-snapshot new-project-key))
+              (magnus-process--coord-ownership-snapshot
+               new-project-key name))
              (magnus-process--transaction-runtime-buffer (list nil))
              new-coord-attempted
              new-runtime-attempted
@@ -1062,8 +1080,8 @@ stopped so callers can retry or explicitly resurrect it."
                :purged-at nil)
               (magnus-process--ensure-agent-dir instance)
               (setq new-coord-attempted t)
-              ;; Registration creates current onboarding instructions, the
-              ;; writer store, and the destination watcher before startup.
+              ;; Registration creates the shared coordination file, current
+              ;; onboarding instructions, and destination watcher before startup.
               (magnus-coord-register-agent new-dir instance)
               (setq new-runtime-attempted t)
               (if external
@@ -1071,8 +1089,8 @@ stopped so callers can retry or explicitly resurrect it."
                 ;; Synchronous spawn is deliberate: setup failures belong to
                 ;; this transaction rather than an unreportable timer callback.
                 (magnus-process--spawn instance))
-              ;; There is now no observation gap: destination ownership and
-              ;; its runtime are live before the source watcher is released.
+              ;; There is now no observation gap: destination ownership and its
+              ;; provider are live before the source watcher is released.
               (setq old-release-attempted t)
               (magnus-coord-unregister-agent old-dir instance)
               (setq committed t)
@@ -1131,11 +1149,7 @@ underscores with hyphens."
     (unwind-protect
         (progn
           (setq buffer
-                (magnus-terminal-create-buffer
-                 buffer-name
-                 (magnus-environment-coordination-bindings
-                  (magnus-instance-id instance)
-                  (magnus-instance-name instance))))
+                (magnus-terminal-create-buffer buffer-name))
           (setq owner-process (get-buffer-process buffer))
           (magnus-process--record-transaction-runtime buffer owner-process)
           (with-current-buffer buffer
@@ -1371,9 +1385,6 @@ Returns the new instance."
                   :prompt full-prompt
                   :allowed-tools magnus-headless-allowed-tools
                   :name name
-                  :environment-bindings
-                  (magnus-environment-coordination-bindings
-                   (magnus-instance-id instance) name)
                   :buffer buffer)
             (list
              :on-event
@@ -1450,6 +1461,17 @@ OWNER-BUFFER preserves the runtime identity after its output buffer is killed."
           ('errored
            (message "Magnus: headless agent '%s' failed: %s"
                     (magnus-instance-name instance) event-str)))
+        (unless (eq (magnus-instance-status instance) 'purged)
+          (condition-case err
+              (magnus-coord-add-log
+               (magnus-instance-directory instance)
+               (magnus-instance-name instance)
+               (format "Headless task %s"
+                       (replace-regexp-in-string "[\r\n]+" " " event-str)))
+            (error
+             (message "Magnus: could not log headless completion for %s: %s"
+                      (magnus-instance-name instance)
+                      (error-message-string err)))))
         (when (buffer-live-p buffer)
           (with-current-buffer buffer
             (let ((inhibit-read-only t))

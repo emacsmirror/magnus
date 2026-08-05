@@ -33,8 +33,8 @@
 (declare-function magnus-coord-agent-busy-p "magnus-coord")
 (declare-function magnus-coord--neglected-p "magnus-coord")
 (declare-function magnus-coord-has-state-p "magnus-coord" (directory))
-(declare-function magnus-coord-open-current "magnus-coord" (directory))
 (declare-function magnus-coord-refresh-all "magnus-coord")
+(declare-function magnus-coord-reconcile-all "magnus-coord")
 (declare-function magnus-retro "magnus-coord")
 (declare-function magnus-persistence-save "magnus-persistence")
 (declare-function magnus--agents-index-get "magnus")
@@ -249,7 +249,6 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
     (define-key map (kbd "g") #'magnus-status-refresh)
     (define-key map (kbd "x") #'magnus-status-context)
     (define-key map (kbd "C") #'magnus-status-coordination)
-    (define-key map (kbd "J") #'magnus-status-coordination-current)
     (define-key map (kbd "n") #'magnus-status-next)
     (define-key map (kbd "p") #'magnus-status-previous)
     (define-key map (kbd "a") #'magnus-attention-next)
@@ -308,9 +307,10 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
 (defun magnus-status-refresh ()
   "Refresh the magnus status buffer."
   (interactive)
-  ;; Poll durable coordination evidence only on interactive (manual `g')
-  ;; refresh.  Presentation-only refreshes do not scan the event store.
+  ;; Re-read shared coordination files only on interactive (manual `g')
+  ;; refresh.  Presentation-only refreshes use the watcher-maintained cache.
   (when (called-interactively-p 'interactive)
+    (magnus-coord-reconcile-all)
     (magnus-coord-refresh-all))
   (when-let ((buffer (get-buffer magnus-buffer-name)))
     (with-current-buffer buffer
@@ -1069,14 +1069,9 @@ If either the registry notification or home migration fails, restore both."
           (user-error "No instances to get project directory from")))))
 
 (defun magnus-status-coordination ()
-  "Open the legacy coordination ingress for the current project."
+  "Open the shared coordination file for the current project."
   (interactive)
   (magnus-coord-open (magnus-status--coordination-directory)))
-
-(defun magnus-status-coordination-current ()
-  "Open the generated coordination view for the current project."
-  (interactive)
-  (magnus-coord-open-current (magnus-status--coordination-directory)))
 
 (defun magnus-status-suspend ()
   "Suspend the instance at point."
