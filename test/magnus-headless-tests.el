@@ -15,6 +15,8 @@
       ("result"
        (list :type type :structured-result (alist-get 'value event)
              :terminal t))
+      ("terminal"
+       (list :type type :terminal t))
       ("provider-error"
        (list :type type :error (list :message (alist-get 'message event))
              :terminal t))
@@ -22,16 +24,26 @@
 
 (defun magnus-test-headless--spec (request)
   "Build a fake process specification from REQUEST."
-  (list :command
-        (list (or (executable-find "sh") shell-file-name)
-              shell-command-switch
-              (plist-get request :fixture-command))
-        :decoder #'magnus-test-headless--decoder
-        :session-id (plist-get request :fixture-session-id)))
+  (let ((spec
+         (list :command
+               (list (or (executable-find "sh") shell-file-name)
+                     shell-command-switch
+                     (plist-get request :fixture-command))
+               :decoder #'magnus-test-headless--decoder
+               :session-id (plist-get request :fixture-session-id))))
+    (when (plist-member request :fixture-success-requires)
+      (setq spec
+            (plist-put spec :success-requires
+                       (plist-get request :fixture-success-requires))))
+    spec))
 
 (magnus-provider-register
  'magnus-test-headless
  '((headless-review-spec . magnus-test-headless--spec)))
+
+(magnus-provider-register
+ 'magnus-test-headless-generic
+ '((headless-spec . magnus-test-headless--spec)))
 
 (defun magnus-test-headless--request (command)
   "Return a fake provider request executing shell COMMAND."
@@ -58,6 +70,80 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
       (sleep-for 0.001))
     (unless (funcall predicate)
       (ert-fail "Timed out waiting for fake headless provider"))))
+
+(ert-deftest magnus-headless-agent-never-uses-legacy-review-adapter ()
+  (let ((request (magnus-test-headless--request "exit 0")))
+    (setq request (plist-put request :purpose 'agent))
+    (should-error
+     (magnus-headless-start 'magnus-test-headless request)
+     :type 'user-error)))
+
+(ert-deftest magnus-headless-agent-can-require-terminal-only ()
+  (let* ((terminal "{\"type\":\"terminal\"}")
+         (request
+          (append
+           (magnus-test-headless--request
+            (magnus-test-headless--emit terminal))
+           '(:purpose agent :fixture-success-requires (terminal))))
+         completion process)
+    (unwind-protect
+        (progn
+          (setq process
+                (magnus-headless-start
+                 'magnus-test-headless-generic request
+                 (list :on-complete
+                       (lambda (_process result)
+                         (setq completion result)))))
+          (magnus-test-headless--wait (lambda () completion))
+          (should (plist-get completion :success-p))
+          (should (equal (plist-get completion :success-requires)
+                         '(terminal)))
+          (should-not
+           (plist-get completion :structured-result-present-p)))
+      (when (and process (process-live-p process))
+        (magnus-headless-cancel process t)))))
+
+(ert-deftest magnus-headless-review-cannot-weaken-success-requirements ()
+  (let ((request
+         (append (magnus-test-headless--request "exit 0")
+                 '(:purpose review
+                   :fixture-success-requires (terminal)))))
+    (should-error
+     (magnus-headless-start 'magnus-test-headless-generic request))))
+
+(ert-deftest magnus-headless-rejects-unknown-success-requirement ()
+  (let ((request
+         (append (magnus-test-headless--request "exit 0")
+                 '(:purpose agent
+                   :fixture-success-requires (terminal magic)))))
+    (should-error
+     (magnus-headless-start 'magnus-test-headless-generic request))))
+
+(ert-deftest magnus-headless-associates-optional-display-buffer ()
+  (let* ((line "{\"type\":\"result\",\"value\":{\"ok\":true}}")
+         (buffer (generate-new-buffer " *magnus-headless-display*"))
+         (request
+          (append
+           (magnus-test-headless--request
+            (magnus-test-headless--emit line))
+           (list :buffer buffer)))
+         completion process)
+    (unwind-protect
+        (progn
+          (setq process
+                (magnus-headless-start
+                 'magnus-test-headless-generic request
+                 (list :on-complete
+                       (lambda (_process result)
+                         (setq completion result)))))
+          (should (eq (process-buffer process) buffer))
+          (should (eq (get-buffer-process buffer) process))
+          (magnus-test-headless--wait (lambda () completion))
+          (should (plist-get completion :success-p)))
+      (when (and process (process-live-p process))
+        (magnus-headless-cancel process t))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (ert-deftest magnus-headless-closes-stdin-after-launch ()
   (let* ((result "{\"type\":\"result\",\"value\":{\"ok\":true}}")
@@ -339,6 +425,8 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
     (should (member session-id fresh-command))
     (should-not (string-match-p "Write\\|Edit\\|Bash"
                                 magnus-claude-review-tools))
+    (should (equal (plist-get fresh :success-requires)
+                   '(terminal structured-result)))
     (should-not (plist-get fresh :session-id))
     (should-not (cl-find-if
                  (lambda (entry) (string-prefix-p "CLAUDECODE=" entry))
@@ -346,6 +434,38 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
     (should (member "--resume" resumed-command))
     (should (member "resume-me" resumed-command))
     (should-not (member "--session-id" resumed-command))))
+
+(ert-deftest magnus-claude-agent-spec-is-explicit-and-separate-from-review ()
+  (let* ((process-environment
+          (cons "CLAUDECODE=nested" process-environment))
+         (spec
+          (magnus-claude-headless-spec
+           '(:purpose agent
+             :prompt "Implement it"
+             :name "swift-hare"
+             :allowed-tools "Read Write Edit Glob Grep Bash")))
+         (command (plist-get spec :command)))
+    (should
+     (equal command
+            (list magnus-claude-executable
+                  "--print" "Implement it"
+                  "--output-format" "stream-json"
+                  "--allowedTools" "Read Write Edit Glob Grep Bash")))
+    (should (equal (plist-get spec :success-requires) '(terminal)))
+    (should (equal (plist-get spec :name)
+                   "magnus-claude-agent-swift-hare"))
+    (should-not (member "--safe-mode" command))
+    (should-not (member "--json-schema" command))
+    (should-not
+     (cl-find-if
+      (lambda (entry) (string-prefix-p "CLAUDECODE=" entry))
+      (plist-get spec :environment)))))
+
+(ert-deftest magnus-claude-agent-spec-requires-explicit-tools ()
+  (should-error
+   (magnus-claude-headless-spec
+    '(:purpose agent :prompt "Implement it"))
+   :type 'user-error))
 
 (ert-deftest magnus-claude-review-decoder-captures-schema-result ()
   (let* ((event '((type . "result")
@@ -358,6 +478,25 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
     (should (equal (alist-get 'verdict
                               (plist-get decoded :structured-result))
                    "approve"))))
+
+(ert-deftest magnus-claude-decoder-normalizes-visible-text-and-cost ()
+  (let* ((assistant
+          (magnus-claude-headless-decode-event
+           '((type . "assistant")
+             (message
+              . ((content
+                  . (((type . "text") (text . "Hello "))
+                     ((type . "tool_use") (name . "Read"))
+                     ((type . "text") (text . "world")))))))
+           nil))
+         (result
+          (magnus-claude-headless-decode-event
+           '((type . "result")
+             (subtype . "success")
+             (cost_usd . 0.125))
+           nil)))
+    (should (equal (plist-get assistant :text) "Hello world"))
+    (should (= (plist-get result :cost-usd) 0.125))))
 
 (ert-deftest magnus-codex-review-spec-uses-resumable-exec-session ()
   (let ((schema-file (make-temp-file "magnus-codex-schema-")))
@@ -401,8 +540,16 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
           (should-not (member "--uncommitted" resumed-command))
           (should-not (member "--title" resumed-command))
           (should-not (member "--ephemeral" resumed-command))
+          (should (equal (plist-get fresh :success-requires)
+                         '(terminal structured-result)))
           (should (equal (plist-get resumed :session-id) "thread-resume")))
       (delete-file schema-file))))
+
+(ert-deftest magnus-codex-headless-agent-purpose-fails-clearly ()
+  (should-error
+   (magnus-codex-headless-spec
+    '(:purpose agent :prompt "Implement it"))
+   :type 'user-error))
 
 (ert-deftest magnus-codex-review-decoder-captures-thread-and-result ()
   (let* ((thread
@@ -421,6 +568,8 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
     (should (equal (alist-get 'verdict
                               (plist-get message :structured-result))
                    "approve"))
+    (should (equal (plist-get message :text)
+                   "{\"verdict\":\"approve\"}"))
     (should (plist-get terminal :terminal))))
 
 (provide 'magnus-headless-tests)

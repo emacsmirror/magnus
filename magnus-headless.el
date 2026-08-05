@@ -21,11 +21,13 @@
 ;;
 ;;   :directory   Existing working directory (required)
 ;;   :prompt      Provider prompt (required)
+;;   :purpose     `review' (the default) or `agent'
 ;;   :session-id  Session to resume, or nil for a fresh session
 ;;   :model       Optional provider model name
 ;;   :effort      Optional provider effort symbol or string
 ;;   :schema      Optional JSON Schema as JSON text or an encodable Lisp value
 ;;   :schema-file Optional existing JSON Schema file
+;;   :buffer      Optional live display buffer to associate with the process
 ;;
 ;; Provider adapters may define additional keys.  Review adapters currently use
 ;; :base, :head, :title, and :name.  When :schema is supplied without
@@ -39,6 +41,9 @@
 ;; A provider launch spec may return :candidate-session-id for a locally chosen
 ;; fresh ID.  Unlike :session-id, a candidate is diagnostic only and never
 ;; triggers :on-session until the provider confirms it in its event stream.
+;; Specs may also return :success-requires, a non-empty list containing
+;; `terminal' and/or `structured-result'.  The strict default requires both;
+;; review work may never weaken that default.
 ;;
 ;; CALLBACKS is a plist of optional functions:
 ;;
@@ -71,6 +76,17 @@ The complete stream remains available through the :on-stderr callback."
 (defvar magnus-headless--process-counter 0
   "Counter used to make provider subprocess names distinct.")
 
+(defconst magnus-headless--purposes '(review agent)
+  "Purposes accepted by the generic headless runner.")
+
+(defconst magnus-headless--success-requirements
+  '(terminal structured-result)
+  "Canonical facts a provider spec may require for success.")
+
+(defconst magnus-headless--default-success-requires
+  '(terminal structured-result)
+  "Success requirements used when a provider spec does not override them.")
+
 (defconst magnus-headless--callback-keys
   '(:on-raw-event :on-event :on-session :on-stderr :on-error :on-complete)
   "Recognized keys in a headless CALLBACKS plist.")
@@ -82,11 +98,17 @@ The complete stream remains available through the :on-stderr callback."
   (unless (listp request)
     (signal 'wrong-type-argument (list 'listp request)))
   (let ((directory (plist-get request :directory))
-        (prompt (plist-get request :prompt)))
+        (prompt (plist-get request :prompt))
+        (purpose (or (plist-get request :purpose) 'review))
+        (buffer (plist-get request :buffer)))
     (unless (and (stringp directory) (file-directory-p directory))
       (user-error "Headless directory does not exist: %s" directory))
     (unless (and (stringp prompt) (not (string-empty-p prompt)))
-      (user-error "A non-empty headless prompt is required"))))
+      (user-error "A non-empty headless prompt is required"))
+    (unless (memq purpose magnus-headless--purposes)
+      (user-error "Unknown headless purpose: %s" purpose))
+    (when (and buffer (not (buffer-live-p buffer)))
+      (user-error "Headless display buffer is not live"))))
 
 (defun magnus-headless--validate-callbacks (callbacks)
   "Validate functions in CALLBACKS."
@@ -114,7 +136,8 @@ The complete stream remains available through the :on-stderr callback."
   "Return REQUEST enriched with normalized schema fields.
 The returned plist contains :owned-schema-file when this function created the
 file and the caller is responsible for deleting it."
-  (let* ((prepared (copy-sequence request))
+  (let* ((prepared (plist-put (copy-sequence request) :purpose
+                              (or (plist-get request :purpose) 'review)))
          (schema-file (plist-get prepared :schema-file))
          (schema-json (magnus-headless--schema-json
                        (plist-get prepared :schema))))
@@ -271,6 +294,9 @@ file and the caller is responsible for deleting it."
          (terminal (process-get process 'magnus-headless-terminal-event))
          (structured-p
           (process-get process 'magnus-headless-structured-result-p))
+         (success-requires
+          (or (process-get process 'magnus-headless-success-requires)
+              magnus-headless--default-success-requires))
          (decode-errors
           (nreverse (process-get process 'magnus-headless-decode-errors)))
          (provider-errors
@@ -281,8 +307,12 @@ file and the caller is responsible for deleting it."
      :provider (process-get process 'magnus-headless-provider)
      :success-p (and (eq status 'exit)
                      (zerop exit-status)
-                     terminal
-                     structured-p
+                     (cl-every
+                      (lambda (requirement)
+                        (pcase requirement
+                          ('terminal terminal)
+                          ('structured-result structured-p)))
+                      success-requires)
                      (null decode-errors)
                      (null provider-errors)
                      (null callback-errors))
@@ -292,6 +322,7 @@ file and the caller is responsible for deleting it."
      :session-id (process-get process 'magnus-headless-session-id)
      :candidate-session-id
      (process-get process 'magnus-headless-candidate-session-id)
+     :success-requires success-requires
      :structured-result-present-p structured-p
      :structured-result
      (process-get process 'magnus-headless-structured-result)
@@ -350,15 +381,48 @@ structured-result event."
       (process-put process 'magnus-headless-finalizer
                    (run-at-time 0 nil #'magnus-headless--finalize process)))))
 
-(defun magnus-headless--validate-spec (provider spec)
-  "Validate PROVIDER launch SPEC and return it."
-  (let ((command (plist-get spec :command))
-        (decoder (plist-get spec :decoder)))
+(defun magnus-headless--provider-spec (provider request)
+  "Return PROVIDER's launch specification for REQUEST.
+Generic adapters are preferred.  The former review-only operation remains a
+compatibility fallback exclusively for review requests."
+  (let ((purpose (plist-get request :purpose)))
+    (cond
+     ((magnus-provider-symbol-operation-p provider 'headless-spec)
+      (magnus-provider-call-symbol provider 'headless-spec request))
+     ((and (eq purpose 'review)
+           (magnus-provider-symbol-operation-p
+            provider 'headless-review-spec))
+      (magnus-provider-call-symbol provider 'headless-review-spec request))
+     ((eq purpose 'review)
+      (user-error "Provider `%s' does not support headless reviews" provider))
+     (t
+      (user-error "Provider `%s' does not support headless agent work"
+                  provider)))))
+
+(defun magnus-headless--validate-spec (provider spec purpose)
+  "Validate PROVIDER launch SPEC for PURPOSE and return it."
+  (let* ((command (plist-get spec :command))
+         (decoder (plist-get spec :decoder))
+         (success-requires
+          (if (plist-member spec :success-requires)
+              (plist-get spec :success-requires)
+            magnus-headless--default-success-requires)))
     (unless (and (consp command) (cl-every #'stringp command))
       (error "Provider `%s' returned an invalid headless command" provider))
     (unless (functionp decoder)
       (error "Provider `%s' returned no headless event decoder" provider))
-    spec))
+    (unless (and (consp success-requires)
+                 (cl-every
+                  (lambda (requirement)
+                    (memq requirement
+                          magnus-headless--success-requirements))
+                  success-requires))
+      (error "Provider `%s' returned invalid success requirements" provider))
+    (when (and (eq purpose 'review)
+               (not (and (memq 'terminal success-requires)
+                         (memq 'structured-result success-requires))))
+      (error "Provider `%s' weakened headless review completion" provider))
+    (plist-put (copy-sequence spec) :success-requires success-requires)))
 
 ;;;###autoload
 (defun magnus-headless-start (provider request &optional callbacks)
@@ -381,8 +445,8 @@ remains with the caller."
           (setq spec
                 (magnus-headless--validate-spec
                  provider
-                 (magnus-provider-call-symbol
-                  provider 'headless-review-spec prepared)))
+                 (magnus-headless--provider-spec provider prepared)
+                 (plist-get prepared :purpose)))
           (let* ((directory (file-name-as-directory
                              (expand-file-name
                               (plist-get prepared :directory))))
@@ -407,7 +471,7 @@ remains with the caller."
             (setq process
                   (make-process
                    :name (generate-new-buffer-name name)
-                   :buffer nil
+                   :buffer (plist-get prepared :buffer)
                    :command (plist-get spec :command)
                    :connection-type 'pipe
                    :coding 'utf-8-unix
@@ -430,6 +494,8 @@ remains with the caller."
             (process-put process 'magnus-headless-callbacks callbacks)
             (process-put process 'magnus-headless-decoder
                          (plist-get spec :decoder))
+            (process-put process 'magnus-headless-success-requires
+                         (plist-get spec :success-requires))
             (process-put process 'magnus-headless-partial-line "")
             (when-let ((session-id (plist-get spec :session-id)))
               (process-put process 'magnus-headless-session-id session-id))

@@ -9,9 +9,9 @@
 ;;; Commentary:
 
 ;; Additive Claude provider capabilities that do not replace Magnus's
-;; established Claude vterm or generic fire-and-forget implementations.  This
-;; adapter builds a resumable, schema-constrained, read-only review command and
-;; normalizes its stream-json events for `magnus-headless'.
+;; established Claude vterm implementation.  This adapter builds both strict,
+;; schema-constrained reviews and explicitly requested fire-and-forget agents,
+;; then normalizes their stream-json events for `magnus-headless'.
 
 ;;; Code:
 
@@ -59,6 +59,11 @@
    ((stringp value) value)
    (t (format "%s" value))))
 
+(defun magnus-claude--headless-environment ()
+  "Return an environment suitable for a nested Claude headless process."
+  (cl-remove-if (lambda (entry) (string-prefix-p "CLAUDECODE=" entry))
+                process-environment))
+
 (defun magnus-claude-headless-review-spec (request)
   "Return a Claude headless launch specification for REQUEST."
   (let* ((resumed-session (plist-get request :session-id))
@@ -98,15 +103,41 @@
         (list "--session-id" session-id))
       (list prompt))
      :environment
-     (cl-remove-if (lambda (entry) (string-prefix-p "CLAUDECODE=" entry))
-                   process-environment)
+     (magnus-claude--headless-environment)
      :decoder #'magnus-claude-headless-decode-event
+     :success-requires '(terminal structured-result)
      ;; A fresh UUID is only a candidate until Claude emits it in stream-json.
      ;; Persisting it before that point makes an early CLI/auth failure poison
      ;; every retry with --resume of a session that never existed.
      :session-id resumed-session
      :candidate-session-id (unless resumed-session session-id)
      :name (and name (format "magnus-claude-review-%s" name)))))
+
+(defun magnus-claude-headless-agent-spec (request)
+  "Return a Claude fire-and-forget agent specification for REQUEST."
+  (let ((allowed-tools (plist-get request :allowed-tools))
+        (name (magnus-claude--option-string (plist-get request :name)))
+        (prompt (plist-get request :prompt)))
+    (unless (and (stringp allowed-tools)
+                 (not (string-empty-p allowed-tools)))
+      (user-error "Claude headless agents require configured allowed tools"))
+    (list
+     :command (list magnus-claude-executable
+                    "--print" prompt
+                    "--output-format" "stream-json"
+                    "--allowedTools" allowed-tools)
+     :environment (magnus-claude--headless-environment)
+     :decoder #'magnus-claude-headless-decode-event
+     :success-requires '(terminal)
+     :name (and name (format "magnus-claude-agent-%s" name)))))
+
+(defun magnus-claude-headless-spec (request)
+  "Return a Claude headless launch specification for REQUEST's purpose."
+  (pcase (or (plist-get request :purpose) 'review)
+    ('review (magnus-claude-headless-review-spec request))
+    ('agent (magnus-claude-headless-agent-spec request))
+    (purpose (user-error "Claude does not support headless purpose `%s'"
+                         purpose))))
 
 (defun magnus-claude--parse-structured-result (text)
   "Parse Claude structured result TEXT into alists and lists."
@@ -116,6 +147,25 @@
                      :null-object nil
                      :false-object nil))
 
+(defun magnus-claude--assistant-text (event)
+  "Return concatenated visible assistant text from stream-json EVENT."
+  (let* ((message (alist-get 'message event))
+         (content (and (listp message) (alist-get 'content message)))
+         (blocks (cond
+                  ((vectorp content) (append content nil))
+                  ((listp content) content))))
+    (mapconcat
+     #'identity
+     (delq nil
+           (mapcar
+            (lambda (block)
+              (when (and (listp block)
+                         (equal (alist-get 'type block) "text")
+                         (stringp (alist-get 'text block)))
+                (alist-get 'text block)))
+            blocks))
+     "")))
+
 (defun magnus-claude-headless-decode-event (event request)
   "Normalize one Claude stream-json EVENT for REQUEST."
   (let* ((type (alist-get 'type event))
@@ -123,9 +173,17 @@
          (session-entry (assq 'session_id event))
          (structured-entry (assq 'structured_output event))
          (result-text (alist-get 'result event))
+         (assistant-text (and (equal type "assistant")
+                              (magnus-claude--assistant-text event)))
+         (cost-usd (alist-get 'cost_usd event))
          (canonical (list :type (or type "unknown")
                           :provider 'claude
                           :raw event)))
+    (when (and (stringp assistant-text)
+               (not (string-empty-p assistant-text)))
+      (setq canonical (plist-put canonical :text assistant-text)))
+    (when (numberp cost-usd)
+      (setq canonical (plist-put canonical :cost-usd cost-usd)))
     (when session-entry
       (setq canonical
             (plist-put canonical :session-id (cdr session-entry))))
@@ -164,7 +222,8 @@
 
 (magnus-provider-register
  'claude
- '((headless-review-spec . magnus-claude-headless-review-spec)))
+ '((headless-spec . magnus-claude-headless-spec)
+   (headless-review-spec . magnus-claude-headless-review-spec)))
 
 (provide 'magnus-provider-claude)
 ;;; magnus-provider-claude.el ends here

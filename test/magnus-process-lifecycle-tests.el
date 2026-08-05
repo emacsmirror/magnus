@@ -231,7 +231,7 @@ When AGENT is non-nil, include its pre-existing Active Work row."
                     (puthash dir 42 magnus-coord--session-start-times)))
                  ((symbol-function 'magnus-coord-clear-agent)
                   (lambda (_dir name) (setq cleared name)))
-                 ((symbol-function 'make-process)
+                 ((symbol-function 'magnus-headless-start)
                   (lambda (&rest _arguments)
                     (error "headless launch failed"))))
               (let ((err
@@ -250,14 +250,88 @@ When AGENT is non-nil, include its pre-existing Active Work row."
           (kill-buffer buffer))
         (delete-directory directory t)))))
 
-(ert-deftest magnus-process-vterm-init-failure-does-not-leak-buffer ()
-  (let ((name " *magnus-failed-vterm*"))
-    (when-let ((old (get-buffer name)))
-      (kill-buffer old))
-    (cl-letf (((symbol-function 'vterm-mode)
-               (lambda () (error "vterm initialization failed"))))
-      (should-error (magnus-process--create-vterm-buffer name)))
-    (should-not (get-buffer name))))
+(ert-deftest magnus-process-headless-spawn-uses-shared-runner ()
+  (magnus-test-process-lifecycle--isolated
+    (let* ((directory (make-temp-file "magnus-headless-runner-" t))
+           (instance (magnus-instances-create directory "runner-agent"))
+           (magnus-headless-allowed-tools "Read Write Edit")
+           (magnus-buffer-name " *magnus-status-not-present*")
+           provider request callbacks process buffer logs)
+      (unwind-protect
+          (let ((magnus-instances-changed-hook nil))
+            (cl-letf
+                (((symbol-function 'magnus-headless-start)
+                  (lambda (selected-provider selected-request
+                           selected-callbacks)
+                    (setq provider selected-provider
+                          request selected-request
+                          callbacks selected-callbacks
+                          process
+                          (make-pipe-process
+                           :name (generate-new-buffer-name
+                                  "magnus-headless-runner")
+                           :buffer (plist-get selected-request :buffer)
+                           :noquery t))
+                    process))
+                 ((symbol-function 'magnus-coord-add-log)
+                  (lambda (&rest arguments) (push arguments logs))))
+              (setq buffer
+                    (magnus-process--spawn-headless
+                     instance "Implement it"))
+              (should (eq provider 'claude))
+              (should (eq (plist-get request :purpose) 'agent))
+              (should (equal (plist-get request :allowed-tools)
+                             "Read Write Edit"))
+              (should (string-match-p "Implement it"
+                                      (plist-get request :prompt)))
+              (should (eq (plist-get request :buffer) buffer))
+              (should (eq (get-buffer-process buffer) process))
+              (funcall (plist-get callbacks :on-event)
+                       process '(:type "assistant" :text "Hello"))
+              (funcall (plist-get callbacks :on-event)
+                       process '(:type "result" :cost-usd 0.25))
+              (with-current-buffer buffer
+                (should (string-match-p "Hello" (buffer-string)))
+                (should (string-match-p "Cost: \\$0\\.2500"
+                                        (buffer-string))))
+              (funcall (plist-get callbacks :on-complete)
+                       process
+                       '(:success-p t :status exit
+                         :process-event "finished"))
+              (should (eq (magnus-instance-status instance) 'finished))
+              (should (equal (car logs)
+                             (list directory "runner-agent"
+                                   "Headless task finished")))
+              (with-current-buffer buffer
+                (should (string-match-p "Process finished"
+                                        (buffer-string))))))
+        (when (and process (process-live-p process))
+          (delete-process process))
+        (when (and buffer (buffer-live-p buffer))
+          (kill-buffer buffer))
+        (delete-directory directory t)))))
+
+(ert-deftest magnus-process-headless-completion-preserves-purged-status ()
+  (let* ((directory (make-temp-file "magnus-headless-purged-" t))
+         (instance (magnus-instances-create directory "archived-agent"))
+         (buffer (generate-new-buffer " *magnus-headless-purged*"))
+         (process (make-pipe-process
+                   :name (generate-new-buffer-name "magnus-headless-purged")
+                   :buffer buffer :noquery t))
+         (magnus-buffer-name " *magnus-status-not-present*"))
+    (unwind-protect
+        (let ((magnus-instances-changed-hook nil))
+          (magnus-instances-update instance :buffer buffer :status 'purged)
+          (cl-letf (((symbol-function 'magnus-coord-add-log) #'ignore))
+            (magnus-process--headless-complete
+             instance process
+             '(:success-p t :status exit :process-event "finished")))
+          (should (eq (magnus-instance-status instance) 'purged)))
+      (when (process-live-p process)
+        (delete-process process))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (delete-directory directory t))))
 
 (ert-deftest magnus-process-claude-spawn-cancels-prewatch-resources ()
   (magnus-test-process-lifecycle--isolated
@@ -274,7 +348,7 @@ When AGENT is non-nil, include its pre-existing Active Work row."
                ((symbol-value 'magnus--summon-context) nil)
                ((symbol-function 'magnus-process--list-sessions)
                 (lambda (_directory) nil))
-               ((symbol-function 'magnus-process--create-vterm-buffer)
+               ((symbol-function 'magnus-terminal-create-buffer)
                 (lambda (_name) terminal))
                ((symbol-function 'vterm-send-string) #'ignore)
                ((symbol-function 'magnus-process--setup-sentinel) #'ignore)
@@ -295,6 +369,23 @@ When AGENT is non-nil, include its pre-existing Active Work row."
         (when (buffer-live-p terminal)
           (kill-buffer terminal))
         (delete-directory directory t)))))
+
+(ert-deftest magnus-process-terminal-compatibility-wrappers-delegate ()
+  (let (calls)
+    (cl-letf (((symbol-function 'magnus-terminal-create-buffer)
+               (lambda (name)
+                 (push (list 'create name) calls)
+                 'terminal-buffer))
+              ((symbol-function 'magnus-terminal-send-escape)
+               (lambda () (push '(escape) calls)))
+              ((symbol-function 'magnus-terminal-setup-keys)
+               (lambda () (push '(setup) calls))))
+      (should (eq (magnus-process--create-vterm-buffer "compat")
+                  'terminal-buffer))
+      (magnus-process-send-escape)
+      (magnus-process--setup-keys))
+    (should (equal (nreverse calls)
+                   '((create "compat") (escape) (setup))))))
 
 (ert-deftest magnus-process-session-watch-setup-is-transactional ()
   (let* ((directory (make-temp-file "magnus-session-watch-" t))

@@ -20,10 +20,9 @@
 (require 'subr-x)
 (require 'magnus-instances)
 (require 'magnus-provider)
+(require 'magnus-terminal)
 
 (declare-function magnus-status-refresh "magnus-status")
-(declare-function magnus-process--create-vterm-buffer "magnus-process"
-                  (buffer-name))
 (declare-function vterm-send-key "vterm" (key &optional shift meta ctrl))
 (declare-function vterm-send-return "vterm" ())
 (declare-function vterm-send-string "vterm" (string &optional paste-p))
@@ -380,8 +379,10 @@ FILES-BEFORE contains rollout files that predate this launch."
 When MARKER is non-nil, capture its new session against FILES-BEFORE."
   (let* ((buffer-name (format "*codex:%s*" (magnus-instance-name instance)))
          (default-directory (magnus-instance-directory instance))
-         (buffer (magnus-process--create-vterm-buffer buffer-name))
          (command (magnus-codex--tui-command instance prompt))
+         ;; Finish pure command construction before allocating a terminal so a
+         ;; malformed instance cannot strand a vterm buffer.
+         (buffer (magnus-terminal-create-buffer buffer-name))
          (process (get-buffer-process buffer)))
     (unless (process-live-p process)
       (kill-buffer buffer)
@@ -736,8 +737,17 @@ duplicated in `event_msg' records, and raw reasoning content is encrypted."
         ;; review target machinery would be redundant.
         (list prompt)))
      :decoder #'magnus-codex-headless-decode-event
+     :success-requires '(terminal structured-result)
      :session-id session-id
      :name (and name (format "magnus-codex-review-%s" name)))))
+
+(defun magnus-codex-headless-spec (request)
+  "Return a Codex headless launch specification for REQUEST's purpose."
+  (pcase (or (plist-get request :purpose) 'review)
+    ('review (magnus-codex-headless-review-spec request))
+    ('agent (user-error "Codex does not support headless agent work"))
+    (purpose (user-error "Codex does not support headless purpose `%s'"
+                         purpose))))
 
 (defun magnus-codex--parse-structured-result (text)
   "Parse Codex structured result TEXT into alists and lists."
@@ -757,6 +767,8 @@ duplicated in `event_msg' records, and raw reasoning content is encrypted."
          (canonical (list :type (or type "unknown")
                           :provider 'codex
                           :raw event)))
+    (when (stringp text)
+      (setq canonical (plist-put canonical :text text)))
     (when (equal type "thread.started")
       (setq canonical
             (plist-put canonical :session-id
@@ -805,6 +817,7 @@ duplicated in `event_msg' records, and raw reasoning content is encrypted."
    (switch-to . magnus-codex-switch-to)
    (trace-file . magnus-codex-trace-file)
    (trace-entry . magnus-codex-trace-entry)
+   (headless-spec . magnus-codex-headless-spec)
    (headless-review-spec . magnus-codex-headless-review-spec)))
 
 (provide 'magnus-provider-codex)
