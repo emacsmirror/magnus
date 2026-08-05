@@ -35,6 +35,7 @@
 (declare-function magnus-project-root "magnus")
 (declare-function magnus-status--get-review-at-point "magnus-status")
 (declare-function magnus-review-ui-open "magnus-review-ui")
+(declare-function magnus-doctor "magnus-doctor")
 
 (defvar magnus-review-ui-action-function)
 
@@ -195,6 +196,7 @@ review actions."
    ("p" "Previous item" magnus-status-previous)]
   ["Buffer"
    ("g" "Refresh" magnus-status-refresh)
+   ("D" "Diagnose installation" magnus-doctor)
    ("q" "Quit" quit-window)])
 
 ;;; Durable reviews
