@@ -72,5 +72,19 @@
           (should (string-suffix-p task prompt)))
       (delete-directory directory t))))
 
+(ert-deftest magnus-onboarding-rejects-agent-home-path-escapes ()
+  (dolist (name '("../escape" "nested/agent" "nested\\agent" "." ".."))
+    (should-not (magnus-instances-valid-name-p name))
+    (should-error (magnus-onboarding-memory-relative-path name)))
+  ;; Display names need not be restricted to the generated adjective-animal
+  ;; convention as long as they remain one safe path segment.
+  (should (magnus-instances-valid-name-p "Wise Deer ☃")))
+
+(ert-deftest magnus-onboarding-legacy-wrapper-never-invents-an-event-writer ()
+  (let ((prompt (magnus-process--onboarding-new "legacy-agent" nil)))
+    (should (string-match-p "No durable writer UUID was supplied" prompt))
+    (should (string-match-p "Do not invent one" prompt))
+    (should (string-match-p "only through legacy \\.magnus-coord\\.md" prompt))))
+
 (provide 'magnus-onboarding-tests)
 ;;; magnus-onboarding-tests.el ends here

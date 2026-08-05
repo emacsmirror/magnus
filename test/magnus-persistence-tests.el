@@ -84,6 +84,17 @@
           (should (= reconnects 0)))
       (delete-directory root t))))
 
+(ert-deftest magnus-persistence-rejects-unsafe-agent-identities-transactionally ()
+  "A persisted path escape or unsafe UUID never becomes live state."
+  (let* ((valid (magnus-instances-serialize
+                 (magnus-persistence-tests--instance "valid")))
+         (unsafe-name (copy-sequence valid))
+         (unsafe-id (copy-sequence valid)))
+    (plist-put unsafe-name :name "../outside")
+    (plist-put unsafe-id :id "../../writer")
+    (dolist (state (list (list unsafe-name) (list unsafe-id)))
+      (should-error (magnus-persistence--deserialize-state state)))))
+
 (ert-deftest magnus-persistence-load-disables-reader-evaluation ()
   "Reader evaluation in a state file is rejected without side effects."
   (let* ((root (make-temp-file "magnus-persistence-" t))

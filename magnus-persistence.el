@@ -120,11 +120,9 @@ deliberately point into a shared directory."
         (error "Invalid Magnus state record %d: non-keyword property" index))
       (pop properties)))
   (let ((instance (magnus-instances-deserialize record)))
-    (unless (magnus-persistence--nonempty-string-p
-             (magnus-instance-id instance))
+    (unless (magnus-instances-valid-id-p (magnus-instance-id instance))
       (error "Invalid Magnus state record %d: missing or invalid id" index))
-    (unless (magnus-persistence--nonempty-string-p
-             (magnus-instance-name instance))
+    (unless (magnus-instances-valid-name-p (magnus-instance-name instance))
       (error "Invalid Magnus state record %d: missing or invalid name" index))
     (unless (magnus-persistence--nonempty-string-p
              (magnus-instance-directory instance))

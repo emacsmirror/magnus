@@ -168,7 +168,7 @@ review actions."
    ("h" "Create headless Claude task" magnus-transient-create-headless)
    ("k" "Archive instance" magnus-status-archive)
    ("R" "Resurrect purged" magnus-status-resurrect-purged)
-   ("r" "Rename instance" magnus-status-rename)
+   ("r" "Rename archived instance" magnus-status-rename)
    ("s" "Suspend instance" magnus-status-suspend)
    ("S" "Resume instance" magnus-status-resume)
    ("d" "Change directory" magnus-status-chdir)
@@ -185,7 +185,8 @@ review actions."
    ("e" "Export to file" magnus-context-export-for-agent)
    ("w" "Copy to clipboard" magnus-context-copy-for-agent)]
   ["Coordination (agent communication)"
-   ("C" "Open coordination file" magnus-status-coordination)
+   ("J" "Open generated current view" magnus-status-coordination-current)
+   ("C" "Open legacy ingress file" magnus-status-coordination)
    ("I" "Open agent instructions" magnus-transient-open-instructions)
    ("F" "Session retrospective" magnus-retro)]
   ["Attention (permission requests)"
@@ -439,7 +440,7 @@ or the best status-buffer project directory."
    ("RET" "Visit" magnus-status-visit)
    ("k" "Archive" magnus-status-archive)
    ("R" "Resurrect" magnus-status-resurrect-purged)
-   ("r" "Rename" magnus-status-rename)
+   ("r" "Rename archived" magnus-status-rename)
    ("s" "Suspend" magnus-status-suspend)
    ("S" "Resume" magnus-status-resume)
    ("d" "Change directory" magnus-status-chdir)

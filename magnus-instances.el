@@ -37,6 +37,12 @@
 (defvar magnus-instances nil
   "List of all Claude Code instances.")
 
+(defvar magnus-instances-name-reservation-functions nil
+  "Functions that return additional reserved names for a project.
+Each function receives a physical project directory and returns a list of
+names.  This lets adjacent durable registries, such as independent reviews,
+reserve identities without making the instance registry depend on them.")
+
 (defun magnus-instances-list ()
   "Return a copy of the instances list."
   (copy-sequence magnus-instances))
@@ -88,6 +94,65 @@
     (dotimes (_ length result)
       (setq result (concat result (string (aref chars (random 16))))))))
 
+(defun magnus-instances-valid-id-p (id)
+  "Return non-nil when ID is a bounded path-safe durable identity."
+  (and (stringp id)
+       (<= 1 (string-bytes id) 160)
+       (string-match-p "\\`[A-Za-z0-9_][A-Za-z0-9_.-]*\\'" id)))
+
+(defun magnus-instances-valid-name-p (name)
+  "Return non-nil when display NAME is safe as one agent-home segment.
+Spaces and non-ASCII display characters remain supported.  Directory
+separators, control characters, and dot-directory aliases are rejected."
+  (and (stringp name)
+       (<= 1 (string-bytes name) 256)
+       (not (member name '("." "..")))
+       (not
+        (cl-some
+         (lambda (character)
+           (or (< character 32) (= character 127)
+               (= character ?/) (= character ?\\)))
+         (string-to-list name)))))
+
+(defun magnus-instances--validate-name (name)
+  "Return display NAME, or signal when it cannot name an agent safely."
+  (unless (magnus-instances-valid-name-p name)
+    (user-error "Unsafe Magnus agent name: %S" name))
+  name)
+
+(defun magnus-instances--canonical-directory (directory)
+  "Return DIRECTORY's physical identity without a trailing separator."
+  (directory-file-name (file-truename (expand-file-name directory))))
+
+(defun magnus-instances-name-conflict (directory name &optional except)
+  "Return an instance already using NAME, except EXCEPT.
+DIRECTORY is accepted for symmetry with adjacent project-scoped reservations.
+Instance display names stay globally unique because terminal buffers and
+legacy name-based compatibility entry points are workspace-global."
+  (ignore directory)
+  (cl-find-if
+   (lambda (instance)
+     (and (not (eq instance except))
+          (string= name (magnus-instance-name instance))))
+   magnus-instances))
+
+(defun magnus-instances-reserved-names (directory)
+  "Return names reserved by adjacent registries for DIRECTORY."
+  (let ((project (magnus-instances--canonical-directory directory)) names)
+    (dolist (function magnus-instances-name-reservation-functions)
+      (setq names (append (funcall function project) names)))
+    (delete-dups names)))
+
+(defun magnus-instances--ensure-name-available
+    (directory name &optional except)
+  "Reject NAME when another instance already owns it in DIRECTORY.
+EXCEPT is the instance being renamed, when any."
+  (when (magnus-instances-name-conflict directory name except)
+    (user-error "Magnus instance name %S is already in use" name))
+  (when (member name (magnus-instances-reserved-names directory))
+    (user-error "Agent name %S is reserved by active project work" name))
+  name)
+
 (defun magnus-instances-add (instance)
   "Add INSTANCE to the registry."
   (push instance magnus-instances)
@@ -111,7 +176,8 @@ PROPERTIES is a plist of slot names and values."
     (let ((slot (pop properties))
           (value (pop properties)))
       (cl-case slot
-        (:name (setf (magnus-instance-name instance) value))
+        (:name (setf (magnus-instance-name instance)
+                     (magnus-instances--validate-name value)))
         (:buffer (setf (magnus-instance-buffer instance) value))
         (:status (setf (magnus-instance-status instance) value))
         (:directory (setf (magnus-instance-directory instance) value))
@@ -125,6 +191,8 @@ PROPERTIES is a plist of slot names and values."
 (defun magnus-instances-create (directory name &optional provider)
   "Create a new instance for DIRECTORY with NAME and optional PROVIDER.
 Returns the new instance (not yet added to registry)."
+  (magnus-instances--validate-name name)
+  (magnus-instances--ensure-name-available directory name)
   (magnus-instance--create
    :id (magnus-instances--generate-id)
    :name name

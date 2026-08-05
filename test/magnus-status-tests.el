@@ -30,6 +30,113 @@
   (should (eq (lookup-key magnus-status-mode-map (kbd "V"))
               'magnus-review-actions)))
 
+(ert-deftest magnus-status-coordination-views-are-explicitly-discoverable ()
+  (should (eq (lookup-key magnus-status-mode-map (kbd "J"))
+              'magnus-status-coordination-current))
+  (should (eq (lookup-key magnus-status-mode-map (kbd "C"))
+              'magnus-status-coordination))
+  (let ((current (transient-get-suffix 'magnus-dispatch "J"))
+        (legacy (transient-get-suffix 'magnus-dispatch "C")))
+    (should (eq (plist-get (nth 2 current) :command)
+                'magnus-status-coordination-current))
+    (should (eq (plist-get (nth 2 legacy) :command)
+                'magnus-status-coordination))))
+
+(ert-deftest magnus-status-manual-refresh-polls-coordination-events ()
+  (let ((magnus-buffer-name " *magnus-manual-refresh-test*")
+        (refreshes 0)
+        (legacy-reconciles 0))
+    (cl-letf (((symbol-function 'magnus-coord-refresh-all)
+               (lambda () (cl-incf refreshes)))
+              ((symbol-function 'magnus-coord-reconcile-all)
+               (lambda () (cl-incf legacy-reconciles)))
+              ((symbol-function 'called-interactively-p)
+               (lambda (&rest _arguments) t)))
+      (magnus-status-refresh))
+    (should (= refreshes 1))
+    (should (= legacy-reconciles 0))))
+
+(ert-deftest magnus-status-coordination-section-uses-all-durable-state ()
+  (let ((directories '("/legacy/" "/events/" "/empty/")))
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'magnus-status--get-project-directories)
+                 (lambda () directories))
+                ((symbol-function 'magnus-coord-has-state-p)
+                 (lambda (directory)
+                   (member directory '("/legacy/" "/events/"))))
+                ((symbol-function 'magnus-coord-parse)
+                 (lambda (_directory) '(:active nil :log nil))))
+        (magnus-status--insert-coordination))
+      (should (string-match-p "Coordination" (buffer-string)))
+      (should (string-match-p "/legacy/" (buffer-string)))
+      (should (string-match-p "/events/" (buffer-string)))
+      (should-not (string-match-p "/empty/" (buffer-string))))))
+
+(ert-deftest magnus-status-projects-deduplicate-physical-directory-aliases ()
+  (let* ((directory (make-temp-file "magnus-status-project-" t))
+         (link (concat directory "-link"))
+         (real-instance
+          (magnus-instance--create
+           :id "real" :name "real" :directory directory :status 'running))
+         (link-instance
+          (magnus-instance--create
+           :id "link" :name "link" :directory link :status 'running))
+         (magnus-instances (list real-instance link-instance)))
+    (unwind-protect
+        (progn
+          (make-symbolic-link directory link)
+          (should
+           (equal (magnus-status--get-project-directories)
+                  (list (magnus-coord--normalized-directory directory)))))
+      (when (file-symlink-p link) (delete-file link))
+      (delete-directory directory t))))
+
+(ert-deftest magnus-status-recent-log-shows-the-chronological-tail ()
+  (let ((log
+         (mapcar (lambda (message)
+                   (list :time "12:00" :agent "agent" :message message))
+                 '("one" "two" "three" "four"))))
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'magnus-coord-parse)
+                 (lambda (_directory) (list :active nil :log log))))
+        (magnus-status--insert-coordination-for-dir default-directory))
+      (let ((rendered (buffer-string)))
+        (should-not (string-match-p "one" rendered))
+        (should (< (string-match "two" rendered)
+                   (string-match "three" rendered)))
+        (should (< (string-match "three" rendered)
+                   (string-match "four" rendered)))))))
+
+(ert-deftest magnus-status-coordination-row-retains-its-project-context ()
+  (let ((first
+         (magnus-instance--create
+          :id "first" :name "first" :directory "/first/" :status 'running)))
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'magnus-coord-parse)
+                 (lambda (_directory) '(:active nil :log nil))))
+        (magnus-status--insert-coordination-for-dir "/selected/"))
+      (goto-char (point-min))
+      (search-forward "selected")
+      (let ((magnus-instances (list first)))
+        (should (equal (magnus-status--coordination-directory)
+                       "/selected/"))))))
+
+(ert-deftest magnus-status-opens-generated-and-legacy-coordination-views ()
+  (let ((instance (magnus-instance--create
+                   :id "author" :name "quick-wren"
+                   :directory "/project/"))
+        current legacy)
+    (cl-letf (((symbol-function 'magnus-status--get-instance-at-point)
+               (lambda () instance))
+              ((symbol-function 'magnus-coord-open-current)
+               (lambda (directory) (setq current directory)))
+              ((symbol-function 'magnus-coord-open)
+               (lambda (directory) (setq legacy directory))))
+      (magnus-status-coordination-current)
+      (magnus-status-coordination))
+    (should (equal current "/project/"))
+    (should (equal legacy "/project/"))))
+
 (ert-deftest magnus-status-context-hints-use-buffer-local-eldoc ()
   (let ((magnus-status-show-context-hints t))
     (with-temp-buffer
@@ -164,12 +271,151 @@
         (should
          (equal
           (substring-no-properties (magnus-status--context-hint nil))
-          "wise-deer (archived) — R resurrect · ? all actions"))
+          "wise-deer (archived) — R resurrect · r rename · ? all actions"))
         (forward-line 1)
         (should
          (equal
           (substring-no-properties (magnus-status--context-hint nil))
           "Magnus — n/p navigate · c create agent · ? all actions"))))))
+
+(ert-deftest magnus-status-rename-requires-an-archived-agent ()
+  (let ((instance
+         (magnus-instance--create
+          :id "live" :name "quick-wren" :directory default-directory
+          :status 'running)))
+    (should-error
+     (magnus-status--rename-archived-instance instance "wise-deer")
+     :type 'user-error)
+    (should (equal (magnus-instance-name instance) "quick-wren"))))
+
+(ert-deftest magnus-status-rename-migrates-memory-and-preserves-continuity ()
+  (let* ((directory (make-temp-file "magnus-status-rename-" t))
+         (instance
+          (magnus-instance--create
+           :id "archived" :name "quick-wren" :directory directory
+           :status 'purged))
+         (magnus-instances (list instance))
+         (magnus-instances-changed-hook nil)
+         (old-memory (magnus-onboarding-memory-path instance)))
+    (unwind-protect
+        (progn
+          (make-directory (file-name-directory old-memory) t)
+          (with-temp-file old-memory (insert "I remember."))
+          (magnus-status--rename-archived-instance instance "wise-deer")
+          (should (equal (magnus-instance-name instance) "wise-deer"))
+          (should-not (file-exists-p old-memory))
+          (should
+           (equal
+            (with-temp-buffer
+              (insert-file-contents (magnus-onboarding-memory-path instance))
+              (buffer-string))
+            "I remember."))
+          (should (string-match-p
+                   "You have been here before"
+                   (magnus-onboarding-prompt instance))))
+      (delete-directory directory t))))
+
+(ert-deftest magnus-status-rename-rejects-project-name-and-home-collisions ()
+  (let* ((directory (make-temp-file "magnus-status-collision-" t))
+         (instance
+          (magnus-instance--create
+           :id "old" :name "quick-wren" :directory directory :status 'purged))
+         (other
+          (magnus-instance--create
+           :id "other" :name "wise-deer" :directory directory :status 'purged))
+         (magnus-instances (list instance other)))
+    (unwind-protect
+        (progn
+          (should-error
+           (magnus-status--rename-archived-instance instance "wise-deer")
+           :type 'user-error)
+          (setq magnus-instances (list instance))
+          (make-directory
+           (file-name-directory
+            (expand-file-name
+             (magnus-onboarding-memory-relative-path "wise-deer") directory))
+           t)
+          (should-error
+           (magnus-status--rename-archived-instance instance "wise-deer")
+           :type 'user-error)
+          (should (equal (magnus-instance-name instance) "quick-wren")))
+      (delete-directory directory t))))
+
+(ert-deftest magnus-status-rename-rolls-home-back-after-observer-failure ()
+  (let* ((directory (make-temp-file "magnus-status-rollback-" t))
+         (instance
+          (magnus-instance--create
+           :id "rollback" :name "quick-wren" :directory directory
+           :status 'purged))
+         (magnus-instances (list instance))
+         (old-memory (magnus-onboarding-memory-path instance))
+         (magnus-instances-changed-hook
+          (list (lambda () (error "simulated observer failure")))))
+    (unwind-protect
+        (progn
+          (make-directory (file-name-directory old-memory) t)
+          (with-temp-file old-memory (insert "still here"))
+          (should-error
+           (magnus-status--rename-archived-instance instance "wise-deer"))
+          (should (equal (magnus-instance-name instance) "quick-wren"))
+          (should (file-exists-p old-memory))
+          (should-not
+           (file-exists-p
+            (expand-file-name
+             (magnus-onboarding-memory-relative-path "wise-deer")
+             directory))))
+      (delete-directory directory t))))
+
+(ert-deftest magnus-status-rename-rolls-back-after-persistence-failure ()
+  (let* ((directory (make-temp-file "magnus-status-persist-rollback-" t))
+         (instance
+          (magnus-instance--create
+           :id "persist-rollback" :name "quick-wren" :directory directory
+           :status 'purged))
+         (magnus-instances (list instance))
+         (magnus-instances-changed-hook nil)
+         (magnus-persistence--autosave-active t)
+         (old-memory (magnus-onboarding-memory-path instance)))
+    (unwind-protect
+        (progn
+          (make-directory (file-name-directory old-memory) t)
+          (with-temp-file old-memory (insert "durable old home"))
+          (cl-letf (((symbol-function 'magnus-persistence-save)
+                     (lambda () (error "simulated durable write failure"))))
+            (should-error
+             (magnus-status--rename-archived-instance instance "wise-deer")))
+          (should (equal (magnus-instance-name instance) "quick-wren"))
+          (should (file-exists-p old-memory)))
+      (delete-directory directory t))))
+
+(ert-deftest magnus-instances-create-rejects-a-workspace-name-collision ()
+  (let* ((directory (make-temp-file "magnus-instance-name-" t))
+         (link (concat directory "-link"))
+         (existing
+          (magnus-instance--create
+           :id "existing" :name "quick-wren" :directory directory
+           :status 'purged))
+         (magnus-instances (list existing)))
+    (unwind-protect
+        (progn
+          (make-symbolic-link directory link)
+          (should-error
+           (magnus-instances-create link "quick-wren" 'codex)
+           :type 'user-error))
+      (when (file-symlink-p link) (delete-file link))
+      (delete-directory directory t))))
+
+(ert-deftest magnus-instances-create-honors-adjacent-identity-reservations ()
+  (let ((magnus-instances nil)
+        (magnus-instances-name-reservation-functions
+         (list (lambda (_project) '("api-reviewer")))))
+    (should-error
+     (magnus-instances-create default-directory "api-reviewer" 'codex)
+     :type 'user-error)
+    (should
+     (magnus-instance-p
+      (magnus-instances-create default-directory "implementation-agent"
+                               'codex)))))
 
 (ert-deftest magnus-review-transient-names-the-selected-operation ()
   (let* ((author

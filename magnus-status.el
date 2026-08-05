@@ -24,6 +24,7 @@
 (require 'magnus-attention)
 (require 'magnus-health)
 (require 'magnus-review)
+(require 'magnus-onboarding)
 
 (declare-function magnus-dispatch "magnus-transient")
 (declare-function magnus-review-request-dispatch "magnus-transient")
@@ -31,15 +32,20 @@
 (declare-function magnus-review-ui-open "magnus-review-ui")
 (declare-function magnus-coord-agent-busy-p "magnus-coord")
 (declare-function magnus-coord--neglected-p "magnus-coord")
+(declare-function magnus-coord-has-state-p "magnus-coord" (directory))
+(declare-function magnus-coord-open-current "magnus-coord" (directory))
+(declare-function magnus-coord-refresh-all "magnus-coord")
 (declare-function magnus-retro "magnus-coord")
+(declare-function magnus-persistence-save "magnus-persistence")
 (declare-function magnus--agents-index-get "magnus")
 
 (defvar magnus-coord--do-not-disturb)
+(defvar magnus-persistence--autosave-active nil)
 (declare-function magnus-context "magnus-context")
 
 ;; Defined in magnus.el
-(defvar magnus-buffer-name)
-(defvar magnus-default-directory)
+(defvar magnus-buffer-name "*magnus*")
+(defvar magnus-default-directory nil)
 
 ;;; Faces
 
@@ -205,6 +211,7 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
                     (concat
                      "%s (archived) — "
                      "\\[magnus-status-resurrect-purged] resurrect · "
+                     "\\[magnus-status-rename] rename · "
                      "\\[magnus-dispatch] all actions")
                     (magnus-instance-name instance))
                  (format
@@ -242,6 +249,7 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
     (define-key map (kbd "g") #'magnus-status-refresh)
     (define-key map (kbd "x") #'magnus-status-context)
     (define-key map (kbd "C") #'magnus-status-coordination)
+    (define-key map (kbd "J") #'magnus-status-coordination-current)
     (define-key map (kbd "n") #'magnus-status-next)
     (define-key map (kbd "p") #'magnus-status-previous)
     (define-key map (kbd "a") #'magnus-attention-next)
@@ -300,9 +308,10 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
 (defun magnus-status-refresh ()
   "Refresh the magnus status buffer."
   (interactive)
-  ;; Reconcile only on interactive (manual `g') refresh
+  ;; Poll durable coordination evidence only on interactive (manual `g')
+  ;; refresh.  Presentation-only refreshes do not scan the event store.
   (when (called-interactively-p 'interactive)
-    (magnus-coord-reconcile-all))
+    (magnus-coord-refresh-all))
   (when-let ((buffer (get-buffer magnus-buffer-name)))
     (with-current-buffer buffer
       (let ((inhibit-read-only t)
@@ -744,7 +753,9 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
 
 (defun magnus-status--insert-coordination ()
   "Insert coordination status from all project directories."
-  (let ((directories (magnus-status--get-project-directories)))
+  (let ((directories
+         (seq-filter #'magnus-coord-has-state-p
+                     (magnus-status--get-project-directories))))
     (when directories
       (insert "\n")
       (insert (propertize "Coordination\n" 'face 'magnus-status-section-heading))
@@ -752,47 +763,52 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
         (magnus-status--insert-coordination-for-dir dir)))))
 
 (defun magnus-status--get-project-directories ()
-  "Get unique project directories from active instances."
-  (let ((dirs (mapcar #'magnus-instance-directory (magnus-instances-active-list))))
+  "Get unique physical project directories from active instances."
+  (let ((dirs
+         (mapcar (lambda (instance)
+                   (magnus-coord--normalized-directory
+                    (magnus-instance-directory instance)))
+                 (magnus-instances-active-list))))
     (delete-dups dirs)))
 
 (defun magnus-status--insert-coordination-for-dir (directory)
   "Insert coordination info for DIRECTORY."
-  (let ((coord-file (magnus-coord-file-path directory)))
-    (when (file-exists-p coord-file)
-      (let* ((parsed (magnus-coord-parse directory))
-             (active (plist-get parsed :active))
-             (log (plist-get parsed :log)))
-        ;; Show directory
-        (insert "  ")
-        (insert (propertize (abbreviate-file-name directory)
-                           'face 'magnus-status-instance-dir))
-        (insert "\n")
-        ;; Show active work
-        (when active
-          (insert (propertize "  Active Work:\n" 'face 'font-lock-comment-face))
-          (dolist (entry active)
-            (insert (format "    %s: %s [%s]\n"
-                           (propertize (plist-get entry :agent)
-                                      'face 'magnus-status-instance-name)
-                           (plist-get entry :area)
-                           (propertize (plist-get entry :status)
-                                      'face (if (string= (plist-get entry :status)
-                                                        "in-progress")
-                                               'magnus-status-running
-                                             'magnus-status-instance-dir))))))
-        ;; Show recent log (last 3 entries)
-        (when log
-          (insert (propertize "  Recent:\n" 'face 'font-lock-comment-face))
-          (let ((recent (seq-take (reverse log) 3)))
-            (dolist (entry (reverse recent))
-              (insert (format "    [%s] %s: %s\n"
-                             (propertize (plist-get entry :time)
-                                        'face 'magnus-status-instance-dir)
-                             (propertize (plist-get entry :agent)
-                                        'face 'magnus-status-instance-name)
-                             (plist-get entry :message))))))
-        (insert "\n")))))
+  (let* ((section-start (point))
+         (parsed (magnus-coord-parse directory))
+         (active (plist-get parsed :active))
+         (log (plist-get parsed :log)))
+    ;; Show directory
+    (insert "  ")
+    (insert (propertize (abbreviate-file-name directory)
+                        'face 'magnus-status-instance-dir))
+    (insert "\n")
+    ;; Show active work
+    (when active
+      (insert (propertize "  Active Work:\n" 'face 'font-lock-comment-face))
+      (dolist (entry active)
+        (insert (format "    %s: %s [%s]\n"
+                        (propertize (plist-get entry :agent)
+                                   'face 'magnus-status-instance-name)
+                        (plist-get entry :area)
+                        (propertize (plist-get entry :status)
+                                   'face (if (string= (plist-get entry :status)
+                                                     "in-progress")
+                                             'magnus-status-running
+                                           'magnus-status-instance-dir))))))
+    ;; Show recent log (last 3 entries)
+    (when log
+      (insert (propertize "  Recent:\n" 'face 'font-lock-comment-face))
+      (let ((recent (magnus-coord-recent-log log 3)))
+        (dolist (entry recent)
+          (insert (format "    [%s] %s: %s\n"
+                          (propertize (plist-get entry :time)
+                                     'face 'magnus-status-instance-dir)
+                          (propertize (plist-get entry :agent)
+                                     'face 'magnus-status-instance-name)
+                          (plist-get entry :message))))))
+    (insert "\n")
+    (put-text-property section-start (point)
+                       'magnus-project-directory directory)))
 
 (defun magnus-status--truncate-tags (tags)
   "Truncate TAGS string to 50 characters if needed."
@@ -956,15 +972,86 @@ Stops the process but preserves the session ID for later resurrection."
                     (magnus-instance-name instance)))
     (user-error "No instance at point")))
 
+(defun magnus-status--rename-archived-instance (instance new-name)
+  "Transactionally rename archived INSTANCE to NEW-NAME.
+Move its project-local memory home before publishing the new registry name.
+If either the registry notification or home migration fails, restore both."
+  (unless (eq (magnus-instance-status instance) 'purged)
+    (user-error "Archive %s before renaming it"
+                (magnus-instance-name instance)))
+  (magnus-instances--validate-name new-name)
+  (magnus-instances--ensure-name-available
+   (magnus-instance-directory instance) new-name instance)
+  (let* ((old-name (magnus-instance-name instance))
+         (directory (magnus-instance-directory instance))
+         (old-home
+          (directory-file-name
+           (file-name-directory
+            (expand-file-name
+             (magnus-onboarding-memory-relative-path old-name) directory))))
+         (new-home
+          (directory-file-name
+           (file-name-directory
+            (expand-file-name
+             (magnus-onboarding-memory-relative-path new-name) directory))))
+         moved)
+    (unless (string= old-name new-name)
+      (when (or (file-exists-p new-home) (file-symlink-p new-home))
+        (user-error "Agent home already exists for %s" new-name))
+      (unwind-protect
+          (condition-case err
+              (progn
+                (when (or (file-exists-p old-home)
+                          (file-symlink-p old-home))
+                  (make-directory (file-name-directory new-home) t)
+                  (rename-file old-home new-home)
+                  (setq moved t))
+                (setf (magnus-instance-name instance) new-name)
+                (run-hooks 'magnus-instances-changed-hook)
+                ;; During a normal initialized session, make the home move and
+                ;; registry rename durable before reporting success.  The
+                ;; persistence writer is atomic, so a failure can still roll
+                ;; the in-memory and filesystem halves back together.
+                (when (and (boundp 'magnus-persistence--autosave-active)
+                           magnus-persistence--autosave-active
+                           (fboundp 'magnus-persistence-save))
+                  (magnus-persistence-save)))
+            (error
+             (setf (magnus-instance-name instance) old-name)
+             (when moved
+               (condition-case rollback-error
+                   (rename-file new-home old-home)
+                 (error
+                  (error "Rename failed (%s); home rollback also failed (%s)"
+                         (error-message-string err)
+                         (error-message-string rollback-error)))))
+             ;; Observers may have seen the tentative name before one failed.
+             ;; Best-effort notification restores their final projection.
+             (condition-case observer-error
+                 (run-hooks 'magnus-instances-changed-hook)
+               (error
+                (message "Magnus: rename rollback observer failed: %s"
+                         (error-message-string observer-error))))
+             (signal (car err) (cdr err))))
+        ;; Nothing should clean either path: the transaction owns a rename,
+        ;; not newly allocated data.
+        nil))
+    instance))
+
 (defun magnus-status-rename ()
-  "Rename the instance at point."
+  "Rename the archived instance at point, preserving its memory home."
   (interactive)
   (if-let ((instance (magnus-status--get-instance-at-point)))
-      (let* ((old-name (magnus-instance-name instance))
-             (new-name (read-string "New name: " old-name)))
-        (unless (string-empty-p new-name)
-          (magnus-instances-update instance :name new-name)
-          (magnus-status-refresh)))
+      (progn
+        (unless (eq (magnus-instance-status instance) 'purged)
+          (user-error "Archive %s before renaming it"
+                      (magnus-instance-name instance)))
+        (let* ((old-name (magnus-instance-name instance))
+               (new-name (read-string "New name: " old-name)))
+          (unless (or (string-empty-p new-name) (string= old-name new-name))
+            (magnus-status--rename-archived-instance instance new-name)
+            (magnus-status-refresh)
+            (message "Renamed '%s' to '%s'" old-name new-name))))
     (user-error "No instance at point")))
 
 (defun magnus-status-context ()
@@ -972,15 +1059,24 @@ Stops the process but preserves the session ID for later resurrection."
   (interactive)
   (magnus-context))
 
-(defun magnus-status-coordination ()
-  "Open the coordination file for the current project."
-  (interactive)
+(defun magnus-status--coordination-directory ()
+  "Return the project directory selected by the current status context."
   (if-let ((instance (magnus-status--get-instance-at-point)))
-      (magnus-coord-open (magnus-instance-directory instance))
-    ;; No instance at point, try to use first instance's directory
-    (if-let ((first-instance (car (magnus-instances-list))))
-        (magnus-coord-open (magnus-instance-directory first-instance))
-      (user-error "No instances to get project directory from"))))
+      (magnus-instance-directory instance)
+    (or (get-text-property (point) 'magnus-project-directory)
+        (if-let ((first-instance (car (magnus-instances-list))))
+            (magnus-instance-directory first-instance)
+          (user-error "No instances to get project directory from")))))
+
+(defun magnus-status-coordination ()
+  "Open the legacy coordination ingress for the current project."
+  (interactive)
+  (magnus-coord-open (magnus-status--coordination-directory)))
+
+(defun magnus-status-coordination-current ()
+  "Open the generated coordination view for the current project."
+  (interactive)
+  (magnus-coord-open-current (magnus-status--coordination-directory)))
 
 (defun magnus-status-suspend ()
   "Suspend the instance at point."
