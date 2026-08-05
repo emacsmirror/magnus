@@ -71,6 +71,49 @@
                             (file-name-as-directory directory))))))
       (delete-directory directory t))))
 
+(ert-deftest magnus-doctor-rejects-storage-path-type-mismatches ()
+  (let* ((root (make-temp-file "magnus-doctor-types-" t))
+         (state-directory (expand-file-name "state.el" root))
+         (review-file (expand-file-name "reviews" root)))
+    (unwind-protect
+        (progn
+          (make-directory state-directory)
+          (write-region "not a directory" nil review-file nil 'quiet)
+          (let ((state (magnus-doctor--storage-check
+                        'state state-directory "Instance state" nil))
+                (reviews (magnus-doctor--storage-check
+                          'reviews review-file "Review storage" t)))
+            (should (eq (magnus-doctor-check-severity state) 'error))
+            (should (eq (magnus-doctor-check-severity reviews) 'error))
+            (should (string-match-p "wrong path type"
+                                    (magnus-doctor-check-summary state)))
+            (should (string-match-p "wrong path type"
+                                    (magnus-doctor-check-summary reviews)))))
+      (delete-directory root t))))
+
+(ert-deftest magnus-doctor-rejects-symlinked-storage-paths ()
+  (let* ((root (make-temp-file "magnus-doctor-links-" t))
+         (real-state (expand-file-name "real-state.el" root))
+         (state-link (expand-file-name "state.el" root))
+         (real-reviews (expand-file-name "real-reviews" root))
+         (review-link (expand-file-name "reviews" root)))
+    (unwind-protect
+        (progn
+          (write-region "state" nil real-state nil 'quiet)
+          (make-directory real-reviews)
+          (make-symbolic-link real-state state-link)
+          (make-symbolic-link real-reviews review-link)
+          (dolist (check
+                   (list
+                    (magnus-doctor--storage-check
+                     'state state-link "Instance state" nil)
+                    (magnus-doctor--storage-check
+                     'reviews review-link "Review storage" t)))
+            (should (eq (magnus-doctor-check-severity check) 'error))
+            (should (string-match-p "symlink"
+                                    (magnus-doctor-check-summary check)))))
+      (delete-directory root t))))
+
 (ert-deftest magnus-doctor-reports-missing-instance-directory ()
   (let* ((missing (expand-file-name
                    (format "magnus-missing-%s" (random most-positive-fixnum))
@@ -98,6 +141,74 @@
     (should (string-match-p "OK[ ]+Everything works" (buffer-string)))
     (should (string-match-p "ERROR[ ]+Something failed" (buffer-string)))
     (should (string-match-p "Install it" (buffer-string)))))
+
+(ert-deftest magnus-doctor-coordination-checks-each-active-project-once ()
+  (let* ((first (magnus-instance--create
+                 :id "first" :name "quick-wren" :directory "/project"))
+         (second (magnus-instance--create
+                  :id "second" :name "keen-owl" :directory "/project/"))
+         (third (magnus-instance--create
+                 :id "third" :name "swift-hare" :directory "/other"))
+         calls)
+    (cl-letf (((symbol-function 'magnus-instances-active-list)
+               (lambda () (list first second third)))
+              ((symbol-function 'magnus-coord-watched-directories)
+               (lambda () '("/project/" "/review-only/")))
+              ((symbol-function 'magnus-coord-runtime-diagnostics)
+               (lambda (directory)
+                 (push directory calls)
+                 (list :running t :project-directory directory)))
+              ((symbol-function 'magnus-coord-runtime-refresh)
+               (lambda (&rest _arguments)
+                 (ert-fail "Doctor must not refresh coordination state"))))
+      (let ((checks (magnus-doctor--coordination-checks)))
+        (should (= (length checks) 3))
+        (should (cl-every
+                 (lambda (check)
+                   (eq (magnus-doctor-check-severity check) 'ok))
+                 checks))))
+    (should (equal (sort calls #'string<)
+                   '("/other/" "/project/" "/review-only/")))))
+
+(ert-deftest magnus-doctor-classifies-cached-coordination-diagnostics ()
+  (cl-letf (((symbol-function 'magnus-coord-runtime-diagnostics)
+             (lambda (_directory)
+               '(:running t :projection-dirty t
+                 :projection-error "disk full"))))
+    (let ((check (magnus-doctor--coordination-check "/project/")))
+      (should (eq (magnus-doctor-check-severity check) 'error))
+      (should (string-match-p "disk full"
+                              (magnus-doctor-check-detail check)))))
+  (cl-letf (((symbol-function 'magnus-coord-runtime-diagnostics)
+             (lambda (_directory)
+               '(:running t :state-issues (one two)))))
+    (let ((check (magnus-doctor--coordination-check "/project/")))
+      (should (eq (magnus-doctor-check-severity check) 'warning))
+      (should (string-match-p "2 state issues"
+                              (magnus-doctor-check-detail check)))))
+  (cl-letf (((symbol-function 'magnus-coord-runtime-diagnostics)
+             (lambda (_directory) '(:running nil))))
+    (let ((check (magnus-doctor--coordination-check "/project/")))
+      (should (eq (magnus-doctor-check-severity check) 'warning))
+      (should (string-match-p "read-only"
+                              (magnus-doctor-check-detail check))))))
+
+(ert-deftest magnus-doctor-exposes-exhausted-review-evidence ()
+  (cl-letf (((symbol-function 'magnus-coord-runtime-diagnostics)
+             (lambda (_directory) '(:running t)))
+            ((symbol-function 'magnus-coord-review-retry-diagnostics)
+             (lambda (_directory)
+               '(:pending-review-retry-count 0
+                 :exhausted-review-count 1
+                 :exhausted-review-event-ids ("event-1")
+                 :exhausted-review-details
+                 ((:event-id "event-1" :last-error "manifest unreadable"))))))
+    (let ((check (magnus-doctor--coordination-check "/project/")))
+      (should (eq (magnus-doctor-check-severity check) 'error))
+      (should (string-match-p "manifest unreadable"
+                              (magnus-doctor-check-detail check)))
+      (should (string-match-p "press g"
+                              (magnus-doctor-check-detail check))))))
 
 (provide 'magnus-doctor-tests)
 ;;; magnus-doctor-tests.el ends here
