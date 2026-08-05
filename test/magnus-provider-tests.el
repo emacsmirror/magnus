@@ -762,21 +762,24 @@ DATE defaults to the original deterministic test fixture date."
       (magnus-test--delete-terminal old-terminal)
       (magnus-test--delete-terminal new-terminal))))
 
-(ert-deftest magnus-coord-stopped-agent-nudge-is-logged-not-signaled ()
+(ert-deftest magnus-coord-stopped-agent-nudge-stays-local-and-does-not-signal ()
   (let* ((directory (make-temp-file "magnus-stopped-nudge-" t))
          (instance (magnus-instances-create directory "stopped-codex" 'codex))
-         (magnus-coord-nudge-debounce nil))
+         (magnus-coord-nudge-debounce nil)
+         logged)
     (unwind-protect
-        (progn
+        (cl-letf (((symbol-function 'message)
+                   (lambda (format-string &rest arguments)
+                     (setq logged (apply #'format format-string arguments)))))
           (should-not
            (magnus-coord-nudge-agent
             instance "Please tell @bold-wren later" "Magnus"))
-          (let ((log (with-temp-buffer
-                       (insert-file-contents
-                        (expand-file-name ".magnus-coord.md" directory))
-                       (buffer-string))))
-            (should (string-match-p "Undelivered nudge" log))
-            (should (string-match-p "(at) bold-wren" log))))
+          (should (string-match-p "Undelivered nudge" logged))
+          (should (string-match-p "(at) bold-wren" logged))
+          ;; Magnus is not another writer of the shared legacy ingress.  A
+          ;; failed best-effort delivery remains an Emacs-local diagnostic.
+          (should-not
+           (file-exists-p (expand-file-name ".magnus-coord.md" directory))))
       (delete-directory directory t))))
 
 (ert-deftest magnus-coord-legacy-running-check-needs-no-process-module-call ()
