@@ -20,6 +20,12 @@
 (require 'json)
 (require 'seq)
 (require 'subr-x)
+(require 'magnus-instances)
+
+(declare-function magnus-coord--maybe-stop-watching "magnus-coord"
+                  (directory))
+(declare-function magnus-review-controller-active-p
+                  "magnus-review-controller" ())
 
 (defgroup magnus-review nil
   "Durable cross-provider reviews managed by Magnus."
@@ -35,6 +41,14 @@
 (defcustom magnus-review-max-evidence-bytes (* 64 1024 1024)
   "Maximum bytes accepted for one immutable review patch.
 This bounds durable storage and accidental giant binary reviews."
+  :type 'integer
+  :group 'magnus-review)
+
+(defcustom magnus-review-max-stream-artifact-bytes (* 8 1024 1024)
+  "Maximum retained bytes for one raw JSONL or stderr review artifact.
+When a stream crosses this bound, Magnus preserves the complete lines already
+written and creates a sibling `.truncated' diagnostic instead of growing the
+artifact without limit."
   :type 'integer
   :group 'magnus-review)
 
@@ -427,9 +441,30 @@ This is intended for raw JSONL and stderr streams; it never follows symlinks."
   (when (and (file-exists-p path)
              (or (file-symlink-p path) (not (file-regular-p path))))
     (magnus-review--signal "Unsafe append-only review artifact: %s" path))
-  (let ((coding-system-for-write (or coding 'utf-8-unix)))
-    (write-region (concat line "\n") nil path t 'quiet))
-  (set-file-modes path #o600)
+  (let* ((coding-system-for-write (or coding 'utf-8-unix))
+         (encoded
+          (encode-coding-string (concat line "\n") coding-system-for-write))
+         (current
+          (if (file-exists-p path)
+              (file-attribute-size (file-attributes path))
+            0))
+         (limit (max 0 magnus-review-max-stream-artifact-bytes)))
+    (if (<= (+ current (string-bytes encoded)) limit)
+        (progn
+          (write-region (concat line "\n") nil path t 'quiet)
+          (set-file-modes path #o600))
+      (let ((marker (concat path ".truncated")))
+        (when (or (file-symlink-p marker) (file-directory-p marker))
+          (magnus-review--signal
+           "Unsafe review truncation marker: %s" marker))
+        (unless (file-exists-p marker)
+          (magnus-review--atomic-write-string
+           marker
+           (format
+            (concat "Magnus stopped retaining this stream at %d bytes; "
+                    "the next complete record required %d bytes and the "
+                    "configured limit is %d bytes.\n")
+            current (string-bytes encoded) limit))))))
   path)
 
 ;;; Git scope inspection
@@ -648,6 +683,21 @@ Evidence files are append-only, private, and remain after worktree cleanup."
 (defun magnus-review-list ()
   "Return a copy of the loaded review list."
   (copy-sequence magnus-reviews))
+
+(defun magnus-review-reserved-instance-names (project-root)
+  "Return reviewer identities reserved by open reviews in PROJECT-ROOT."
+  (let ((project (magnus-review--canonical-directory project-root)) names)
+    (dolist (review magnus-reviews (delete-dups names))
+      (when (and (eq (magnus-review-lifecycle review) 'open)
+                 (magnus-review-reviewer-name review)
+                 (string=
+                  project
+                  (magnus-review--canonical-directory
+                   (magnus-review-project-root review))))
+        (push (magnus-review-reviewer-name review) names)))))
+
+(add-hook 'magnus-instances-name-reservation-functions
+          #'magnus-review-reserved-instance-names)
 
 (defun magnus-review-get (id)
   "Return the loaded review whose ID is ID."
@@ -1255,6 +1305,9 @@ REASON is a durable diagnostic.  INTERRUPTION-KIND may be `manual',
           (magnus-review-closed-at review) now
           (magnus-review-updated-at review) now)
     (magnus-review-save review)
+    (when (fboundp 'magnus-coord--maybe-stop-watching)
+      (magnus-coord--maybe-stop-watching
+       (magnus-review-project-root review)))
     review))
 
 (defun magnus-review-archive (review)
@@ -1268,6 +1321,9 @@ REASON is a durable diagnostic.  INTERRUPTION-KIND may be `manual',
           (magnus-review-archived-at review) now
           (magnus-review-updated-at review) now)
     (magnus-review-save review)
+    (when (fboundp 'magnus-coord--maybe-stop-watching)
+      (magnus-coord--maybe-stop-watching
+       (magnus-review-project-root review)))
     review))
 
 ;;; JSON persistence
@@ -2202,6 +2258,10 @@ EXPECTED-ID and EXPECTED-HASH validate its managed storage path."
   "Load all durable reviews and recover abandoned active attempts.
 Malformed records are skipped with a warning; valid records remain available."
   (interactive)
+  (when (and (fboundp 'magnus-review-controller-active-p)
+             (magnus-review-controller-active-p))
+    (user-error
+     "Cannot reload reviews while the review controller owns a live attempt"))
   (setq magnus-reviews nil)
   (let ((root (expand-file-name magnus-review-directory-root))
         (loaded 0))
@@ -2481,6 +2541,8 @@ Even with FORCE, cleanup never operates outside REVIEW's derived checkout."
 (defun magnus-review-handle-ready-marker (directory marker)
   "Validate a coordination review-ready MARKER emitted in DIRECTORY.
 MARKER is a plist with :request-id, :checkpoint-token, :base, and :head strings.
+Event-backed markers also carry :writer-id; that durable identity must match
+the review author.  Legacy Markdown markers omit it and remain supported.
 A new valid marker appends an immutable round and runs
 `magnus-review-ready-hook'.  An unchanged re-review checkpoint is acknowledged
 without duplicating the round or launching a model, and finishes that pending
@@ -2495,8 +2557,26 @@ startup recovery can continue launching it idempotently."
          (token (plist-get marker :checkpoint-token))
          (base (plist-get marker :base))
          (head (plist-get marker :head))
+         (writer-id (plist-get marker :writer-id))
          (review (and request-id (magnus-review-get request-id))))
+    ;; An immutable event may outlive a temporarily unreadable review manifest.
+    ;; Do not acknowledge and garbage-collect that evidence merely because the
+    ;; durable registry could not load its request during this Emacs session.
+    ;; Legacy Markdown has historically treated unknown requests as no-ops and
+    ;; remains compatible because it carries no writer identity.
+    (when (and writer-id (null review))
+      (magnus-review--signal
+       "Event-backed review request is not loaded: %s"
+       (or request-id "<missing>")))
     (when review
+      (when (and writer-id
+                 (not (and (stringp writer-id)
+                           (string= writer-id
+                                    (magnus-review-author-instance-id
+                                     review)))))
+        (signal
+         'magnus-review-checkpoint-rejected
+         (list "Review-ready event came from a different agent identity")))
       (unless (stringp token)
         (magnus-review--signal "Review-ready checkpoint token is missing"))
       (unless (and (magnus-review--valid-oid-p base)

@@ -16,6 +16,72 @@
   "Guard against accidentally nesting the update defun inside create."
   (should (fboundp 'magnus-review-worktree-update)))
 
+(ert-deftest magnus-review-open-reviewer-reserves-its-project-identity ()
+  (let* ((directory (make-temp-file "magnus-review-reservation-" t))
+         (open
+          (magnus-review--create
+           :id "open" :project-root directory :reviewer-name "api-reviewer"
+           :lifecycle 'open))
+         (closed
+          (magnus-review--create
+           :id "closed" :project-root directory :reviewer-name "old-reviewer"
+           :lifecycle 'closed))
+         (magnus-reviews (list open closed)))
+    (unwind-protect
+        (should
+         (equal (magnus-review-reserved-instance-names directory)
+                '("api-reviewer")))
+      (delete-directory directory t))))
+
+(ert-deftest magnus-review-stream-artifacts-stop-at-a-durable-byte-bound ()
+  (let* ((storage (make-temp-file "magnus-review-stream-bound-" t))
+         (magnus-review-directory-root storage)
+         (magnus-review-max-stream-artifact-bytes 10)
+         (review
+          (magnus-review--create
+           :id "bounded" :project-hash (make-string 64 ?a)))
+         (path (expand-file-name "rounds/001/attempt-001.stderr.log"
+                                 (magnus-review-directory review))))
+    (unwind-protect
+        (progn
+          (magnus-review-append-artifact-line review path "1234")
+          (magnus-review-append-artifact-line review path "5678")
+          (magnus-review-append-artifact-line review path "not-retained")
+          (should (= (file-attribute-size (file-attributes path)) 10))
+          (should
+           (equal
+            (with-temp-buffer
+              (insert-file-contents path)
+              (buffer-string))
+            "1234\n5678\n"))
+          (should (file-regular-p (concat path ".truncated"))))
+      (delete-directory storage t))))
+
+(ert-deftest magnus-review-load-all-refuses-a-live-controller-owner ()
+  (let* ((sentinel (magnus-review--create :id "sentinel"))
+         (magnus-reviews (list sentinel)))
+    (cl-letf (((symbol-function 'magnus-review-controller-active-p)
+               (lambda () t)))
+      (should-error (magnus-review-load-all) :type 'user-error))
+    (should (equal magnus-reviews (list sentinel)))))
+
+(ert-deftest magnus-review-task-inference-prefers-durable-author-identity ()
+  "Duplicate display names cannot attribute another writer's task."
+  (let ((author
+         (magnus-instance--create
+          :id "exact-author" :name "same-name" :directory default-directory)))
+    (cl-letf (((symbol-function 'magnus-coord-parse)
+               (lambda (_root)
+                 (list
+                  :active
+                  (list (list :agent "same-name" :writer-id "other-author"
+                              :area "wrong task")
+                        (list :agent "same-name" :writer-id "exact-author"
+                              :area "right task"))))))
+      (should (equal (magnus-review-controller--task
+                      author default-directory)
+                     "right task")))))
+
 (ert-deftest magnus-review-prompt-pins-the-exact-committed-range ()
   (let* ((review
           (magnus-review--create
@@ -198,6 +264,73 @@
                round-two))
           (should (= ready 1)))
       (delete-directory root t))))
+
+(ert-deftest magnus-review-event-requires-the-exact-author-identity ()
+  "Durable events cannot spend another agent's checkpoint token."
+  (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-writer-id-" t))
+               (magnus-review-directory-root storage)
+               (magnus-reviews nil)
+               (magnus-reviews-changed-hook nil))
+    (unwind-protect
+        (let* ((review
+                (magnus-review-create
+                 root "author-uuid" "bright-crow"
+                 :id "writer-bound-review"
+                 :task "Bind the checkpoint to its author"
+                 :reviewer-name "keen-owl"
+                 :reviewer-provider 'codex))
+               (marker
+                (list :request-id (magnus-review-id review)
+                      :checkpoint-token (magnus-review-checkpoint-token review)
+                      :base base :head head :writer-id "other-uuid")))
+          (should-error
+           (magnus-review-handle-ready-marker root marker)
+           :type 'magnus-review-checkpoint-rejected)
+          (should-not (magnus-review-rounds review))
+          (should (eq (magnus-review-execution review)
+                      'waiting-for-checkpoint))
+          ;; The old Markdown protocol carries no durable writer ID and stays
+          ;; valid for compatibility with already-running agents.
+          (setq marker (copy-sequence marker))
+          (setq marker (plist-put marker :writer-id nil))
+          (should
+           (magnus-review-round-p
+            (magnus-review-handle-ready-marker root marker))))
+      (delete-directory root t)
+      (delete-directory storage t))))
+
+(ert-deftest magnus-review-event-for-unloaded-request-remains-retryable ()
+  "Durable checkpoint evidence survives a missing or unreadable manifest."
+  (let ((magnus-reviews nil)
+        (marker
+         (list :request-id "temporarily-unloaded-review"
+               :checkpoint-token "checkpoint-token-unknown"
+               :base "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+               :head "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+               :writer-id "author-uuid")))
+    (should-error
+     (magnus-review-handle-ready-marker default-directory marker)
+     :type 'magnus-review-error)
+    ;; The legacy ingress retains its historical ignore-unknown behavior.
+    (should-not
+     (magnus-review-handle-ready-marker
+     default-directory (plist-put (copy-sequence marker) :writer-id nil)))))
+
+(ert-deftest magnus-review-terminal-lifecycle-releases-coordination-watch ()
+  "Closing or archiving the sole pending review releases its project poller."
+  (let ((review
+         (magnus-review--create
+          :id "review-lifecycle" :project-root default-directory
+          :lifecycle 'open :execution 'waiting-for-checkpoint))
+        released)
+    (cl-letf (((symbol-function 'magnus-review-save) #'identity)
+              ((symbol-function 'magnus-coord--maybe-stop-watching)
+               (lambda (root) (push root released))))
+      (magnus-review-close review)
+      (setf (magnus-review-lifecycle review) 'open)
+      (magnus-review-archive review))
+    (should (equal released (list default-directory default-directory)))))
 
 (defun magnus-test-review--git (directory &rest arguments)
   "Run Git with ARGUMENTS in DIRECTORY and return trimmed output."
@@ -951,6 +1084,7 @@
          (review
           (magnus-review--create
            :id "exact-message" :project-root "/tmp/project"
+           :author-instance-id "author-uuid"
            :author-name "bright-crow" :task "Finish the controller"
            :checkpoint-token "stale-aggregate-token"))
          message)
@@ -962,6 +1096,14 @@
             (magnus-review-controller--checkpoint-message review request)))
     (should (string-match-p
              (regexp-quote "checkpoint=exact-request-token") message))
+    (should (string-match-p (regexp-quote "`review.ready'") message))
+    (should (string-match-p
+             (regexp-quote
+              "\"checkpoint_token\":\"exact-request-token\"")
+             message))
+    (should (string-match-p
+             (regexp-quote "$MAGNUS_COORD_WRITER_ID") message))
+    (should (string-match-p (regexp-quote "author-uuid") message))
     (should-not (string-match-p
                  (regexp-quote "stale-aggregate-token") message))))
 

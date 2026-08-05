@@ -64,6 +64,15 @@ The default deliberately serializes expensive model work on a laptop."
   :type 'natnum
   :group 'magnus)
 
+(defcustom magnus-review-attempt-timeout 3600
+  "Maximum seconds one headless review attempt may run.
+When positive, Magnus marks the exact process/round/attempt owner failed, kills
+its subprocess, and advances the review queue after this interval.  Nil or a
+non-positive value disables the watchdog.  A late watchdog can never affect a
+replacement attempt because ownership includes the process and attempt token."
+  :type '(choice (const :tag "No timeout" nil) number)
+  :group 'magnus)
+
 (defcustom magnus-review-local-delivery-retry-delay 1.0
   "Seconds before retrying a message deferred from a user-owned agent TUI."
   :type 'number
@@ -87,6 +96,12 @@ The default deliberately serializes expensive model work on a laptop."
 
 (defvar magnus-review-controller-changed-hook nil
   "Hook run after a controller-visible review state transition.")
+
+(defun magnus-review-controller-active-p ()
+  "Return non-nil while the controller owns a headless review attempt.
+Registry ownership spans provider startup through exact completion release, so
+callers can use this predicate to reject unsafe durable-state reloads."
+  (> (hash-table-count magnus-review-controller--processes) 0))
 
 (defconst magnus-review-controller--result-schema
   '((type . "object")
@@ -760,8 +775,12 @@ shown beneath unrelated code."
               (entry
                (seq-find
                 (lambda (candidate)
-                  (string= (plist-get candidate :agent)
-                           (magnus-instance-name author)))
+                  (let ((writer-id (plist-get candidate :writer-id)))
+                    (if writer-id
+                        (string= writer-id (magnus-instance-id author))
+                      ;; Legacy Markdown rows have only a display name.
+                      (string= (plist-get candidate :agent)
+                               (magnus-instance-name author)))))
                 (plist-get parsed :active))))
          (when-let ((area (and entry (plist-get entry :area))))
            (unless (string-empty-p (string-trim area)) area)))
@@ -960,21 +979,31 @@ the message; callers include stable idempotency keys for replay."
       "validation, and commit only your own changes. Preserve unrelated dirty "
       "work. Infer the task's upstream merge-base and current committed HEAD; "
       "Magnus's current suggestion is base=%s head=%s. Verify them yourself.\n\n"
-      "Then append exactly one machine marker to the Log in .magnus-coord.md, "
-      "using full object IDs (never abbreviations):\n"
+      "Then publish exactly one immutable `review.ready' event using the "
+      "protocol in .claude/magnus-instructions.md. Use your next durable "
+      "writer_sequence and full object IDs (never abbreviations). Its payload "
+      "must be exactly:\n"
+      "{\"request_id\":\"%s\",\"checkpoint_token\":\"%s\","
+      "\"base\":\"<FULL_BASE_OID>\",\"head\":\"<FULL_HEAD_OID>\"}\n"
+      "The event writer_id must be $MAGNUS_COORD_WRITER_ID, which Magnus "
+      "expects to equal %s. If this is an already-running legacy session with "
+      "no MAGNUS_COORD_WRITER_ID, use the old fallback instead: append "
       "[REVIEW-READY request=%s checkpoint=%s base=<FULL_BASE_OID> "
-      "head=<FULL_HEAD_OID>]\n\n"
+      "head=<FULL_HEAD_OID>] to the Log in .magnus-coord.md.\n\n"
       "The checkpoint token is an opaque Magnus correlation token: copy it "
       "exactly. "
       "Never generate, hash, derive, or replace it. "
       "This request is idempotent. If that exact checkpoint was already prepared, "
-      "re-emit the same marker; do not create an empty or unrelated commit.")
+      "re-publish the same evidence; do not create an empty or unrelated commit.")
      (magnus-review-id review)
      token
      (magnus-review-checkpoint-request-number request)
      (magnus-review-task review)
      (or base "not inferred")
      (or head "not inferred")
+     (magnus-review-id review)
+     token
+     (or (magnus-review-author-instance-id review) "<unknown>")
      (magnus-review-id review)
      token)))
 
@@ -1142,7 +1171,6 @@ CONTEXT, when non-nil, must be a freshly validated value returned by
                       (or (plist-get reviewer-selection :expertise)
                           (plist-get reviewer-selection :summary))
                       1200))))))
-        (magnus-coord-ensure-file root)
         (magnus-coord-start-watching root)
         (if (magnus-review-controller--deliver-checkpoint
              review (magnus-review-pending-checkpoint-request review))
@@ -1245,6 +1273,7 @@ keeps its immutable evidence and can be resumed with `magnus-review-retry'."
                   (magnus-review-reviewer-name review)))
     ;; Revoke ownership first.  `magnus-headless-cancel' can synchronously run
     ;; a sentinel, and that callback must observe itself as stale.
+    (magnus-review-controller--cancel-watchdog owner)
     (remhash review-id magnus-review-controller--processes)
     (unwind-protect
         (pcase-let ((`(,current-review ,round ,attempt) context))
@@ -1490,6 +1519,78 @@ When STATES is non-nil, the current attempt must be in one of them."
          (= round-number (plist-get owner :round-number))
          (string= attempt-token (plist-get owner :attempt-token)))))
 
+(defun magnus-review-controller--cancel-watchdog (owner)
+  "Cancel OWNER's attempt watchdog, if one is still scheduled."
+  (when-let ((timer (plist-get owner :watchdog-timer)))
+    (when (timerp timer)
+      (cancel-timer timer))))
+
+(defun magnus-review-controller--watchdog-fired
+    (process review-id round-number attempt-token seconds)
+  "Time out PROCESS if it still owns REVIEW-ID ROUND-NUMBER ATTEMPT-TOKEN.
+SECONDS is the configured duration captured when this owner was started."
+  (when (and (magnus-review-controller--owner-p
+              process review-id round-number attempt-token)
+             ;; A terminal subprocess may be waiting for its zero-delay
+             ;; finalizer.  Let that completion win instead of relabeling it as
+             ;; a timeout at the event-loop boundary.
+             (process-live-p process))
+    (let* ((owner (gethash review-id magnus-review-controller--processes))
+           (context
+            (magnus-review-controller--context
+             review-id round-number attempt-token '(starting running)))
+           (reason (format "Review attempt timed out after %.1f seconds"
+                           seconds)))
+      (magnus-review-controller--cancel-watchdog owner)
+      ;; Revoke first: killing the process may synchronously run its sentinel,
+      ;; whose completion must be stale before it can publish or release a slot.
+      (remhash review-id magnus-review-controller--processes)
+      (unwind-protect
+          (progn
+            (condition-case err
+                (magnus-headless-cancel process t)
+              (error
+               (display-warning
+                'magnus-review
+                (format "Could not cancel timed-out review %s: %s"
+                        review-id (error-message-string err))
+                :warning)))
+            (when context
+              (pcase-let ((`(,review ,round ,attempt) context))
+                (condition-case err
+                    (magnus-review-fail-attempt
+                     review round attempt reason attempt-token)
+                  (error
+                   (display-warning
+                    'magnus-review
+                    (format "Could not persist timed-out review %s: %s"
+                            review-id (error-message-string err))
+                    :warning))))))
+        ;; Timeout must release the global low-resource slot even if process
+        ;; cancellation or durable failure persistence is temporarily broken.
+        (magnus-review-controller--pump))
+      (message "Magnus: review %s timed out; use retry from its menu"
+               review-id))))
+
+(defun magnus-review-controller--arm-watchdog
+    (process review-id round-number attempt-token)
+  "Arm the configured watchdog for PROCESS's exact review owner tuple."
+  (when (and (numberp magnus-review-attempt-timeout)
+             (> magnus-review-attempt-timeout 0)
+             (magnus-review-controller--owner-p
+              process review-id round-number attempt-token))
+    (let* ((seconds magnus-review-attempt-timeout)
+           (timer
+            (run-at-time
+             seconds nil #'magnus-review-controller--watchdog-fired
+             process review-id round-number attempt-token seconds))
+           (owner
+            (copy-sequence
+             (gethash review-id magnus-review-controller--processes))))
+      (puthash review-id (plist-put owner :watchdog-timer timer)
+               magnus-review-controller--processes)
+      timer)))
+
 (defun magnus-review-controller--append-raw
     (process review-id round-number attempt-token line)
   "Persist one provider LINE if PROCESS still owns its attempt."
@@ -1530,13 +1631,19 @@ When STATES is non-nil, the current attempt must be in one of them."
 (defun magnus-review-controller--completion-error (result)
   "Return a bounded diagnostic string for failed headless RESULT."
   (magnus-review-controller--truncate-string
-   (format "exit=%S event=%S stderr=%s decode=%S provider=%S callbacks=%S"
+   (format (concat "exit=%S event=%S stderr=%s decode=%S provider=%S "
+                   "callbacks=%S bounds=%S")
            (plist-get result :exit-status)
            (plist-get result :process-event)
            (string-trim (or (plist-get result :stderr) ""))
            (plist-get result :decode-errors)
            (plist-get result :provider-errors)
-           (plist-get result :callback-errors))
+           (plist-get result :callback-errors)
+           (list :stderr-dropped-chars
+                 (or (plist-get result :stderr-dropped-chars) 0)
+                 :discarded-jsonl-lines
+                 (or (plist-get result :discarded-jsonl-lines) 0)
+                 :dropped-errors (plist-get result :dropped-errors)))
    12000))
 
 (defun magnus-review-controller--release
@@ -1544,6 +1651,8 @@ When STATES is non-nil, the current attempt must be in one of them."
   "Release PROCESS's exact owned slot and pump the next review."
   (when (magnus-review-controller--owner-p
          process review-id round-number attempt-token)
+    (magnus-review-controller--cancel-watchdog
+     (gethash review-id magnus-review-controller--processes))
     (remhash review-id magnus-review-controller--processes)
     (magnus-review-controller--pump)))
 
@@ -1659,12 +1768,16 @@ When STATES is non-nil, the current attempt must be in one of them."
                          :attempt-token token)
                    magnus-review-controller--processes)
           (magnus-review-mark-attempt-running review round attempt token)
+          (magnus-review-controller--arm-watchdog
+           process review-id round-number token)
           (message "Magnus: %s is reviewing %s (round %d)"
                    (magnus-review-reviewer-name review)
                    (magnus-review-author-name review) round-number)
           process)
       (error
        ;; Revoke callback ownership before cancellation can run a sentinel.
+       (magnus-review-controller--cancel-watchdog
+        (gethash review-id magnus-review-controller--processes))
        (remhash review-id magnus-review-controller--processes)
        ;; `magnus-review-append-attempt' mutates then saves.  If that save
        ;; throws, SETQ never receives its return value; recover the just-appended
@@ -2056,9 +2169,7 @@ Return non-nil when publication was recovered."
           ;; after persisted queue reconstruction, while pumping is suppressed.
           (dolist (root (sort watcher-roots #'string-lessp))
             (condition-case err
-                (progn
-                  (magnus-coord-ensure-file root)
-                  (magnus-coord-start-watching root))
+                (magnus-coord-start-watching root)
               (error
                (display-warning
                 'magnus-review
@@ -2106,6 +2217,7 @@ Return non-nil when publication was recovered."
                             review-id (error-message-string err))))
               ;; Process cancellation and ownership revocation are invariant even
               ;; when persistence is unavailable.
+              (magnus-review-controller--cancel-watchdog owner)
               (remhash review-id magnus-review-controller--processes)
               (condition-case err
                   (when (and process (process-live-p process))
@@ -2115,6 +2227,14 @@ Return non-nil when publication was recovered."
                           review-id (error-message-string err))))))))
     ;; Hook/timer teardown is itself a cleanup invariant and therefore runs even
     ;; if an unforeseen owner-loop error escapes the boundaries above.
+    (maphash
+     (lambda (_review-id owner)
+       (condition-case err
+           (magnus-review-controller--cancel-watchdog owner)
+         (error
+          (message "Magnus: could not clear review watchdog: %s"
+                   (error-message-string err)))))
+     magnus-review-controller--processes)
     (clrhash magnus-review-controller--processes)
     (maphash
      (lambda (process _value)
