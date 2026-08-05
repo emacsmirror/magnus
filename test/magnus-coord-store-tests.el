@@ -446,7 +446,9 @@
   (magnus-coord-store-tests--with-project
     (let* ((root (magnus-coord-store-directory project))
            (writer (magnus-coord-store-writer-directory project "writer")))
-      (should (equal root (expand-file-name ".magnus-coord" project)))
+      (should (equal root
+                     (expand-file-name ".magnus-coord"
+                                       (file-truename project))))
       (should-not (file-exists-p root))
       (should (equal (magnus-coord-store-ensure-writer-directory
                       project "writer")

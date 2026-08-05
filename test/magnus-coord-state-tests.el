@@ -178,8 +178,35 @@
              (mapcar #'magnus-coord-state-log-record-event-id
                      (magnus-coord-state-logs state))
              '("a1" "a2")))
+    (should (equal
+             (mapcar #'magnus-coord-state-log-record-event-id
+                     (magnus-coord-state-log-effects state))
+             '("b1" "a1" "a2")))
     (should (equal (magnus-coord-state-retained-event-ids state)
                    '("a1" "a2" "b1")))))
+
+(ert-deftest magnus-coord-state-projection-applies-lifecycle-overlay ()
+  "Lifecycle visibility changes presentation without discarding evidence."
+  (let* ((project default-directory)
+         (event
+          (magnus-coord-state-tests--event
+           "hidden-writer" 1 "active.set"
+           (magnus-coord-state-tests--payload
+            "area" "old project" "status" "working" "files" ["old.el"])))
+         (state
+          (magnus-coord-state-reduce
+           (magnus-coord-state-tests--snapshot project (list event))))
+         (magnus-coord-state-active-record-visible-function
+          (lambda (record supplied-project)
+            (and (not (string= "hidden-writer"
+                               (magnus-coord-state-active-record-writer-id
+                                record)))
+                 supplied-project))))
+    (should (= (length (magnus-coord-state-active state)) 1))
+    (should-not (magnus-coord-state-visible-active state))
+    (should-not
+     (string-match-p "hidden-writer"
+                     (magnus-coord-state--projection-text state)))))
 
 (ert-deftest magnus-coord-state-knowledge-cap-counts-tombstones ()
   "The newest bounded winners include removals and permit old-key collection."

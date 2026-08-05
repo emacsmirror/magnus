@@ -229,7 +229,7 @@ Schema 1 uses six fractional-second digits so lexical order is time order."
       (signal 'magnus-coord-store-error
               (list (format "Project directory does not exist: %s"
                             directory))))
-    directory))
+    (file-name-as-directory (file-truename directory))))
 
 (defun magnus-coord-store--root (project-directory)
   "Return the coordination store root for PROJECT-DIRECTORY."

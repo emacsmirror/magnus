@@ -38,6 +38,13 @@ Both visible entries and removal tombstones count toward this bound."
   :type 'natnum
   :group 'magnus-coord-state)
 
+(defvar magnus-coord-state-active-record-visible-function nil
+  "Optional predicate used when projecting active-work records.
+The function receives an active record and its project directory.  A nil
+value keeps the reducer completely event-derived.  Magnus binds this boundary
+to its live instance registry so a crashed, archived, or moved agent does not
+remain visible merely because its last immutable event was `active.set'.")
+
 (define-error 'magnus-coord-state-invalid-payload
   "Invalid Magnus coordination event payload")
 
@@ -79,8 +86,20 @@ Both visible entries and removal tombstones count toward this bound."
                (:copier nil))
   "Current state derived from one immutable store snapshot."
   project-directory snapshot active active-winners discoveries decisions
-  knowledge-winners logs review-ready issues retained-event-ids
+  knowledge-winners logs log-effects review-ready issues retained-event-ids
   sequence-anchor-event-ids)
+
+(defun magnus-coord-state-visible-active (state)
+  "Return active records from STATE that belong in the human projection.
+The durable winning records remain available through `active-winners' even
+when Magnus's lifecycle overlay temporarily hides one from `current.md'."
+  (let ((records (magnus-coord-state-active state))
+        (predicate magnus-coord-state-active-record-visible-function)
+        (project (magnus-coord-state-project-directory state)))
+    (if (functionp predicate)
+        (cl-remove-if-not
+         (lambda (record) (funcall predicate record project)) records)
+      records)))
 
 (defun magnus-coord-state--payload-error (format-string &rest arguments)
   "Signal a payload error formatted with FORMAT-STRING and ARGUMENTS."
@@ -511,7 +530,7 @@ Permit the empty string only when EMPTY-OK is non-nil."
        :snapshot snapshot
        :active visible-active :active-winners active-winners
        :discoveries discoveries :decisions decisions
-       :knowledge-winners knowledge-winners :logs recent
+       :knowledge-winners knowledge-winners :logs recent :log-effects merged
        :review-ready (nreverse reviews)
        :issues (sort issues #'magnus-coord-state--issue-less-p)
        :sequence-anchor-event-ids anchor-ids
@@ -532,7 +551,7 @@ Permit the empty string only when EMPTY-OK is non-nil."
     (insert "## Active Work\n\n")
     (insert "| Agent | Area | Status | Files |\n")
     (insert "|-------|------|--------|-------|\n")
-    (dolist (entry (magnus-coord-state-active state))
+    (dolist (entry (magnus-coord-state-visible-active state))
       (insert (format "| %s | %s | %s | %s |\n"
                       (magnus-coord-state--markdown
                        (magnus-coord-state-active-record-writer-name entry))

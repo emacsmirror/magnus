@@ -8,8 +8,11 @@
 
 ;;; Commentary:
 
-;; This module provides inter-agent coordination through a shared
-;; coordination file (.magnus-coord.md).  Agents use this file to:
+;; This module connects Magnus's append-only, per-writer coordination event
+;; store to agent delivery and the status UI.  `.magnus-coord/current.md' is a
+;; generated human view.  The historical `.magnus-coord.md' remains a
+;; read-compatible legacy ingress and is never used as the event projection.
+;; Agents use coordination to:
 ;; - Announce what they're working on
 ;; - Communicate with other agents
 ;; - Record decisions and agreements
@@ -17,15 +20,28 @@
 
 ;;; Code:
 
+(require 'cl-lib)
+(require 'seq)
+(require 'subr-x)
 (require 'magnus-instances)
 (require 'magnus-provider)
+(require 'magnus-coord-runtime)
+(require 'magnus-coord-state)
+(require 'magnus-coord-store)
+(require 'magnus-background)
 
 (declare-function vterm-send-string "vterm")
 (declare-function project-root "project")
 (declare-function vterm-send-return "vterm")
+(declare-function magnus-review-list "magnus-review" ())
+(declare-function magnus-review-lifecycle "magnus-review" (review))
+(declare-function magnus-review-project-root "magnus-review" (review))
+(declare-function magnus-review-pending-checkpoint-request
+                  "magnus-review" (review))
 
 (defvar magnus-claude-executable)
-(declare-function magnus--headless-command "magnus")
+(defvar magnus-headless-model)
+(declare-function magnus--strip-thinking-markers "magnus")
 
 ;;; Vterm buffer activity tracking
 
@@ -68,7 +84,8 @@ Quiet means no output for `magnus-coord-quiescence-threshold' seconds."
 ;;; Customization
 
 (defcustom magnus-coord-file ".magnus-coord.md"
-  "Name of the coordination file in project directories."
+  "Name of the legacy coordination ingress in project directories.
+New Magnus agents publish immutable events below `.magnus-coord/writers/'."
   :type 'string
   :group 'magnus)
 
@@ -77,7 +94,7 @@ Quiet means no output for `magnus-coord-quiescence-threshold' seconds."
   :type 'string
   :group 'magnus)
 
-(defconst magnus-coord--instructions-version 3
+(defconst magnus-coord--instructions-version 4
   "Version of the instructions template.
 Bump this when the template content changes.  Files with an older
 version marker are automatically regenerated.")
@@ -179,19 +196,16 @@ This prevents partial reads when agents write concurrently."
   "Hash of instance-id → timestamp of last Magnus system nudge.")
 
 (defun magnus-coord--log-undelivered-nudge (instance text reason)
-  "Record that TEXT could not reach INSTANCE because of REASON."
+  "Record in Emacs's message log that TEXT missed INSTANCE for REASON."
   (let* ((name (magnus-instance-name instance))
-         (directory (magnus-instance-directory instance))
          (safe-text (replace-regexp-in-string
                      "@" "(at) "
                      (replace-regexp-in-string "[\n\r]+" " " text)))
          (entry (format "Undelivered nudge to %s (%s): %s"
                         name reason safe-text)))
-    (condition-case err
-        (magnus-coord-add-log directory "Magnus" entry)
-      (error
-       (message "Magnus: could not log undelivered nudge for %s: %s"
-                name (error-message-string err))))
+    ;; `message' writes *Messages* without making Magnus another writer of the
+    ;; shared legacy Markdown ingress.  That file cannot provide multiwriter
+    ;; safety and is retained only for compatibility with old agents.
     (message "Magnus: %s" entry)
     nil))
 
@@ -268,10 +282,10 @@ are debounced per `magnus-coord-nudge-debounce'."
   (magnus-coord--stop-idle-watch))
 
 (defvar magnus-coord--reminder-templates
-  '("Hey %s — take a quick look at .magnus-coord.md. Any messages for you? Anything you've learned that other agents should know? Drop it in the Discoveries section."
-    "Coordination check, %s. Read .magnus-coord.md — has anyone posted something useful in Discoveries? If you've figured out something non-obvious, share it there."
-    "%s, heads up: peek at .magnus-coord.md. Other agents may have left insights in Discoveries that save you time. And if you've hit a gotcha or found a pattern, pay it forward."
-    "Quick sync, %s. Open .magnus-coord.md — update your status, check for messages, and if you've learned anything surprising about this codebase, add it to Discoveries.")
+  '("Hey %s — take a quick look at .magnus-coord/current.md and the legacy .magnus-coord.md ingress when present. Publish useful updates with the protocol in .claude/magnus-instructions.md."
+    "Coordination check, %s. Review .magnus-coord/current.md for messages, discoveries, decisions, and overlapping work; publish any update as an immutable event."
+    "%s, heads up: revisit the generated coordination view. A teammate may have left context that saves you time; use your durable writer identity for anything you publish."
+    "Quick sync, %s. Read the current and legacy coordination views, then publish status or non-obvious discoveries through .claude/magnus-instructions.md when needed.")
   "Rotating reminder messages. %s is replaced with the agent name.")
 
 (defvar magnus-coord--reminder-index 0
@@ -426,12 +440,8 @@ Suppressed entirely when AFK or DND is on."
            "Magnus")))
       (setq magnus-coord--reminder-index
             (1+ magnus-coord--reminder-index))))
-  ;; Trim logs while we're at it (even when idle)
-  (magnus-coord-trim-all)
   ;; Check context utilization (runs even when idle/active)
-  (magnus-coord-check-context-all)
-  ;; Ask an agent to tidy if coord file is large
-  (magnus-coord--maybe-tidy))
+  (magnus-coord-check-context-all))
 
 ;;; Log trimming
 
@@ -483,8 +493,11 @@ Keeps only the last `magnus-coord-log-max-entries' entries."
 (defun magnus-coord-trim-all ()
   "Trim coordination file logs for all active project directories."
   (let ((dirs (delete-dups
-               (mapcar #'magnus-instance-directory
-                       (magnus-instances-list)))))
+               (mapcar
+                (lambda (instance)
+                  (magnus-coord--normalized-directory
+                   (magnus-instance-directory instance)))
+                (magnus-instances-list)))))
     (dolist (dir dirs)
       (magnus-coord-trim-log dir))))
 
@@ -500,8 +513,11 @@ Checks each project directory's coordination file against
 random quiescent agent to consolidate the Discoveries and Decisions
 sections.  Debounced to at most once per hour per directory."
   (let ((dirs (delete-dups
-               (mapcar #'magnus-instance-directory
-                       (magnus-instances-list)))))
+               (mapcar
+                (lambda (instance)
+                  (magnus-coord--normalized-directory
+                   (magnus-instance-directory instance)))
+                (magnus-instances-list)))))
     (dolist (dir dirs)
       (let ((file (magnus-coord-file-path dir))
             (threshold (magnus-coord--dir-local-value
@@ -517,7 +533,8 @@ sections.  Debounced to at most once per hour per directory."
             (let ((candidates
                    (cl-remove-if-not
                     (lambda (inst)
-                      (and (string= (magnus-instance-directory inst) dir)
+                      (and (magnus-coord--same-directory-p
+                            (magnus-instance-directory inst) dir)
                            (eq (magnus-instance-status inst) 'running)
                            (not (magnus-coord-agent-busy-p inst))
                            (magnus-coord-agent-quiescent-p inst)))
@@ -540,11 +557,7 @@ sections.  Debounced to at most once per hour per directory."
                     "active architectural decisions. Do not touch the Active "
                     "Work or Log sections. Be aggressive about trimming — a "
                     "shorter file is more useful than a comprehensive one.")
-                   "Magnus")
-                  (magnus-coord-add-log
-                   dir "Magnus"
-                   (format "Asked %s to tidy the coordination file"
-                           (magnus-instance-name chosen)))))))))))
+                   "Magnus")))))))))
 
 ;;; AFK detection
 
@@ -600,7 +613,9 @@ Sends a wake-up message to running agents and re-arms the idle timer."
                (not (magnus-coord-agent-busy-p instance)))
       (magnus-coord-nudge-agent
        instance
-       "The user is back! Resume normal operation — check .magnus-coord.md for any updates."
+       (concat
+        "The user is back! Resume normal operation — check "
+        ".magnus-coord/current.md and the legacy ingress for updates.")
        "Magnus")))
   ;; Re-arm the idle timer for the next AFK period
   (magnus-coord--start-idle-watch))
@@ -689,8 +704,121 @@ cache_read_input_tokens."
 (defvar magnus-coord--watched-dirs nil
   "List of directories being polled for coordination file changes.")
 
+(defun magnus-coord-watched-directories ()
+  "Return a copy of physical project roots with live coordination runtimes."
+  (copy-sequence magnus-coord--watched-dirs))
+
 (defvar magnus-coord--file-mtimes nil
   "Alist of (directory . modification-time) for polling dedup.")
+
+(defvar magnus-coord--legacy-states nil
+  "Alist of parsed legacy ingress state for watched project directories.")
+
+(defvar magnus-coord--lifecycle-signatures (make-hash-table :test #'equal)
+  "Visible instance-ID sets keyed by normalized project directory.")
+
+(defun magnus-coord--normalized-directory (directory)
+  "Return DIRECTORY's canonical physical project identity."
+  (directory-file-name (file-truename (expand-file-name directory))))
+
+(defun magnus-coord--same-directory-p (left right)
+  "Return non-nil when LEFT and RIGHT have the same normalized spelling."
+  (and (stringp left) (stringp right)
+       (string= (magnus-coord--normalized-directory left)
+                (magnus-coord--normalized-directory right))))
+
+(defun magnus-coord--lifecycle-visible-p (instance)
+  "Return non-nil when INSTANCE should appear as active coordination work."
+  (memq (magnus-instance-status instance) '(running suspended)))
+
+(defun magnus-coord--active-record-visible-p (record project-directory)
+  "Apply Magnus lifecycle visibility to active RECORD in PROJECT-DIRECTORY.
+Unmanaged durable writers remain event-derived.  A writer whose UUID belongs
+to Magnus is visible only while that exact instance is live in this project."
+  (let ((instance
+         (magnus-instances-get
+          (magnus-coord-state-active-record-writer-id record))))
+    (or (null instance)
+        (and (magnus-coord--lifecycle-visible-p instance)
+             (magnus-coord--same-directory-p
+              (magnus-instance-directory instance) project-directory)))))
+
+;; Keep reduction pure and install the mutable registry only at projection.
+(setq magnus-coord-state-active-record-visible-function
+      #'magnus-coord--active-record-visible-p)
+
+(defun magnus-coord--lifecycle-signature (directory)
+  "Return sorted visible Magnus instance IDs for DIRECTORY."
+  (sort
+   (delq nil
+         (mapcar
+          (lambda (instance)
+            (and (magnus-coord--lifecycle-visible-p instance)
+                 (magnus-coord--same-directory-p
+                  (magnus-instance-directory instance) directory)
+                 (magnus-instance-id instance)))
+          (magnus-instances-list)))
+   #'string<))
+
+(defun magnus-coord--known-lifecycle-directories ()
+  "Return normalized directories whose active projection may have changed."
+  (let ((directories
+         (append (copy-sequence magnus-coord--watched-dirs)
+                 (delq nil
+                       (mapcar
+                        (lambda (instance)
+                          (let ((directory
+                                 (magnus-instance-directory instance)))
+                            (and (stringp directory)
+                                 (not (string-empty-p directory))
+                                 directory)))
+                        (magnus-instances-list))))))
+    (maphash (lambda (directory _signature) (push directory directories))
+             magnus-coord--lifecycle-signatures)
+    (delete-dups (mapcar #'magnus-coord--normalized-directory directories))))
+
+(defun magnus-coord--instances-changed ()
+  "Reproject cached event state whose live-instance visibility changed."
+  (let ((missing (make-symbol "missing-lifecycle-signature")))
+    (dolist (directory (magnus-coord--known-lifecycle-directories))
+      (let ((before (gethash directory magnus-coord--lifecycle-signatures
+                             missing))
+            (after (magnus-coord--lifecycle-signature directory)))
+        (unless (equal before after)
+          (puthash directory after magnus-coord--lifecycle-signatures)
+          (condition-case err
+              (magnus-coord-runtime-reproject directory)
+            (error
+             (message "Magnus: lifecycle projection failed for %s: %s"
+                      directory (error-message-string err)))))))))
+
+(defun magnus-coord--pending-review-p (directory)
+  "Return non-nil when DIRECTORY has a durable checkpoint still in flight."
+  (and (fboundp 'magnus-review-list)
+       (fboundp 'magnus-review-pending-checkpoint-request)
+       (cl-some
+        (lambda (review)
+          (and (eq (magnus-review-lifecycle review) 'open)
+               (magnus-coord--same-directory-p
+                (magnus-review-project-root review) directory)
+               (magnus-review-pending-checkpoint-request review)))
+        (magnus-review-list))))
+
+(defun magnus-coord--project-owned-p (directory)
+  "Return non-nil when agents or pending reviews still own DIRECTORY's watch."
+  (or (cl-some
+       (lambda (instance)
+         (magnus-coord--same-directory-p
+          (magnus-instance-directory instance) directory))
+       (magnus-instances-active-list))
+      (magnus-coord--pending-review-p directory)))
+
+(defun magnus-coord--maybe-stop-watching (directory)
+  "Stop DIRECTORY only after every agent and pending-review owner releases it."
+  (setq directory (magnus-coord--normalized-directory directory))
+  (when (and (member directory magnus-coord--watched-dirs)
+             (not (magnus-coord--project-owned-p directory)))
+    (magnus-coord-stop-watching directory)))
 
 (defvar magnus-coord--processed-mentions nil
   "Alist of (directory . list-of-processed-mention-hashes) to avoid duplicates.")
@@ -720,42 +848,135 @@ Each function receives DIRECTORY and a plist containing `:request-id',
   :group 'magnus)
 
 (defvar magnus-coord--review-ready-retries (make-hash-table :test #'equal)
-  "Retry state keyed by (DIRECTORY . MARKER-HASH).")
+  "Legacy marker retry state keyed by (DIRECTORY . MARKER-HASH).")
+
+(defvar magnus-coord--event-review-retries (make-hash-table :test #'equal)
+  "Exact event-review retry state keyed by (DIRECTORY . EVENT-ID).")
+
+(defvar magnus-coord--last-review-handler-error nil
+  "Most recent review handler error captured during synchronous dispatch.")
+
+(defun magnus-coord-review-retry-diagnostics (directory)
+  "Return read-only retry diagnostics for durable reviews in DIRECTORY."
+  (let (pending exhausted details)
+    (maphash
+     (lambda (key state)
+       (when (magnus-coord--same-directory-p (car key) directory)
+         (if (plist-get state :exhausted)
+             (progn
+               (push (cdr key) exhausted)
+               (push (list :kind 'event :event-id (cdr key)
+                           :last-error (plist-get state :last-error))
+                     details))
+           (push (cdr key) pending))))
+     magnus-coord--event-review-retries)
+    (maphash
+     (lambda (key state)
+       (when (magnus-coord--same-directory-p (car key) directory)
+         (if (plist-get state :exhausted)
+             (progn
+               (push (concat "legacy:" (cdr key)) exhausted)
+               (push (list :kind 'legacy :event-id (cdr key)
+                           :last-error (plist-get state :last-error))
+                     details))
+           (push (concat "legacy:" (cdr key)) pending))))
+     magnus-coord--review-ready-retries)
+    (list :pending-review-retry-count (length pending)
+          :exhausted-review-count (length exhausted)
+          :exhausted-review-event-ids (sort exhausted #'string<)
+          :exhausted-review-details
+          (sort details
+                (lambda (left right)
+                  (string< (plist-get left :event-id)
+                           (plist-get right :event-id)))))))
+
+(defun magnus-coord--reset-exhausted-review-retries (directory)
+  "Forget exhausted retry guards in DIRECTORY and return tagged IDs."
+  (let (remove)
+    (dolist (entry
+             (list (cons 'event magnus-coord--event-review-retries)
+                   (cons 'legacy magnus-coord--review-ready-retries)))
+      (let (keys)
+        (maphash
+         (lambda (key state)
+           (when (and (magnus-coord--same-directory-p (car key) directory)
+                      (plist-get state :exhausted))
+             (when-let ((timer (plist-get state :timer)))
+               (cancel-timer timer))
+             (push key keys)
+             (push (cons (car entry) (cdr key)) remove)))
+         (cdr entry))
+        (dolist (key keys) (remhash key (cdr entry)))))
+    remove))
 
 (defvar magnus-coord--poll-timer nil
   "Timer for polling coordination files for messages and control markers.")
 
 (defun magnus-coord-ensure-watchers ()
-  "Start polling for all directories with active instances.
-Call this on startup to ensure @mention and DM detection works for
+  "Start coordination runtimes for all directories with active instances.
+Call this on startup so legacy messages and immutable events are observed for
 instances restored from persistence."
-  (let ((dirs (delete-dups
-               (mapcar #'magnus-instance-directory (magnus-instances-list)))))
+  (add-hook 'magnus-instances-changed-hook #'magnus-coord--instances-changed)
+  (let ((dirs
+         (delete-dups
+          (mapcar (lambda (instance)
+                    (magnus-coord--normalized-directory
+                     (magnus-instance-directory instance)))
+                  (magnus-instances-active-list)))))
     (dolist (dir dirs)
-      (when (file-exists-p (magnus-coord-file-path dir))
-        (unless (member dir magnus-coord--watched-dirs)
-          (magnus-coord-start-watching dir)))))
+      (unless (member dir magnus-coord--watched-dirs)
+        (magnus-coord-start-watching dir))))
   (magnus-coord--start-poll-timer))
 
+(defun magnus-coord--seed-legacy-content (directory content)
+  "Seed legacy delivery deduplication for DIRECTORY from one CONTENT read."
+  (magnus-coord--cache-legacy-content directory content)
+  (magnus-coord--init-processed-mentions directory content)
+  (magnus-coord--init-processed-dms directory content)
+  (magnus-coord--init-processed-summons directory content)
+  ;; Review checkpoints are durable/idempotent and intentionally replay.
+  (magnus-coord--init-processed-review-ready directory content))
+
+(defun magnus-coord--consume-legacy-content (directory content)
+  "Consume every legacy effect for DIRECTORY from one CONTENT read."
+  (when magnus-coord-mention-notify
+    (magnus-coord--check-new-mentions directory content))
+  (magnus-coord--check-new-dms directory content)
+  (magnus-coord--check-new-summons directory content)
+  (magnus-coord--check-new-review-ready directory content))
+
 (defun magnus-coord-start-watching (directory)
-  "Start polling the coordination file in DIRECTORY for mentions and DMs."
-  (let ((file (magnus-coord-file-path directory)))
-    (when (file-exists-p file)
+  "Start observing legacy and event coordination in DIRECTORY.
+Calling this again refreshes durable events without reseeding legacy delivery
+state, so an in-flight mention cannot be silently reclassified as history."
+  (setq directory (magnus-coord--normalized-directory directory))
+  (unless (member directory magnus-coord--watched-dirs)
+    (let* ((file (magnus-coord-file-path directory))
+           (content (magnus-coord--read-legacy-content directory)))
       (cl-pushnew directory magnus-coord--watched-dirs :test #'equal)
-      ;; Seed mtime so first poll doesn't re-process everything
       (setf (alist-get directory magnus-coord--file-mtimes nil nil #'equal)
-            (file-attribute-modification-time (file-attributes file)))
-      ;; Initialize processed state from current content
-      (magnus-coord--init-processed-mentions directory)
-      (magnus-coord--init-processed-dms directory)
-      (magnus-coord--init-processed-summons directory)
-      (magnus-coord--init-processed-review-ready directory))))
+            (and (file-exists-p file)
+                 (file-attribute-modification-time (file-attributes file))))
+      (magnus-coord--seed-legacy-content directory content)))
+  (condition-case err
+      (magnus-coord--consume-runtime-result
+       directory (magnus-coord-runtime-start directory))
+    (error
+     (message "Magnus: event coordination startup failed for %s: %s"
+              directory (error-message-string err))))
+  (puthash (magnus-coord--normalized-directory directory)
+           (magnus-coord--lifecycle-signature directory)
+           magnus-coord--lifecycle-signatures)
+  (magnus-coord--start-poll-timer))
 
 (defun magnus-coord-stop-watching (directory)
   "Stop polling the coordination file in DIRECTORY."
+  (setq directory (magnus-coord--normalized-directory directory))
   (setq magnus-coord--watched-dirs (delete directory magnus-coord--watched-dirs))
   (setq magnus-coord--file-mtimes
         (assoc-delete-all directory magnus-coord--file-mtimes))
+  (setq magnus-coord--legacy-states
+        (assoc-delete-all directory magnus-coord--legacy-states))
   (setq magnus-coord--processed-mentions
         (assoc-delete-all directory magnus-coord--processed-mentions))
   (setq magnus-coord--processed-dms
@@ -764,6 +985,7 @@ instances restored from persistence."
         (assoc-delete-all directory magnus-coord--processed-summons))
   (setq magnus-coord--processed-review-ready
         (assoc-delete-all directory magnus-coord--processed-review-ready))
+  (magnus-coord-runtime-stop directory)
   (let (remove)
     (maphash
      (lambda (key state)
@@ -773,46 +995,58 @@ instances restored from persistence."
          (push key remove)))
      magnus-coord--review-ready-retries)
     (dolist (key remove)
-      (remhash key magnus-coord--review-ready-retries))))
+      (remhash key magnus-coord--review-ready-retries)))
+  (let (remove)
+    (maphash
+     (lambda (key state)
+       (when (equal (car key) directory)
+         (when-let ((timer (plist-get state :timer)))
+           (cancel-timer timer))
+         (push key remove)))
+     magnus-coord--event-review-retries)
+    (dolist (key remove)
+      (remhash key magnus-coord--event-review-retries)))
+  (when (and (null magnus-coord--watched-dirs)
+             magnus-coord--poll-timer)
+    (cancel-timer magnus-coord--poll-timer)
+    (setq magnus-coord--poll-timer nil)))
 
 (defun magnus-coord--start-poll-timer ()
   "Start the coordination file poll timer."
-  (unless magnus-coord--poll-timer
+  (when (and magnus-coord--watched-dirs
+             (null magnus-coord--poll-timer))
     (setq magnus-coord--poll-timer
           (run-with-timer 3 3 #'magnus-coord--poll-all))))
 
-(defvar magnus-coord--last-trim-time 0
-  "Timestamp of last log trim, for debouncing.")
-
 (defun magnus-coord--poll-all ()
-  "Poll all watched coordination files for new mentions, DMs, and summons.
-Also updates vterm buffer activity ticks for quiescence tracking."
+  "Poll watched projects for legacy messages and immutable events.
+Also update vterm buffer activity ticks for quiescence tracking."
   (magnus-coord--update-buffer-ticks)
   (dolist (directory magnus-coord--watched-dirs)
-    (let* ((file (magnus-coord-file-path directory))
-           (mtime (and (file-exists-p file)
-                       (file-attribute-modification-time
-                        (file-attributes file))))
-           (last-mtime (alist-get directory magnus-coord--file-mtimes
-                                  nil nil #'equal)))
-      (when (and mtime (not (equal mtime last-mtime)))
-        (setf (alist-get directory magnus-coord--file-mtimes nil nil #'equal)
-              mtime)
-        (condition-case err
-            (progn
-              (when magnus-coord-mention-notify
-                (magnus-coord--check-new-mentions directory))
-              (magnus-coord--check-new-dms directory)
-              (magnus-coord--check-new-summons directory)
-              (magnus-coord--check-new-review-ready directory)
-              ;; Trim logs every 3min when file is changing
-              (let ((now (float-time)))
-                (when (> (- now magnus-coord--last-trim-time) 180)
-                  (setq magnus-coord--last-trim-time now)
-                  (magnus-coord-trim-log directory))))
-          (error
-           (message "Magnus: coord poll error for %s: %s"
-                    directory (error-message-string err))))))))
+    (condition-case err
+        (let* ((file (magnus-coord-file-path directory))
+               (mtime (and (file-exists-p file)
+                           (file-attribute-modification-time
+                            (file-attributes file))))
+               (last-mtime
+                (alist-get directory magnus-coord--file-mtimes
+                           nil nil #'equal)))
+          (unless (equal mtime last-mtime)
+            (let ((content (magnus-coord--read-legacy-content directory)))
+              (magnus-coord--cache-legacy-content directory content)
+              (magnus-coord--consume-legacy-content directory content)
+              (setf (alist-get directory magnus-coord--file-mtimes
+                               nil nil #'equal)
+                    mtime))))
+      (error
+       (message "Magnus: legacy coord poll error for %s: %s"
+                directory (error-message-string err))))
+    (condition-case err
+        (magnus-coord--consume-runtime-result
+         directory (magnus-coord-runtime-refresh directory))
+      (error
+       (message "Magnus: event coord poll error for %s: %s"
+                directory (error-message-string err))))))
 
 (defun magnus-coord-stop-all-watchers ()
   "Stop all coordination file polling."
@@ -821,15 +1055,23 @@ Also updates vterm buffer activity ticks for quiescence tracking."
     (setq magnus-coord--poll-timer nil))
   (setq magnus-coord--watched-dirs nil)
   (setq magnus-coord--file-mtimes nil)
+  (setq magnus-coord--legacy-states nil)
   (setq magnus-coord--processed-mentions nil)
   (setq magnus-coord--processed-dms nil)
   (setq magnus-coord--processed-summons nil)
   (setq magnus-coord--processed-review-ready nil)
+  (clrhash magnus-coord--lifecycle-signatures)
   (maphash (lambda (_key state)
              (when-let ((timer (plist-get state :timer)))
                (cancel-timer timer)))
            magnus-coord--review-ready-retries)
-  (clrhash magnus-coord--review-ready-retries))
+  (clrhash magnus-coord--review-ready-retries)
+  (maphash (lambda (_key state)
+             (when-let ((timer (plist-get state :timer)))
+               (cancel-timer timer)))
+           magnus-coord--event-review-retries)
+  (clrhash magnus-coord--event-review-retries)
+  (magnus-coord-runtime-stop-all))
 
 (defun magnus-coord-shutdown ()
   "Stop every long-lived coordination resource.
@@ -837,6 +1079,8 @@ Safe to call after partial setup and safe to call more than once."
   (magnus-coord-stop-reminders)
   (magnus-coord-stop-all-watchers)
   (magnus-coord-stop-attention-tracking)
+  (remove-hook 'magnus-instances-changed-hook
+               #'magnus-coord--instances-changed)
   (remove-hook 'pre-command-hook #'magnus-coord--on-user-return)
   (when magnus-coord--attention-save-timer
     (cancel-timer magnus-coord--attention-save-timer)
@@ -847,26 +1091,48 @@ Safe to call after partial setup and safe to call more than once."
        (message "Magnus: could not flush attention data: %s"
                 (error-message-string err))))))
 
-(defun magnus-coord--init-processed-mentions (directory)
-  "Initialize processed mentions for DIRECTORY from current file content."
+(defun magnus-coord--read-legacy-content (directory)
+  "Read DIRECTORY's legacy coordination ingress once, or return nil."
   (let ((file (magnus-coord-file-path directory)))
     (when (file-exists-p file)
-      (let ((mentions (magnus-coord--extract-mentions
-                       (with-temp-buffer
-                         (insert-file-contents file)
-                         (buffer-string)))))
-        (setf (alist-get directory magnus-coord--processed-mentions nil nil #'equal)
-              (mapcar #'magnus-coord--mention-hash mentions))))))
+      (with-temp-buffer
+        (insert-file-contents file)
+        (buffer-string)))))
 
-(defun magnus-coord--check-new-mentions (directory)
-  "Check for new @mentions in DIRECTORY's coordination file."
-  (let* ((file (magnus-coord-file-path directory))
-         (content (when (file-exists-p file)
-                    (with-temp-buffer
-                      (insert-file-contents file)
-                      (buffer-string))))
-         (mentions (when content (magnus-coord--extract-mentions content)))
-         (processed (alist-get directory magnus-coord--processed-mentions nil nil #'equal)))
+(defun magnus-coord--parse-legacy-content (content)
+  "Parse already-read legacy coordination CONTENT."
+  (if content
+      (with-temp-buffer
+        (insert content)
+        (magnus-coord--parse-buffer))
+    (list :active nil :log nil :discoveries nil :decisions nil)))
+
+(defun magnus-coord--cache-legacy-content (directory content)
+  "Cache parsed legacy CONTENT for watched DIRECTORY."
+  (setf (alist-get directory magnus-coord--legacy-states nil nil #'equal)
+        (magnus-coord--parse-legacy-content content)))
+
+(cl-defun magnus-coord--init-processed-mentions
+    (directory &optional (content nil content-supplied-p))
+  "Initialize processed mentions for DIRECTORY from legacy CONTENT.
+Read the legacy ingress when CONTENT was not supplied."
+  (unless content-supplied-p
+    (setq content (magnus-coord--read-legacy-content directory)))
+  (when content
+    (let ((mentions (magnus-coord--extract-mentions content)))
+      (setf (alist-get directory magnus-coord--processed-mentions nil nil #'equal)
+            (mapcar #'magnus-coord--mention-hash mentions)))))
+
+(cl-defun magnus-coord--check-new-mentions
+    (directory &optional (content nil content-supplied-p))
+  "Check legacy CONTENT for new @mentions in DIRECTORY.
+Read the legacy ingress when CONTENT was not supplied."
+  (unless content-supplied-p
+    (setq content (magnus-coord--read-legacy-content directory)))
+  (let* ((mentions (when content (magnus-coord--extract-mentions content)))
+         (processed
+          (alist-get directory magnus-coord--processed-mentions
+                     nil nil #'equal)))
     (dolist (mention mentions)
       (let ((hash (magnus-coord--mention-hash mention)))
         (unless (member hash processed)
@@ -883,12 +1149,20 @@ Returns list of (agent-name . context-line) pairs."
     (with-temp-buffer
       (insert content)
       (goto-char (point-min))
-      (while (re-search-forward "@\\([a-zA-Z][-a-zA-Z0-9_]*\\)" nil t)
-        (let ((agent (match-string 1))
-              (line (buffer-substring-no-properties
-                     (line-beginning-position)
-                     (line-end-position))))
-          (push (cons agent line) mentions))))
+      (while (re-search-forward
+              "@\\(?:{\\([^}\n]+\\)}\\|\\([a-zA-Z][-a-zA-Z0-9_]*\\)\\)"
+              nil t)
+        (let* ((prefix
+                (buffer-substring-no-properties
+                 (line-beginning-position) (match-beginning 0)))
+               (agent (string-trim (or (match-string 1) (match-string 2))))
+               (line (buffer-substring-no-properties
+                      (line-beginning-position)
+                      (line-end-position))))
+          ;; Direct-message and summon envelopes have their own delivery
+          ;; paths; do not also turn their target token into a plain mention.
+          (unless (string-match-p "\\[\\(?:DM\\|SUMMON\\) \\'" prefix)
+            (push (cons agent line) mentions)))))
     (nreverse mentions)))
 
 (defun magnus-coord--mention-hash (mention)
@@ -907,14 +1181,16 @@ Returns list of (agent-name . context-line) pairs."
   "Find an instance with NAME working in DIRECTORY."
   (cl-find-if (lambda (inst)
                 (and (string= (magnus-instance-name inst) name)
-                     (string= (magnus-instance-directory inst) directory)))
+                     (magnus-coord--same-directory-p
+                      (magnus-instance-directory inst) directory)))
               (magnus-instances-list)))
 
 (defun magnus-coord--extract-sender-and-message (context-line)
   "Extract sender name and message from CONTEXT-LINE.
 Returns (sender . message) or nil."
   (when (string-match
-         "\\[.*?\\] \\([^:]+\\): .*?@[^ ]+ \\(.*\\)"
+         (concat "\\[.*?\\] \\([^:]+\\): .*?"
+                 "@\\(?:{[^}\n]+}\\|[^ ]+\\) \\(.*\\)")
          context-line)
     (let ((sender (match-string 1 context-line))
           (message (match-string 2 context-line)))
@@ -933,16 +1209,16 @@ Delivers the message content without commanding the agent."
 
 ;;; Agent-to-agent direct messages
 
-(defun magnus-coord--init-processed-dms (directory)
-  "Initialize processed DMs for DIRECTORY from current file content."
-  (let ((file (magnus-coord-file-path directory)))
-    (when (file-exists-p file)
-      (let ((dms (magnus-coord--extract-dms
-                  (with-temp-buffer
-                    (insert-file-contents file)
-                    (buffer-string)))))
-        (setf (alist-get directory magnus-coord--processed-dms nil nil #'equal)
-              (mapcar #'magnus-coord--dm-hash dms))))))
+(cl-defun magnus-coord--init-processed-dms
+    (directory &optional (content nil content-supplied-p))
+  "Initialize processed DMs for DIRECTORY from legacy CONTENT.
+Read the legacy ingress when CONTENT was not supplied."
+  (unless content-supplied-p
+    (setq content (magnus-coord--read-legacy-content directory)))
+  (when content
+    (let ((dms (magnus-coord--extract-dms content)))
+      (setf (alist-get directory magnus-coord--processed-dms nil nil #'equal)
+            (mapcar #'magnus-coord--dm-hash dms)))))
 
 (defun magnus-coord--extract-dms (content)
   "Extract all [DM @name] patterns from CONTENT.
@@ -952,9 +1228,9 @@ Returns list of (target sender message) tuples."
       (insert content)
       (goto-char (point-min))
       (while (re-search-forward
-              "\\[DM @\\([a-zA-Z][-a-zA-Z0-9_]*\\)\\][[:space:]]*\\(.*\\)"
+              "\\[DM @\\([^]\n]+\\)\\][[:space:]]*\\(.*\\)"
               nil t)
-        (let* ((target (match-string 1))
+        (let* ((target (string-trim (match-string 1)))
                (message (string-trim (match-string 2)))
                (line (buffer-substring-no-properties
                       (line-beginning-position)
@@ -968,15 +1244,16 @@ Returns list of (target sender message) tuples."
   "Create a hash for DM to track duplicates."
   (secure-hash 'md5 (format "%s:%s:%s" (nth 0 dm) (nth 1 dm) (nth 2 dm))))
 
-(defun magnus-coord--check-new-dms (directory)
-  "Check for new [DM @name] patterns in DIRECTORY's coordination file."
-  (let* ((file (magnus-coord-file-path directory))
-         (content (when (file-exists-p file)
-                    (with-temp-buffer
-                      (insert-file-contents file)
-                      (buffer-string))))
-         (dms (when content (magnus-coord--extract-dms content)))
-         (processed (alist-get directory magnus-coord--processed-dms nil nil #'equal)))
+(cl-defun magnus-coord--check-new-dms
+    (directory &optional (content nil content-supplied-p))
+  "Check legacy CONTENT for new direct messages in DIRECTORY.
+Read the legacy ingress when CONTENT was not supplied."
+  (unless content-supplied-p
+    (setq content (magnus-coord--read-legacy-content directory)))
+  (let* ((dms (when content (magnus-coord--extract-dms content)))
+         (processed
+          (alist-get directory magnus-coord--processed-dms
+                     nil nil #'equal)))
     (dolist (dm dms)
       (let ((hash (magnus-coord--dm-hash dm)))
         (unless (member hash processed)
@@ -1001,16 +1278,16 @@ DM is (target sender message)."
 
 (defvar magnus--summon-context)
 
-(defun magnus-coord--init-processed-summons (directory)
-  "Initialize processed summons for DIRECTORY from current file content."
-  (let ((file (magnus-coord-file-path directory)))
-    (when (file-exists-p file)
-      (let ((summons (magnus-coord--extract-summons
-                      (with-temp-buffer
-                        (insert-file-contents file)
-                        (buffer-string)))))
-        (setf (alist-get directory magnus-coord--processed-summons nil nil #'equal)
-              (mapcar #'magnus-coord--summon-hash summons))))))
+(cl-defun magnus-coord--init-processed-summons
+    (directory &optional (content nil content-supplied-p))
+  "Initialize processed summons for DIRECTORY from legacy CONTENT.
+Read the legacy ingress when CONTENT was not supplied."
+  (unless content-supplied-p
+    (setq content (magnus-coord--read-legacy-content directory)))
+  (when content
+    (let ((summons (magnus-coord--extract-summons content)))
+      (setf (alist-get directory magnus-coord--processed-summons nil nil #'equal)
+            (mapcar #'magnus-coord--summon-hash summons)))))
 
 (defun magnus-coord--extract-summons (content)
   "Extract all [SUMMON @name] patterns from CONTENT.
@@ -1020,9 +1297,9 @@ Returns list of (target sender reason) tuples."
       (insert content)
       (goto-char (point-min))
       (while (re-search-forward
-              "\\[SUMMON @\\([a-zA-Z][-a-zA-Z0-9_]*\\)\\][[:space:]]*\\(.*\\)"
+              "\\[SUMMON @\\([^]\n]+\\)\\][[:space:]]*\\(.*\\)"
               nil t)
-        (let* ((target (match-string 1))
+        (let* ((target (string-trim (match-string 1)))
                (reason (string-trim (match-string 2)))
                (line (buffer-substring-no-properties
                       (line-beginning-position)
@@ -1037,14 +1314,13 @@ Returns list of (target sender reason) tuples."
   (secure-hash 'md5 (format "%s:%s:%s"
                              (nth 0 summon) (nth 1 summon) (nth 2 summon))))
 
-(defun magnus-coord--check-new-summons (directory)
-  "Check for new [SUMMON @name] patterns in DIRECTORY's coordination file."
-  (let* ((file (magnus-coord-file-path directory))
-         (content (when (file-exists-p file)
-                    (with-temp-buffer
-                      (insert-file-contents file)
-                      (buffer-string))))
-         (summons (when content (magnus-coord--extract-summons content)))
+(cl-defun magnus-coord--check-new-summons
+    (directory &optional (content nil content-supplied-p))
+  "Check legacy CONTENT for new summon requests in DIRECTORY.
+Read the legacy ingress when CONTENT was not supplied."
+  (unless content-supplied-p
+    (setq content (magnus-coord--read-legacy-content directory)))
+  (let* ((summons (when content (magnus-coord--extract-summons content)))
          (processed (alist-get directory magnus-coord--processed-summons
                                nil nil #'equal)))
     (dolist (summon summons)
@@ -1113,20 +1389,24 @@ launching any work."
 Return non-nil when all handlers complete or permanently reject the marker, so
 an invalid immutable marker is consumed while a failed durable transition is
 left unprocessed for bounded retry."
-  (condition-case err
-      (progn
-        (run-hook-with-args 'magnus-coord-review-ready-hook directory marker)
-        t)
-    (magnus-review-checkpoint-rejected
-     (message "Magnus: ignored stale review checkpoint in %s — %s"
-              (file-name-nondirectory (directory-file-name directory))
-              (if (stringp (cadr err)) (cadr err)
-                (error-message-string err)))
-     t)
-    (error
-     (message "Magnus: review checkpoint handler failed for %s: %s"
-              directory (error-message-string err))
-     nil)))
+  (setq magnus-coord--last-review-handler-error nil)
+  (when magnus-coord-review-ready-hook
+    (condition-case err
+        (progn
+          (run-hook-with-args 'magnus-coord-review-ready-hook directory marker)
+          t)
+      (magnus-review-checkpoint-rejected
+       (message "Magnus: ignored stale review checkpoint in %s — %s"
+                (file-name-nondirectory (directory-file-name directory))
+                (if (stringp (cadr err)) (cadr err)
+                  (error-message-string err)))
+       t)
+      (error
+       (setq magnus-coord--last-review-handler-error
+             (error-message-string err))
+       (message "Magnus: review checkpoint handler failed for %s: %s"
+                directory magnus-coord--last-review-handler-error)
+       nil))))
 
 (defun magnus-coord--clear-review-ready-retry (directory hash)
   "Clear any pending retry for marker HASH in DIRECTORY."
@@ -1141,8 +1421,18 @@ left unprocessed for bounded retry."
   (let* ((key (cons directory hash))
          (state (gethash key magnus-coord--review-ready-retries))
          (count (or (plist-get state :count) 0)))
-    (when (and (< count magnus-coord-review-ready-retry-count)
-               (null (plist-get state :timer)))
+    (when magnus-coord--last-review-handler-error
+      (setq state
+            (plist-put state :last-error
+                       magnus-coord--last-review-handler-error)))
+    (cond
+     ((plist-get state :timer))
+     ((>= count magnus-coord-review-ready-retry-count)
+      (setq state (plist-put state :exhausted t))
+      (message
+       "Magnus: legacy review marker %s exhausted bounded retries; press g or diagnose"
+       hash))
+     (t
       (setq state (plist-put state :count (1+ count)))
       (setq state
             (plist-put
@@ -1155,43 +1445,175 @@ left unprocessed for bounded retry."
                   (when current
                     (puthash key (plist-put current :timer nil)
                              magnus-coord--review-ready-retries))
-                  (magnus-coord--check-new-review-ready directory))))))
-      (puthash key state magnus-coord--review-ready-retries))))
+                  (magnus-coord--check-new-review-ready directory))))))))
+    (puthash key state magnus-coord--review-ready-retries)))
 
-(defun magnus-coord--init-processed-review-ready (directory)
+(cl-defun magnus-coord--init-processed-review-ready
+    (directory &optional (content nil content-supplied-p))
   "Initialize checkpoint processing for DIRECTORY.
 Unlike conversational messages, checkpoint markers are safe to replay because
 the review lifecycle validates their request and attempt tokens.  Replaying
 them on startup lets a persisted awaiting-checkpoint review recover after an
-Emacs restart."
+Emacs restart.  Use already-read legacy CONTENT when supplied."
   (setf (alist-get directory magnus-coord--processed-review-ready
                    nil nil #'equal)
         nil)
   (when magnus-coord-review-ready-hook
-    (magnus-coord--check-new-review-ready directory)))
+    (if content-supplied-p
+        (magnus-coord--check-new-review-ready directory content)
+      (magnus-coord--check-new-review-ready directory))))
 
-(defun magnus-coord--check-new-review-ready (directory)
-  "Dispatch new REVIEW-READY markers found in DIRECTORY."
-  (let* ((file (magnus-coord-file-path directory))
-         (content (when (file-exists-p file)
-                    (with-temp-buffer
-                      (insert-file-contents file)
-                      (buffer-string))))
-         (markers (when content (magnus-coord--extract-review-ready content)))
+(cl-defun magnus-coord--check-new-review-ready
+    (directory &optional (content nil content-supplied-p))
+  "Dispatch new REVIEW-READY markers from legacy CONTENT in DIRECTORY.
+Read the legacy ingress when CONTENT was not supplied."
+  (unless content-supplied-p
+    (setq content (magnus-coord--read-legacy-content directory)))
+  (let* ((markers (when content
+                    (magnus-coord--extract-review-ready content)))
          (processed
           (alist-get directory magnus-coord--processed-review-ready
-                     nil nil #'equal)))
+                     nil nil #'equal))
+         resolved)
     (dolist (marker markers)
       (let ((hash (magnus-coord--review-ready-hash marker)))
         (unless (member hash processed)
           (if (magnus-coord--dispatch-review-ready directory marker)
               (progn
                 (magnus-coord--clear-review-ready-retry directory hash)
-                (push hash processed))
+                (push hash processed)
+                (setq resolved t))
             (magnus-coord--schedule-review-ready-retry directory hash)))))
     (setf (alist-get directory magnus-coord--processed-review-ready
                      nil nil #'equal)
-          processed)))
+          processed)
+    (when resolved
+      (magnus-coord--maybe-stop-watching directory))))
+
+;;; Immutable event effects
+
+(defun magnus-coord--event-log-content (record)
+  "Render coordination log RECORD once for existing message extractors."
+  (format "[%s] %s: %s"
+          (magnus-coord-state-log-record-created-at record)
+          (magnus-coord-state-log-record-writer-name record)
+          (replace-regexp-in-string
+           "[\r\n]+" " " (magnus-coord-state-log-record-message record))))
+
+(defun magnus-coord--deliver-event-log (directory record)
+  "Deliver conversational effects from immutable log RECORD in DIRECTORY."
+  (let ((content (magnus-coord--event-log-content record)))
+    (when magnus-coord-mention-notify
+      (dolist (mention (magnus-coord--extract-mentions content))
+        (magnus-coord--notify-mention directory mention)))
+    (dolist (dm (magnus-coord--extract-dms content))
+      (magnus-coord--deliver-dm directory dm))
+    (dolist (summon (magnus-coord--extract-summons content))
+      (run-with-idle-timer 5 nil
+                           #'magnus-coord--handle-summon directory summon))))
+
+(defun magnus-coord--event-review-marker (effect)
+  "Convert durable review EFFECT to the review subsystem's marker plist."
+  (list :request-id
+        (magnus-coord-state-review-effect-request-id effect)
+        :checkpoint-token
+        (magnus-coord-state-review-effect-checkpoint-token effect)
+        :base (magnus-coord-state-review-effect-base effect)
+        :head (magnus-coord-state-review-effect-head effect)
+        :writer-id (magnus-coord-state-review-effect-writer-id effect)
+        :event-id (magnus-coord-state-review-effect-event-id effect)))
+
+(defun magnus-coord--clear-event-review-retry (directory event-id)
+  "Clear exact EVENT-ID retry state for DIRECTORY."
+  (let* ((key (cons directory event-id))
+         (state (gethash key magnus-coord--event-review-retries)))
+    (when-let ((timer (plist-get state :timer)))
+      (cancel-timer timer))
+    (remhash key magnus-coord--event-review-retries)))
+
+(defun magnus-coord--settle-event-review (directory event-id)
+  "Settle EVENT-ID in DIRECTORY after its durable handler completes."
+  (condition-case err
+      (progn
+        (magnus-coord-runtime-settle-review directory event-id)
+        (magnus-coord--clear-event-review-retry directory event-id)
+        t)
+    (error
+     (setq magnus-coord--last-review-handler-error
+           (error-message-string err))
+     (message "Magnus: could not settle review event %s: %s"
+              event-id magnus-coord--last-review-handler-error)
+     nil)))
+
+(defun magnus-coord--schedule-event-review-retry
+    (directory event-id marker)
+  "Schedule a bounded exact retry for review EVENT-ID and MARKER."
+  (let* ((key (cons directory event-id))
+         (state (or (gethash key magnus-coord--event-review-retries)
+                    (list :marker marker :count 0)))
+         (count (or (plist-get state :count) 0)))
+    (when magnus-coord--last-review-handler-error
+      (setq state
+            (plist-put state :last-error
+                       magnus-coord--last-review-handler-error)))
+    (cond
+     ((plist-get state :timer))
+     ((>= count magnus-coord-review-ready-retry-count)
+      (setq state (plist-put state :exhausted t))
+      (message
+       "Magnus: review event %s exhausted bounded retries; press g or diagnose"
+       event-id))
+     (t
+      (setq state (plist-put state :count (1+ count)))
+      (setq state
+            (plist-put
+             state :timer
+             (run-with-timer magnus-coord-review-ready-retry-delay nil
+                             #'magnus-coord--retry-event-review
+                             directory event-id)))))
+    (puthash key state magnus-coord--event-review-retries)))
+
+(defun magnus-coord--retry-event-review (directory event-id)
+  "Retry the exact immutable review EVENT-ID in DIRECTORY."
+  (let* ((key (cons directory event-id))
+         (state (gethash key magnus-coord--event-review-retries))
+         (marker (plist-get state :marker)))
+    (when state
+      (puthash key (plist-put state :timer nil)
+               magnus-coord--event-review-retries)
+      (if (and (magnus-coord--dispatch-review-ready directory marker)
+               (magnus-coord--settle-event-review directory event-id))
+          (progn
+            (magnus-coord--maybe-stop-watching directory)
+            t)
+        (magnus-coord--schedule-event-review-retry
+         directory event-id marker)))))
+
+(defun magnus-coord--dispatch-event-review (directory effect)
+  "Dispatch durable review EFFECT from DIRECTORY exactly once or retry it."
+  (let* ((event-id (magnus-coord-state-review-effect-event-id effect))
+         (key (cons directory event-id)))
+    (when (and magnus-coord-review-ready-hook
+               (not (gethash key magnus-coord--event-review-retries)))
+      (let ((marker (magnus-coord--event-review-marker effect)))
+        (if (and (magnus-coord--dispatch-review-ready directory marker)
+                 (magnus-coord--settle-event-review directory event-id))
+            t
+          (magnus-coord--schedule-event-review-retry
+           directory event-id marker))))))
+
+(defun magnus-coord--consume-runtime-result (directory result)
+  "Deliver bounded effects from coordination runtime RESULT in DIRECTORY."
+  (dolist (record (magnus-coord-runtime-result-new-logs result))
+    (magnus-coord--deliver-event-log directory record))
+  (let ((reviews (magnus-coord-runtime-result-unresolved-reviews result)))
+    (dolist (effect reviews)
+      (magnus-coord--dispatch-event-review directory effect))
+    ;; Do this only after the complete result has been settled: tearing down a
+    ;; review-only runtime during the loop would strand sibling effects.
+    (when reviews
+      (magnus-coord--maybe-stop-watching directory)))
+  result)
 
 (defun magnus-coord--handle-summon (directory summon)
   "Handle a SUMMON request in DIRECTORY.
@@ -1216,7 +1638,7 @@ SUMMON is (target-name sender reason)."
       (when-let ((requester (magnus-coord--find-instance-by-name sender directory)))
         (magnus-coord-nudge-agent
          requester
-         (format "%s is already online — @mention them in .magnus-coord.md instead."
+         (format "%s is already online — publish an @mention through the coordination protocol instead."
                  target)
          "Magnus"))))))
 
@@ -1226,20 +1648,12 @@ SUMMON is (target-name sender reason)."
   (unwind-protect
       (magnus-process-create directory target)
     (setq magnus--summon-context nil))
-  (magnus-coord-add-log directory "Magnus"
-                         (format "Summoned %s (requested by %s: %s)"
-                                 target sender reason)))
+  (message "Magnus: summoned %s for %s (%s)" target sender reason))
 
 ;;; Session retrospectives
 
 (defvar magnus-coord--session-start-times (make-hash-table :test 'equal)
   "Hash: directory -> float-time when first agent joined this session.")
-
-(defvar magnus-coord--retro-generating nil
-  "Non-nil while a retro is being generated.")
-
-(defvar magnus-coord--retro-output ""
-  "Accumulated output from the retro generator process.")
 
 (defvar magnus-coord--latest-retro (make-hash-table :test 'equal)
   "Hash: directory -> path of the most recent retro file.")
@@ -1252,7 +1666,8 @@ SUMMON is (target-name sender reason)."
     (condition-case err
         (with-temp-buffer
           (call-process "git" nil t nil
-                        "log" "--oneline" (format "--since=%s" since))
+                        "log" "--oneline" "-n" "100"
+                        (format "--since=%s" since))
           (let ((output (string-trim (buffer-string))))
             (if (string-empty-p output) "No commits" output)))
       (error
@@ -1265,11 +1680,10 @@ Returns a plist with :log, :discoveries, :decisions, :git, :start, :end."
   (let* ((parsed (magnus-coord-parse directory))
          (log-entries (plist-get parsed :log))
          (decisions (plist-get parsed :decisions))
+         (discoveries (plist-get parsed :discoveries))
          (start-time (gethash directory magnus-coord--session-start-times))
          (git-log (when start-time
-                    (magnus-coord--git-log-since directory start-time)))
-         ;; Extract discoveries from the raw file
-         (discoveries (magnus-coord--extract-discoveries directory)))
+                    (magnus-coord--git-log-since directory start-time))))
     (list :log log-entries
           :discoveries discoveries
           :decisions decisions
@@ -1300,7 +1714,7 @@ Returns a plist with :log, :discoveries, :decisions, :git, :start, :end."
                            (plist-get e :time)
                            (plist-get e :agent)
                            (plist-get e :message)))
-                 (reverse entries) "\n")
+                 entries "\n")
     "No log entries"))
 
 (defun magnus-coord--retro-prompt (data)
@@ -1328,7 +1742,9 @@ Write a session retrospective with these sections:
 
 Keep it under 250 words. No filler."
           (magnus-coord--format-log-for-retro (plist-get data :log))
-          (or (plist-get data :discoveries) "None recorded")
+          (if (plist-get data :discoveries)
+              (mapconcat #'identity (plist-get data :discoveries) "\n")
+            "None recorded")
           (if (plist-get data :decisions)
               (mapconcat #'identity (plist-get data :decisions) "\n")
             "None recorded")
@@ -1336,38 +1752,28 @@ Keep it under 250 words. No filler."
 
 (defun magnus-coord-generate-retro (directory)
   "Generate a session retrospective for DIRECTORY asynchronously."
-  (when (and (not magnus-coord--retro-generating)
-             (bound-and-true-p magnus-claude-executable)
+  (setq directory (magnus-coord--normalized-directory directory))
+  (when (and (bound-and-true-p magnus-claude-executable)
              (executable-find magnus-claude-executable))
-    (let ((data (magnus-coord--collect-retro-data directory)))
-      (setq magnus-coord--retro-generating t
-            magnus-coord--retro-output "")
-      (condition-case err
-          (let ((process-environment
-                 (cl-remove-if
-                  (lambda (e) (string-prefix-p "CLAUDECODE=" e))
-                  process-environment)))
-            (let ((proc (make-process
-                         :name "magnus-retro-gen"
-                         :command (magnus--headless-command
-                                       (magnus-coord--retro-prompt data))
-                         :connection-type 'pipe
-                         :filter (lambda (_proc output)
-                                   (setq magnus-coord--retro-output
-                                         (concat magnus-coord--retro-output output)))
-                         :sentinel (lambda (_proc event)
-                                     (let ((status (string-trim event)))
-                                       (if (string-prefix-p "finished" status)
-                                           (magnus-coord--save-retro
-                                            directory magnus-coord--retro-output data)
-                                         (message "Magnus retro: generator %s" status))
-                                       (setq magnus-coord--retro-generating nil))))))
-              ;; Close stdin so claude doesn't block waiting for input
-              (when (process-live-p proc)
-                (process-send-eof proc))))
-        (error
-         (setq magnus-coord--retro-generating nil)
-         (message "Magnus retro: %s" (error-message-string err)))))))
+    (let* ((data (magnus-coord--collect-retro-data directory))
+           (key (list 'coord-retro directory)))
+      (magnus-background-submit
+       key 'claude
+       (list :purpose 'agent
+             :directory directory
+             :prompt (magnus-coord--retro-prompt data)
+             :allowed-tools ""
+             :model (and (boundp 'magnus-headless-model)
+                         magnus-headless-model)
+             :name "session-retro")
+       (list
+        :on-complete
+        (lambda (result)
+          (when (plist-get result :success-p)
+            (magnus-coord--save-retro
+             directory
+             (magnus--strip-thinking-markers (plist-get result :output))
+             data))))))))
 
 (defun magnus-coord--save-retro (directory content data)
   "Save retro CONTENT for DIRECTORY with session DATA metadata."
@@ -1422,7 +1828,8 @@ If no agents are running, shows the most recent saved retro."
                   (magnus-coord--get-directory)))
          (has-agents (cl-some
                       (lambda (inst)
-                        (and (string= (magnus-instance-directory inst) dir)
+                        (and (magnus-coord--same-directory-p
+                              (magnus-instance-directory inst) dir)
                              (eq (magnus-instance-status inst) 'running)))
                       (magnus-instances-list))))
     (if has-agents
@@ -1497,111 +1904,164 @@ If no agents are running, shows the most recent saved retro."
   (with-temp-file file
     (insert (magnus-coord--instructions-content directory))))
 
+(defconst magnus-coord--git-exclude-patterns
+  '("/.magnus-coord/" "/.claude/magnus-instructions.md")
+  "Generated Magnus paths that should stay out of ordinary Git staging.")
+
+(defun magnus-coord--git-path (directory path)
+  "Return Git's resolved PATH for repository DIRECTORY, or nil."
+  (when (executable-find "git")
+    (with-temp-buffer
+      (when (zerop (process-file "git" nil t nil
+                                 "-C" directory "rev-parse" "--git-path" path))
+        (let ((result (string-trim (buffer-string))))
+          (unless (string-empty-p result)
+            (if (file-name-absolute-p result)
+                result
+              (expand-file-name result directory))))))))
+
+(defun magnus-coord--ensure-git-excludes (directory)
+  "Locally exclude generated coordination paths in Git DIRECTORY.
+This updates Git's repository-local `info/exclude', never the tracked root
+`.gitignore'.  Return non-nil for a Git worktree, including when every pattern
+was already present."
+  (when-let ((file (magnus-coord--git-path directory "info/exclude")))
+    (let ((parent (file-name-directory file))
+          (existing ""))
+      (when (or (file-symlink-p parent) (not (file-directory-p parent)))
+        (error "Unsafe Git exclude directory: %s" parent))
+      (when (or (file-symlink-p file) (file-directory-p file))
+        (error "Unsafe Git exclude path: %s" file))
+      (when (file-exists-p file)
+        (when (> (file-attribute-size (file-attributes file)) (* 1024 1024))
+          (error "Git exclude file is unexpectedly large: %s" file))
+        (with-temp-buffer
+          (insert-file-contents file)
+          (setq existing (buffer-string))))
+      (let* ((lines (split-string existing "\n" t))
+             (missing
+              (cl-remove-if (lambda (pattern) (member pattern lines))
+                            magnus-coord--git-exclude-patterns)))
+        (when missing
+          (let ((coding-system-for-write 'utf-8-unix))
+            (write-region
+             (concat
+              (unless (or (string-empty-p existing)
+                          (string-suffix-p "\n" existing))
+                "\n")
+              "# Magnus generated local state\n"
+              (mapconcat #'identity missing "\n") "\n")
+             nil file t 'quiet))))
+    t)))
+
 (defun magnus-coord--instructions-content (_directory)
   "Generate instructions content."
   (format "# Magnus Coordination Protocol
 
-You are one of multiple Claude Code agents working on this project.
-To coordinate with other agents, follow this protocol:
+Magnus may run Claude and Codex agents together. Coordination is an immutable,
+per-writer event stream; no agent rewrites a shared state file.
 
-## Before Starting Work
+## Read First
 
-1. Read `%s` to see what other agents are working on
-2. Check the Active Work table for potential conflicts
-3. If your work might conflict, discuss in the Log section first
+1. Read applicable project guidance and inspect existing work.
+2. Read `.magnus-coord/current.md` when present. It is generated and read-only.
+3. Read legacy `.magnus-coord.md` when present. Older sessions may still write
+   there, so it remains valid ingress during migration.
+4. Check Active Work for overlap before editing. Resolve conflicts through a
+   `log.append` event before touching another agent's claimed files.
 
-## Announcing Your Work
+The generated view may lag by a few seconds. Never edit `current.md`.
 
-When you start a task, update the Active Work table:
+## Durable Identity
 
-```markdown
-| your-name | area you're working on | in-progress | file1.ts, file2.ts |
+Your terminal exports:
+
+- `MAGNUS_COORD_WRITER_ID`: your immutable Magnus instance UUID
+- `MAGNUS_COORD_WRITER_NAME`: your human display name
+
+Use the UUID as `writer_id` for every event, even if your display name changes.
+Your inbox is `.magnus-coord/writers/$MAGNUS_COORD_WRITER_ID/`.
+
+## Publishing One Event
+
+Every final `*.json` file is immutable. Never edit, replace, or delete one.
+
+1. Inspect every final event in your own inbox. Find the greatest positive
+   `writer_sequence`; the next sequence is that value plus one (or 1 when the
+   inbox is empty). If any existing final file cannot be safely parsed, stop and
+   report it instead of guessing. Never run two writers with the same UUID.
+2. Choose a globally unique, path-safe event ID using only letters, digits,
+   `_`, `.`, `:`, and `-`. The final filename must be `<event-id>.json`.
+3. Create a private temporary file named `.magnus-event-tmp-*` in that same
+   writer inbox. Write exactly one JSON object, flush/close it, and use mode 600.
+4. Atomically create the unique final name without replacement (a hard-link
+   create from the temporary file has these semantics), then delete the
+   temporary name. A collision requires a new ID and a newly encoded envelope.
+5. Do not edit the generated view. Magnus validates, reduces, projects, and
+   eventually garbage-collects superseded evidence.
+
+The envelope has exactly these fields:
+
+```json
+{
+  \"schema\": 1,
+  \"id\": \"<event-id>\",
+  \"writer_id\": \"<MAGNUS_COORD_WRITER_ID>\",
+  \"writer_name\": \"<MAGNUS_COORD_WRITER_NAME>\",
+  \"writer_sequence\": 1,
+  \"created_at\": \"2026-08-04T12:34:56.123456Z\",
+  \"kind\": \"log.append\",
+  \"payload\": {\"message\": \"Starting work\"}
+}
 ```
 
-## Communicating
+`created_at` is canonical UTC with exactly six fractional digits. It helps
+display independent writers; only `writer_sequence` establishes your causal
+order.
 
-To talk to other agents, append to the Log section:
+## Exact Event Payloads
 
-```markdown
-[HH:MM] your-name: Your message here. @other-agent if you need their attention.
-```
+- `log.append`: `{\"message\": \"...\"}`
+- `active.set`: `{\"area\": \"...\", \"status\": \"in-progress\",
+  \"files\": [\"path/one\", \"path/two\"]}`
+- `active.clear`: `{}`
+- `knowledge.put`: `{\"section\": \"discoveries\"|\"decisions\",
+  \"entry_id\": \"stable-id\", \"text\": \"...\"}`
+- `knowledge.remove`: `{\"section\": \"discoveries\"|\"decisions\",
+  \"entry_id\": \"stable-id\"}`
+- `review.ready`: `{\"request_id\": \"...\", \"checkpoint_token\": \"...\",
+  \"base\": \"<full Git object ID>\", \"head\": \"<full Git object ID>\"}`
 
-**Note:** When you @mention another agent, they will automatically receive a
-notification with your message. You don't need to wait for them to check the file.
+Payloads accept no extra fields. Put `@agent` (or `@{display name}` when the
+name contains spaces), `[DM @display name]`, `[SUMMON @display name]`, and
+`[ATTENTION]` conventions inside `log.append` messages when needed.
 
-## Sharing What You Learn
+Publish `active.set` before substantive edits, with the files you expect to
+touch. Publish `active.clear` when releasing them. Use stable knowledge
+`entry_id` values so a later put updates that entry and a remove tombstones it.
 
-As you work, you will discover things — API quirks, gotchas, patterns, or
-non-obvious behavior in the codebase. Add these to the **Discoveries** section
-of the coordination file. Other agents read this, and your insight might save
-them hours. Think of it as leaving breadcrumbs for your teammates.
+An already-running legacy session without `MAGNUS_COORD_WRITER_ID` may continue
+using `.magnus-coord.md`; do not invent a writer UUID. New sessions must use
+events. No plugin or skill is required.
 
-## When You Finish
+## Finishing and Authority
 
-1. Update your row in Active Work (status: done, or remove it)
-2. Log a message that you've finished
-3. Add any non-obvious learnings to the Discoveries section
-4. If you made decisions that affect others, add to the Decisions section
-5. When you commit, include context in your commit message — what you learned,
-   why you made the choices you did, any gotchas future developers should know.
-   Commit messages are the permanent record; the coordination file is ephemeral.
+Publish completion and release events, preserve useful discoveries/decisions,
+and update your first-person memory. Coordination context does not authorize
+commits, pushes, deployments, destructive actions, external messages, or
+unrelated changes.
 
-## Conflict Resolution
+## User-Visible Engineering Journal
 
-If you need a file another agent is using:
-1. Post in the Log asking if they can release it
-2. Wait for their response before proceeding
-3. If urgent, explain why in your message
-
-## Requesting User Attention
-
-When you need user input (permissions, confirmations, etc.):
-1. BEFORE asking, announce in the Log: `[HH:MM] your-name: [ATTENTION] Need user input for <reason>`
-2. Wait briefly for other agents to finish their current attention requests
-3. Other agents should pause requests when they see another agent waiting
-4. After receiving input, log: `[HH:MM] your-name: [ATTENTION] Done, input received`
-
-This prevents multiple agents from asking for input simultaneously.
-
-## Thinking Out Loud
-
-As of Claude Code v2.1.29, Anthropic encrypts thinking traces — your internal
-reasoning is hidden from the user. For multi-agent coordination this is a
-critical loss: the user cannot see why you made a decision, catch a wrong
-assumption early, or redirect you before you waste an hour.
-
-To restore transparency, always structure your output with explicit markers:
-
-[thinking]
-Raw, unfiltered reasoning goes here. Not a summary. Not polished for
-presentation. Your actual thought process — doubts, dead ends, corrections,
-the messy path from confusion to clarity.
-[end-thinking]
-
-[response]
-Your actual response to the user or action you're taking.
-[end-response]
-
-Both markers are required on every message, even one-liners.
-
-Use [thinking] as your mental scratchpad. Do not be conservative — write out
-your full reasoning, even when it's messy or uncertain. On hard problems, your
-thinking should be long — hundreds or thousands of words of working through the
-problem. \"I think X because... wait, but that contradicts Y... let me
-re-read... ah, the issue is actually Z.\" That is what the user needs to see.
-Not \"I will now analyze the code\" — that is narration, not thinking.
-
-The scratchpad is where you do real work. Scribble freely.
-
-## Important Files
-
-- Coordination: `%s`
-- Shared context: `.magnus-context.md` (if exists)
-
-Remember: Check the coordination file periodically, especially before major changes.
+For substantive user-facing messages, put a candid engineering decision journal
+inside `[thinking]...[end-thinking]`, then the answer inside
+`[response]...[end-response]`. State useful hypotheses, evidence, uncertainty,
+constraints, alternatives, tradeoffs, contradictions, and corrections. This is
+an explicit collaborative journal; never claim it is private or raw
+chain-of-thought. Keep it proportional and omit empty narration.
 
 <!-- magnus-instructions-version: %d -->
-" magnus-coord-file magnus-coord-file magnus-coord--instructions-version))
+" magnus-coord--instructions-version))
 
 ;;; Coordination skill
 
@@ -1664,22 +2124,95 @@ When you run /coordinate, perform these steps in order:
 
 ;;; Parsing coordination file
 
+(defun magnus-coord--parse-legacy (directory)
+  "Parse DIRECTORY's legacy ingress without consulting event state."
+  (setq directory (magnus-coord--normalized-directory directory))
+  (let ((cached (assoc directory magnus-coord--legacy-states)))
+    (if cached
+        (cdr cached)
+      (magnus-coord--parse-legacy-content
+       (magnus-coord--read-legacy-content directory)))))
+
+(defun magnus-coord--event-time (created-at)
+  "Return a compact display time from canonical CREATED-AT."
+  (if (and (stringp created-at)
+           (string-match "T\\([0-9][0-9]:[0-9][0-9]\\):" created-at))
+      (match-string 1 created-at)
+    (or created-at "")))
+
+(defun magnus-coord--event-active-entry (record)
+  "Convert active state RECORD to the legacy display plist shape."
+  (list :agent (magnus-coord-state-active-record-writer-name record)
+        :writer-id (magnus-coord-state-active-record-writer-id record)
+        :area (magnus-coord-state-active-record-area record)
+        :status (magnus-coord-state-active-record-status record)
+        :files (string-join
+                (magnus-coord-state-active-record-files record) ", ")
+        :event-id (magnus-coord-state-active-record-event-id record)))
+
+(defun magnus-coord--event-log-entry (record)
+  "Convert coordination log RECORD to the legacy display plist shape."
+  (list :time
+        (magnus-coord--event-time
+         (magnus-coord-state-log-record-created-at record))
+        :created-at (magnus-coord-state-log-record-created-at record)
+        :agent (magnus-coord-state-log-record-writer-name record)
+        :writer-id (magnus-coord-state-log-record-writer-id record)
+        :message (magnus-coord-state-log-record-message record)
+        :event-id (magnus-coord-state-log-record-event-id record)))
+
 (defun magnus-coord-parse (directory)
-  "Parse the coordination file in DIRECTORY.
-Returns a plist with :active, :log, and :decisions."
-  (let ((file (magnus-coord-file-path directory)))
-    (if (file-exists-p file)
-        (with-temp-buffer
-          (insert-file-contents file)
-          (magnus-coord--parse-buffer))
-      (list :active nil :log nil :decisions nil))))
+  "Return merged event and legacy coordination state for DIRECTORY.
+Event tombstones suppress a same-name legacy Active Work row.  The legacy file
+remains read-compatible ingress but is never rewritten by this merge.  Log
+entries are returned in chronological order.  Legacy entries precede event
+entries because the immutable store is the migration successor to that
+compatibility ingress."
+  (setq directory (magnus-coord--normalized-directory directory))
+  (let* ((legacy (magnus-coord--parse-legacy directory))
+         (state (magnus-coord-runtime-current-state directory))
+         (winners (and state (magnus-coord-state-active-winners state)))
+         (managed-names
+          (mapcar #'magnus-coord-state-active-record-writer-name winners))
+         (legacy-active
+          (cl-remove-if
+           (lambda (entry)
+             (member (plist-get entry :agent) managed-names))
+           (plist-get legacy :active)))
+         (event-active
+          (mapcar #'magnus-coord--event-active-entry
+                  (and state (magnus-coord-state-visible-active state))))
+         (event-log
+          (mapcar #'magnus-coord--event-log-entry
+                  (and state (magnus-coord-state-logs state))))
+         ;; `magnus-coord-add-log' inserts at the top of the legacy section,
+         ;; whereas the event reducer is chronological.  Normalize once at
+         ;; the read boundary so every consumer has the same contract.
+         (legacy-log (reverse (copy-sequence (plist-get legacy :log))))
+         (event-decisions
+          (mapcar #'magnus-coord-state-knowledge-record-text
+                  (and state (magnus-coord-state-decisions state))))
+         (event-discoveries
+          (mapcar #'magnus-coord-state-knowledge-record-text
+                  (and state (magnus-coord-state-discoveries state)))))
+    (list :active (append legacy-active event-active)
+          :log (append legacy-log event-log)
+          :decisions
+          (delete-dups (append (plist-get legacy :decisions)
+                               event-decisions))
+          :discoveries
+          (delete-dups (append (plist-get legacy :discoveries)
+                               event-discoveries))
+          :event-state state)))
 
 (defun magnus-coord--parse-buffer ()
   "Parse the current buffer as a coordination file."
   (let ((active (magnus-coord--parse-active-table))
         (log (magnus-coord--parse-log))
+        (discoveries (magnus-coord--parse-list-section "Discoveries"))
         (decisions (magnus-coord--parse-decisions)))
-    (list :active active :log log :decisions decisions)))
+    (list :active active :log log
+          :discoveries discoveries :decisions decisions)))
 
 (defun magnus-coord--parse-active-table ()
   "Parse the Active Work table from current buffer."
@@ -1718,15 +2251,25 @@ Returns a plist with :active, :log, and :decisions."
                   entries))))
       (nreverse entries))))
 
-(defun magnus-coord--parse-decisions ()
-  "Parse the Decisions section from current buffer."
+(defun magnus-coord--parse-list-section (heading)
+  "Parse Markdown list entries below section HEADING in the current buffer."
   (save-excursion
     (goto-char (point-min))
     (let (entries)
-      (when (re-search-forward "^## Decisions" nil t)
-        (while (re-search-forward "^- \\(.+\\)$" nil t)
-          (push (match-string 1) entries)))
+      (when (re-search-forward
+             (format "^## %s[[:space:]]*$" (regexp-quote heading)) nil t)
+        (let ((section-end
+               (save-excursion
+                 (if (re-search-forward "^## " nil t)
+                     (match-beginning 0)
+                   (point-max)))))
+          (while (re-search-forward "^- \\(.+\\)$" section-end t)
+            (push (match-string 1) entries))))
       (nreverse entries))))
+
+(defun magnus-coord--parse-decisions ()
+  "Parse the Decisions section from current buffer."
+  (magnus-coord--parse-list-section "Decisions"))
 
 ;;; Writing to coordination file
 
@@ -1822,7 +2365,8 @@ with stale statuses like done, died, finished, completed, stopped."
          (live-names (mapcar #'magnus-instance-name
                              (cl-remove-if-not
                               (lambda (inst)
-                                (string= (magnus-instance-directory inst) directory))
+                                (magnus-coord--same-directory-p
+                                 (magnus-instance-directory inst) directory))
                               (magnus-instances-list)))))
     (when (file-exists-p file)
       (with-temp-buffer
@@ -1845,42 +2389,103 @@ with stale statuses like done, died, finished, completed, stopped."
 (defun magnus-coord-reconcile-all ()
   "Reconcile coordination files for all project directories."
   (let ((dirs (delete-dups
-               (mapcar #'magnus-instance-directory (magnus-instances-list)))))
+               (mapcar
+                (lambda (instance)
+                  (magnus-coord--normalized-directory
+                   (magnus-instance-directory instance)))
+                (magnus-instances-list)))))
     (dolist (dir dirs)
       (magnus-coord-reconcile dir))))
+
+(defun magnus-coord-refresh (directory)
+  "Refresh canonical coordination state for DIRECTORY and deliver new effects.
+The immutable event store is reduced once when its cheap revision changes.
+The historical Markdown ingress is not rewritten."
+  (setq directory (magnus-coord--normalized-directory directory))
+  (let ((rearmed (magnus-coord--reset-exhausted-review-retries directory)))
+    (when rearmed
+      (message "Magnus: re-armed %d exhausted review checkpoint retr%s in %s"
+               (length rearmed) (if (= (length rearmed) 1) "y" "ies")
+               (file-name-nondirectory
+                (directory-file-name directory))))
+    (prog1
+        (magnus-coord--consume-runtime-result
+         directory (magnus-coord-runtime-refresh directory))
+      (when (cl-find 'legacy rearmed :key #'car)
+        (magnus-coord--check-new-review-ready directory)))))
+
+(defun magnus-coord-refresh-all ()
+  "Refresh canonical coordination state for every active or watched project.
+Return an alist of project directories and refresh results.  A failure in one
+project is reported without preventing healthy siblings from refreshing."
+  (let ((directories
+         (delete-dups
+          (append (copy-sequence magnus-coord--watched-dirs)
+                  (mapcar
+                   (lambda (instance)
+                     (magnus-coord--normalized-directory
+                      (magnus-instance-directory instance)))
+                   (magnus-instances-active-list)))))
+        results)
+    (dolist (directory directories)
+      (condition-case err
+          (push (cons directory (magnus-coord-refresh directory)) results)
+        (error
+         (message "Magnus: coordination refresh failed for %s: %s"
+                  directory (error-message-string err)))))
+    (nreverse results)))
+
+(defun magnus-coord-current-path (directory)
+  "Return DIRECTORY's generated coordination-view path without creating it."
+  (expand-file-name "current.md" (magnus-coord-store-directory directory)))
+
+(defun magnus-coord-has-state-p (directory)
+  "Return non-nil when DIRECTORY has cached, generated, or legacy state.
+This predicate performs no event scan, reduction, projection, or delivery."
+  (or (magnus-coord-runtime-current-state directory)
+      (file-exists-p (magnus-coord-file-path directory))
+      (condition-case err
+          (file-exists-p (magnus-coord-current-path directory))
+        (error
+         (message "Magnus: cannot inspect coordination state for %s: %s"
+                  directory (error-message-string err))
+         nil))))
 
 ;;; Agent registration
 
 (defun magnus-coord-register-agent (directory instance)
-  "Register INSTANCE as active in DIRECTORY's coordination file."
-  (let ((name (magnus-instance-name instance)))
-    (magnus-coord-ensure-file directory)
+  "Register INSTANCE's durable event identity in DIRECTORY."
+  (setq directory (magnus-coord--normalized-directory directory))
+  (let ((writer-id (magnus-instance-id instance)))
+    (add-hook 'magnus-instances-changed-hook #'magnus-coord--instances-changed)
     (magnus-coord-ensure-instructions directory)
-    (magnus-coord-ensure-skill directory)
-    (magnus-coord-add-log directory name "Joined the session")
-    ;; Start polling for @mentions and DMs if not already
+    (condition-case err
+        (magnus-coord--ensure-git-excludes directory)
+      (error
+       (message "Magnus: could not install local Git excludes for %s: %s"
+                directory (error-message-string err))))
+    (magnus-coord-store-ensure-writer-directory directory writer-id)
     (unless (member directory magnus-coord--watched-dirs)
       (magnus-coord-start-watching directory))
-    ;; Track session start time for retrospectives
     (unless (gethash directory magnus-coord--session-start-times)
       (puthash directory (float-time) magnus-coord--session-start-times))))
 
 (defun magnus-coord-unregister-agent (directory instance)
-  "Unregister INSTANCE from DIRECTORY's coordination file."
-  (let ((name (magnus-instance-name instance)))
-    (magnus-coord-clear-agent directory name)
-    (magnus-coord-add-log directory name "Left the session")
-    ;; If no agents remain, clean up for next session
-    (let ((remaining (cl-count-if
-                      (lambda (inst)
-                        (and (not (eq inst instance))
-                             (string= (magnus-instance-directory inst) directory)))
-                      (magnus-instances-list))))
-      (when (zerop remaining)
-        (magnus-coord-generate-retro directory)
-        (remhash directory magnus-coord--session-start-times)
-        (magnus-coord-stop-watching directory)
-        (magnus-coord-mark-session-end directory)))))
+  "Release Magnus's runtime ownership for INSTANCE in DIRECTORY.
+The agent owns its append-only `active.clear' and completion events.  Magnus
+does not forge a sequence on its behalf while its process may still be live."
+  (setq directory (magnus-coord--normalized-directory directory))
+  (let ((remaining
+         (cl-count-if
+          (lambda (other)
+            (and (not (eq other instance))
+                 (magnus-coord--same-directory-p
+                  (magnus-instance-directory other) directory)))
+          (magnus-instances-active-list))))
+    (when (zerop remaining)
+      (magnus-coord-generate-retro directory)
+      (remhash directory magnus-coord--session-start-times)
+      (magnus-coord--maybe-stop-watching directory))))
 
 ;;; Display
 
@@ -1901,11 +2506,17 @@ with stale statuses like done, died, finished, completed, stopped."
          "\n")
       (propertize "  No active work" 'face 'magnus-status-empty-hint))))
 
+(defun magnus-coord-recent-log (entries limit)
+  "Return the most recent LIMIT chronological log ENTRIES.
+The returned entries retain chronological order."
+  (let ((drop (- (length entries) (max 0 limit))))
+    (if (> drop 0) (nthcdr drop entries) entries)))
+
 (defun magnus-coord-format-log (parsed &optional limit)
   "Format the :log entries from PARSED for display.
 Show at most LIMIT entries (default 5)."
   (let* ((log (plist-get parsed :log))
-         (entries (if limit (seq-take log limit) log)))
+         (entries (if limit (magnus-coord-recent-log log limit) log)))
     (if entries
         (mapconcat
          (lambda (entry)
@@ -1920,9 +2531,18 @@ Show at most LIMIT entries (default 5)."
 ;;; Interactive commands
 
 (defun magnus-coord-open (directory)
-  "Open the coordination file for DIRECTORY."
+  "Open DIRECTORY's legacy coordination ingress, creating it if necessary."
   (interactive (list (magnus-coord--get-directory)))
   (find-file (magnus-coord-ensure-file directory)))
+
+(defun magnus-coord-open-current (directory)
+  "Refresh and open DIRECTORY's generated coordination view read-only."
+  (interactive (list (magnus-coord--get-directory)))
+  (magnus-coord-refresh directory)
+  (let ((file (magnus-coord-current-path directory)))
+    (unless (file-exists-p file)
+      (user-error "No generated coordination view is available"))
+    (find-file-read-only file)))
 
 (defun magnus-coord-open-instructions (directory)
   "Open the instructions file for DIRECTORY."
