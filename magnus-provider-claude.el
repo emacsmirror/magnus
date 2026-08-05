@@ -116,16 +116,26 @@
 (defun magnus-claude-headless-agent-spec (request)
   "Return a Claude fire-and-forget agent specification for REQUEST."
   (let ((allowed-tools (plist-get request :allowed-tools))
+        (model (magnus-claude--option-string (plist-get request :model)))
         (name (magnus-claude--option-string (plist-get request :name)))
         (prompt (plist-get request :prompt)))
-    (unless (and (stringp allowed-tools)
-                 (not (string-empty-p allowed-tools)))
+    (unless (and (plist-member request :allowed-tools)
+                 (stringp allowed-tools))
       (user-error "Claude headless agents require configured allowed tools"))
     (list
-     :command (list magnus-claude-executable
-                    "--print" prompt
-                    "--output-format" "stream-json"
-                    "--allowedTools" allowed-tools)
+     :command
+     (append
+      (list magnus-claude-executable
+            "--print" prompt
+            "--verbose"
+            "--output-format" "stream-json")
+      (when model (list "--model" model))
+      ;; An explicitly empty tool set is the narrow capability needed by
+      ;; background summarizers.  Omitting the field remains an error, so a
+      ;; caller can never gain the CLI's default tools by accident.
+      (if (string-empty-p allowed-tools)
+          (list "--tools" "")
+        (list "--allowedTools" allowed-tools)))
      :environment (magnus-claude--headless-environment)
      :decoder #'magnus-claude-headless-decode-event
      :success-requires '(terminal)

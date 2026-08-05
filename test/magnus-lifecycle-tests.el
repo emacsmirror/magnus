@@ -17,6 +17,7 @@
          ((symbol-function 'magnus--migrate-data-files) #'ignore)
          ((symbol-function 'magnus-persistence-load) #'ignore)
          ((symbol-function 'magnus--agents-index-load) #'ignore)
+         ((symbol-function 'magnus-background-setup) #'ignore)
          ((symbol-function 'magnus-review-load-all) #'ignore)
          ((symbol-function 'magnus-persistence--setup-autosave) #'ignore)
          ((symbol-function 'magnus-review-controller-setup) #'ignore)
@@ -41,6 +42,8 @@
           (lambda () (push 'coord teardowns)))
          ((symbol-function 'magnus-health-shutdown)
           (lambda () (push 'health teardowns)))
+         ((symbol-function 'magnus-background-shutdown)
+          (lambda () (push 'background teardowns)))
          ((symbol-function 'magnus-attention-shutdown)
           (lambda () (push 'attention teardowns)))
          ((symbol-function 'magnus-context-shutdown)
@@ -53,7 +56,8 @@
     (should-not continued)
     (should
      (equal (nreverse teardowns)
-            '(review status trace coord health attention context persistence)))
+            '(review status trace coord health background
+                     attention context persistence)))
     (should-not (memq #'magnus--shutdown kill-emacs-hook))))
 
 (ert-deftest magnus-shutdown-continues-after-subsystem-failure ()
@@ -75,6 +79,8 @@
           (lambda () (push 'coord calls)))
          ((symbol-function 'magnus-health-shutdown)
           (lambda () (push 'health calls)))
+         ((symbol-function 'magnus-background-shutdown)
+          (lambda () (push 'background calls)))
          ((symbol-function 'magnus-attention-shutdown)
           (lambda () (push 'attention calls)))
          ((symbol-function 'magnus-context-shutdown)
@@ -85,7 +91,8 @@
       (magnus--shutdown))
     (should
      (equal (nreverse calls)
-            '(review status trace coord health attention context persistence)))
+            '(review status trace coord health background
+                     attention context persistence)))
     (should-not magnus--initialized)
     (should-not (memq #'magnus--shutdown kill-emacs-hook))))
 

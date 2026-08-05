@@ -525,6 +525,7 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
      (equal command
             (list magnus-claude-executable
                   "--print" "Implement it"
+                  "--verbose"
                   "--output-format" "stream-json"
                   "--allowedTools" "Read Write Edit Glob Grep Bash")))
     (should (equal (plist-get spec :success-requires) '(terminal)))

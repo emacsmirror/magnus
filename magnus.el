@@ -4,7 +4,7 @@
 
 ;; Author: Hrishikesh S <hrish2006@gmail.com>
 ;; Maintainer: Hrishikesh S <hrish2006@gmail.com>
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "28.1") (vterm "0.0.2") (transient "0.4.0") (magit-section "3.3.0"))
 ;; Keywords: tools, processes, convenience
 ;; URL: https://github.com/hrishikeshs/magnus
@@ -32,15 +32,19 @@
 
 ;;; Commentary:
 
-;; Magnus is a magit-inspired interface for managing Claude Code and Codex
-;; agents within Emacs.  It provides a status buffer showing active instances,
-;; durable cross-provider reviews, and transient menus for quick actions.
+;; Magnus is a Magit-inspired interface for hands-on management of Claude Code
+;; and Codex agents in Emacs.  Interactive agents retain their native terminal
+;; UIs while Magnus supplies durable identities, shared onboarding, lifecycle
+;; management, attention and health monitoring, and multiwriter coordination.
+;; Committed work can be sent to a headless reviewer from either provider and
+;; read as a structured, folding Git diff.
 ;;
 ;; Main entry point: M-x magnus
+;; Installation diagnostics: M-x magnus-doctor
 ;;
 ;; Key bindings in magnus buffer:
 ;;   RET - Visit instance or review
-;;   c   - Create new instance
+;;   c   - Create a Claude Code instance
 ;;   k   - Archive instance
 ;;   r   - Rename instance
 ;;   v   - Request an independent review
@@ -89,6 +93,9 @@
 (declare-function magnus-attention-shutdown "magnus-attention")
 (declare-function magnus-health-shutdown "magnus-health")
 (declare-function magnus-trace-stop-timer "magnus-trace")
+(declare-function magnus-background-submit "magnus-background")
+(declare-function magnus-background-setup "magnus-background")
+(declare-function magnus-background-shutdown "magnus-background")
 
 (defvar magnus-context-directory)
 (defvar magnus-context-cache-directory)
@@ -164,6 +171,11 @@ Stored in ~/.magnus/ so it survives Emacs config resets."
   :type 'file
   :group 'magnus)
 
+(defcustom magnus-agents-index-memory-limit (* 64 1024)
+  "Maximum bytes read from an agent memory file for expertise indexing."
+  :type 'integer
+  :group 'magnus)
+
 (defcustom magnus-instance-name-generator #'magnus-generate-instance-name
   "Function to generate names for new instances.
 Takes the working directory as argument and returns a string."
@@ -221,7 +233,9 @@ Plist with :sender and :reason, bound during agent-initiated summoning.")
 When `magnus--creation-task' is set, uses AI to match the task
 against dormant agent memories for smart resurrection.  Falls back
 to most-recent resurrection, then random name generation."
-  (let ((existing (mapcar #'magnus-instance-name (magnus-instances-list))))
+  (let ((existing
+         (append (mapcar #'magnus-instance-name (magnus-instances-list))
+                 (magnus-instances-reserved-names directory))))
     (or (when magnus--creation-task
           (magnus--smart-resurrect directory existing magnus--creation-task))
         (magnus--resurrect-dormant-identity directory existing)
@@ -462,51 +476,52 @@ Returns (NAME . REASON) if a valid match was found, or nil."
 
 (defun magnus--agents-index-update (instance)
   "Update the expertise index for INSTANCE asynchronously.
-Reads the agent's memory file and extracts expertise keywords via haiku."
+Reads a bounded prefix of the agent's memory and queues one text-only model
+call.  All Magnus background work is serialized, so archiving many agents does
+not launch many provider processes at once."
   (let* ((name (magnus-instance-name instance))
+         (instance-id (magnus-instance-id instance))
          (directory (magnus-instance-directory instance))
          (memory-path (magnus-process--agent-memory-path instance)))
-    (when (and (file-exists-p memory-path)
+    (when (and (stringp memory-path)
+               (file-exists-p memory-path)
                (bound-and-true-p magnus-claude-executable)
                (executable-find magnus-claude-executable))
       (let* ((memory (with-temp-buffer
-                       (insert-file-contents memory-path)
+                       (insert-file-contents
+                        memory-path nil 0
+                        (max 0 magnus-agents-index-memory-limit))
                        (buffer-string)))
              (prompt (format "Read this agent memory and extract 3-5 expertise \
 keywords that describe what this agent knows. Reply with ONLY comma-separated \
 lowercase keywords, nothing else.\n\nMemory:\n%s" memory))
-             (process-environment
-              (cl-remove-if
-               (lambda (e) (string-prefix-p "CLAUDECODE=" e))
-               process-environment)))
-        (condition-case err
-            (let ((proc (make-process
-                         :name (format "magnus-index-%s" name)
-                         :command (magnus--headless-command prompt t)
-                         :connection-type 'pipe
-                         :filter (lambda (proc output)
-                                   (process-put
-                                    proc :output
-                                    (concat (or (process-get proc :output) "")
-                                            output)))
-                         :sentinel (magnus--agents-index-sentinel
-                                    directory name))))
-              (when (process-live-p proc)
-                (process-send-eof proc)))
-          (error (message "Magnus: index update error for %s: %s"
-                          name (error-message-string err))))))))
-
-(defun magnus--agents-index-sentinel (directory name)
-  "Return a process sentinel for indexing agent NAME in DIRECTORY."
-  (lambda (proc event)
-    (let ((status (string-trim event)))
-      (if (string-prefix-p "finished" status)
-          (let ((tags (magnus--sanitize-expertise
-                       (or (process-get proc :output) ""))))
-            (unless (string-empty-p tags)
-              (magnus--agents-index-set directory name tags)
-              (message "Magnus: indexed %s → %s" name tags)))
-        (message "Magnus: indexing %s failed: %s" name status)))))
+             (key (list 'expertise instance-id)))
+        (magnus-background-submit
+         key 'claude
+         (list :purpose 'agent
+               :directory directory
+               :prompt prompt
+               :allowed-tools ""
+               :model magnus-headless-model
+               :name (format "index-%s" name))
+         (list
+          :on-complete
+          (lambda (result)
+            (when (plist-get result :success-p)
+              (let ((current (magnus-instances-get instance-id))
+                    (tags
+                     (magnus--sanitize-expertise
+                      (plist-get result :output))))
+                ;; A queued archive job may finish after a transactional rename
+                ;; or directory move.  Never publish metadata under its stale
+                ;; identity; the next archive/reindex can submit fresh evidence.
+                (when (and current
+                           (equal name (magnus-instance-name current))
+                           (equal directory
+                                  (magnus-instance-directory current))
+                           (not (string-empty-p tags)))
+                  (magnus--agents-index-set directory name tags)
+                  (message "Magnus: indexed %s → %s" name tags)))))))))))
 
 (defun magnus--strip-thinking-markers (raw)
   "Strip [thinking]...[end-thinking] blocks and marker lines from RAW.
@@ -597,6 +612,7 @@ them now; new agents populate once their memory file exists."
             (require 'magnus-instances)
             (require 'magnus-persistence)
             (require 'magnus-process)
+            (require 'magnus-background)
             (require 'magnus-context)
             (require 'magnus-coord)
             (require 'magnus-attention)
@@ -609,6 +625,7 @@ them now; new agents populate once their memory file exists."
             (magnus--migrate-data-files)
             (magnus-persistence-load)
             (magnus--agents-index-load)
+            (magnus-background-setup)
             ;; Reviews must be reconstructed before the controller attaches its
             ;; hooks.  Controller setup then rebuilds the durable queue and
             ;; synchronously replays checkpoints before the general watcher.
@@ -695,6 +712,7 @@ Return non-nil when FUNCTION completed successfully or is unavailable."
                  magnus-trace-stop-timer
                  magnus-coord-shutdown
                  magnus-health-shutdown
+                 magnus-background-shutdown
                  magnus-attention-shutdown
                  magnus-context-shutdown
                  magnus-persistence-shutdown))
