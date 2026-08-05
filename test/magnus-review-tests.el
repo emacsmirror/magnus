@@ -26,9 +26,12 @@
   (unless (eq state 'queued)
     (list (magnus-test-review--attempt-for-state state token))))
 
-(ert-deftest magnus-review-worktree-update-defined-at-load-time ()
-  "Guard against accidentally nesting the update defun inside create."
-  (should (fboundp 'magnus-review-worktree-update)))
+(ert-deftest magnus-review-checkout-has-one-public-operation ()
+  (should (fboundp 'magnus-review-ensure-checkout))
+  (dolist (removed '(magnus-review-worktree-create
+                     magnus-review-worktree-update
+                     magnus-review-worktree-repair))
+    (should-not (fboundp removed))))
 
 (ert-deftest magnus-review-anchors-real-a-b-and-unicode-paths ()
   (dolist (fixture
@@ -344,6 +347,47 @@
       (delete-directory root t)
       (delete-directory storage t))))
 
+(ert-deftest magnus-review-ready-marker-requires-current-committed-work ()
+  (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-committed-ready-" t))
+               (magnus-review-directory-root storage)
+               (magnus-reviews nil)
+               (magnus-reviews-changed-hook nil))
+    (unwind-protect
+        (let* ((review
+                (magnus-review-create
+                 root "author-id" "quick-wren"
+                 :id "committed-ready" :task "Review committed work"
+                 :reviewer-name "keen-owl" :reviewer-provider 'codex))
+               (marker
+                (list :request-id (magnus-review-id review)
+                      :checkpoint-token (magnus-review-checkpoint-token review)
+                      :base base :head head)))
+          (with-temp-file (expand-file-name "sample.el" root)
+            (insert "uncommitted change\n"))
+          (let ((err
+                 (should-error
+                  (magnus-review-handle-ready-marker root marker)
+                  :type 'magnus-review-error)))
+            (should
+             (string-match-p
+              (regexp-quote magnus-review-uncommitted-message)
+              (error-message-string err))))
+          (should-not (magnus-review-rounds review))
+          (magnus-test-review--git root "add" "--" "sample.el")
+          (magnus-test-review--git root "commit" "--quiet" "-m" "advance")
+          (let ((new-head (magnus-test-review--git root "rev-parse" "HEAD")))
+            (should-error
+             (magnus-review-handle-ready-marker root marker)
+             :type 'magnus-review-error)
+            (should-not (magnus-review-rounds review))
+            (setq marker (plist-put marker :head new-head))
+            (should
+             (magnus-review-round-p
+              (magnus-review-handle-ready-marker root marker)))))
+      (delete-directory root t)
+      (delete-directory storage t))))
+
 (ert-deftest magnus-review-event-for-unloaded-request-remains-retryable ()
   "Durable checkpoint evidence survives a missing or unreadable manifest."
   (let ((magnus-reviews nil)
@@ -400,6 +444,244 @@
       (magnus-test-review--git root "add" "--" "sample.el")
       (magnus-test-review--git root "commit" "--quiet" "-m" "head")
       (list root base (magnus-test-review--git root "rev-parse" "HEAD")))))
+
+(defun magnus-test-review--checkout-review (root id)
+  "Return a review fixture for ROOT with durable ID."
+  (let ((root (magnus-review--canonical-directory root)))
+    (magnus-review--create
+     :id id :project-root root
+     :project-hash (magnus-review-compute-project-hash root))))
+
+(ert-deftest magnus-review-ensure-checkout-creates-reuses-and-updates ()
+  (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-checkout-" t))
+               (magnus-review-directory-root storage)
+               (review (magnus-test-review--checkout-review
+                        root "ensure-checkout"))
+               (checkout (magnus-review-checkout-path review))
+               (legacy-marker
+                (expand-file-name "worktree-owner.json"
+                                  (magnus-review-directory review))))
+    (unwind-protect
+        (progn
+          (should (equal (magnus-review-ensure-checkout review base)
+                         checkout))
+          (should (file-directory-p checkout))
+          (should-not (file-symlink-p checkout))
+          (should (string=
+                   (magnus-review-git-root checkout)
+                   (magnus-review--canonical-directory checkout)))
+          (should (string=
+                   (magnus-review--git-common-directory checkout)
+                   (magnus-review--git-common-directory root)))
+          (should (string= (magnus-review-resolve-oid checkout "HEAD") base))
+          (should-not
+           (magnus-review--git-output-optional
+            checkout "symbolic-ref" "--quiet" "HEAD"))
+          (should-not (magnus-review-worktree-dirty-status checkout))
+          (with-temp-file legacy-marker
+            (insert "legacy marker must remain inert\n"))
+          (let ((legacy-bytes
+                 (magnus-test-review--file-string legacy-marker)))
+            (should (equal (magnus-review-ensure-checkout review base)
+                           checkout))
+            (should (equal (magnus-test-review--file-string legacy-marker)
+                           legacy-bytes))
+            (should (equal (magnus-review-ensure-checkout review head)
+                           checkout))
+            (should (equal (magnus-test-review--file-string legacy-marker)
+                           legacy-bytes)))
+          (should (string= (magnus-review-resolve-oid checkout "HEAD") head))
+          (should-not (magnus-review-worktree-dirty-status checkout)))
+      (delete-directory storage t)
+      (delete-directory root t))))
+
+(ert-deftest magnus-review-ensure-checkout-refuses-and-preserves-dirt ()
+  (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-dirty-checkout-" t))
+               (magnus-review-directory-root storage)
+               (review (magnus-test-review--checkout-review
+                        root "dirty-checkout"))
+               (checkout (magnus-review-checkout-path review))
+               (tracked (expand-file-name "sample.el" checkout))
+               (untracked (expand-file-name "local-notes.txt" checkout)))
+    (unwind-protect
+        (progn
+          (magnus-review-ensure-checkout review base)
+          (with-temp-file tracked
+            (insert "locally modified tracked contents\n"))
+          (with-temp-file untracked
+            (insert "untracked contents\n"))
+          (should-error (magnus-review-ensure-checkout review head)
+                        :type 'magnus-review-error)
+          (should (string= (magnus-review-resolve-oid checkout "HEAD") base))
+          (should (equal (magnus-test-review--file-string tracked)
+                         "locally modified tracked contents\n"))
+          (should (equal (magnus-test-review--file-string untracked)
+                         "untracked contents\n")))
+      (delete-directory storage t)
+      (delete-directory root t))))
+
+(ert-deftest magnus-review-ensure-checkout-refuses-ignored-files ()
+  (pcase-let* ((`(,root ,_base ,_head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-ignored-checkout-" t))
+               (magnus-review-directory-root storage)
+               (review (magnus-test-review--checkout-review
+                        root "ignored-checkout")))
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name ".gitignore" root)
+            (insert "secret.env\n"))
+          (magnus-test-review--git root "add" "--" ".gitignore")
+          (magnus-test-review--git root "commit" "--quiet" "-m" "ignore secret")
+          (let* ((head (magnus-test-review--git root "rev-parse" "HEAD"))
+                 (checkout (magnus-review-ensure-checkout review head))
+                 (secret (expand-file-name "secret.env" checkout)))
+            (with-temp-file secret (insert "not committed\n"))
+            (should-error (magnus-review-ensure-checkout review head)
+                          :type 'magnus-review-error)
+            (should (equal (magnus-test-review--file-string secret)
+                           "not committed\n"))))
+      (delete-directory storage t)
+      (delete-directory root t))))
+
+(ert-deftest magnus-review-round-checkouts-never-share-mutable-state ()
+  (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-round-checkouts-" t))
+               (magnus-review-directory-root storage)
+               (review (magnus-test-review--checkout-review
+                        root "round-checkouts"))
+               (round-one (magnus-review-round--create
+                           :number 1 :base-oid base :head-oid base))
+               (round-two (magnus-review-round--create
+                           :number 2 :base-oid base :head-oid head))
+               (checkout-one
+                (magnus-review-round-checkout-path review round-one))
+               (checkout-two
+                (magnus-review-round-checkout-path review round-two)))
+    (unwind-protect
+        (progn
+          (should-not (equal checkout-one checkout-two))
+          (should (equal (magnus-review-ensure-checkout review base round-one)
+                         checkout-one))
+          (should (equal (magnus-review-ensure-checkout review head round-two)
+                         checkout-two))
+          (should (string= (magnus-review-resolve-oid checkout-one "HEAD") base))
+          (should (string= (magnus-review-resolve-oid checkout-two "HEAD") head))
+          (should-error (magnus-review-ensure-checkout review head round-one)
+                        :type 'magnus-review-error)
+          (should (string= (magnus-review-resolve-oid checkout-one "HEAD") base)))
+      (delete-directory storage t)
+      (delete-directory root t))))
+
+(ert-deftest magnus-review-round-checkout-refuses-symlinked-parent ()
+  (pcase-let* ((`(,root ,_base ,head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-round-parent-" t))
+               (target (make-temp-file "magnus-review-round-target-" t))
+               (magnus-review-directory-root storage)
+               (review (magnus-test-review--checkout-review
+                        root "round-parent"))
+               (round (magnus-review-round--create
+                       :number 1 :base-oid head :head-oid head))
+               (checkout (magnus-review-round-checkout-path review round))
+               (parent (directory-file-name (file-name-directory checkout)))
+               (sentinel (expand-file-name "sentinel" target)))
+    (unwind-protect
+        (progn
+          (magnus-review--ensure-review-directories review)
+          (with-temp-file sentinel (insert "preserve me\n"))
+          (make-symbolic-link target parent)
+          (should-error (magnus-review-ensure-checkout review head round)
+                        :type 'magnus-review-error)
+          (should (file-symlink-p parent))
+          (should (equal (magnus-test-review--file-string sentinel)
+                         "preserve me\n")))
+      (when (file-symlink-p parent) (delete-file parent))
+      (delete-directory storage t)
+      (delete-directory target t)
+      (delete-directory root t))))
+
+(ert-deftest magnus-review-ensure-checkout-refuses-symlink-entry ()
+  (pcase-let* ((`(,root ,_base ,head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-symlink-checkout-" t))
+               (target (make-temp-file "magnus-review-symlink-target-" t))
+               (magnus-review-directory-root storage)
+               (review (magnus-test-review--checkout-review
+                        root "symlink-checkout"))
+               (checkout (magnus-review-checkout-path review))
+               (sentinel (expand-file-name "sentinel" target)))
+    (unwind-protect
+        (progn
+          (magnus-review--ensure-review-directories review)
+          (with-temp-file sentinel (insert "preserve me\n"))
+          (make-symbolic-link target checkout)
+          (should-error (magnus-review-ensure-checkout review head)
+                        :type 'magnus-review-error)
+          (should (file-symlink-p checkout))
+          (should (equal (magnus-test-review--file-string sentinel)
+                         "preserve me\n")))
+      (when (file-symlink-p checkout)
+        (delete-file checkout))
+      (delete-directory storage t)
+      (delete-directory target t)
+      (delete-directory root t))))
+
+(ert-deftest magnus-review-ensure-checkout-refuses-another-repository ()
+  (pcase-let* ((`(,root ,_base ,head) (magnus-test-review--repository))
+               (`(,other-root ,_other-base ,other-head)
+                (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-foreign-checkout-" t))
+               (magnus-review-directory-root storage)
+               (review (magnus-test-review--checkout-review
+                        root "foreign-checkout"))
+               (checkout (magnus-review-checkout-path review)))
+    (unwind-protect
+        (progn
+          (magnus-review--ensure-review-directories review)
+          (magnus-test-review--git
+           other-root "worktree" "add" "--detach" checkout other-head)
+          (should-error (magnus-review-ensure-checkout review head)
+                        :type 'magnus-review-error)
+          (should (file-directory-p checkout))
+          (should (string=
+                   (magnus-review--git-common-directory checkout)
+                   (magnus-review--git-common-directory other-root)))
+          (should (string=
+                   (magnus-review-resolve-oid checkout "HEAD") other-head)))
+      (delete-directory storage t)
+      (delete-directory other-root t)
+      (delete-directory root t))))
+
+(ert-deftest magnus-review-ensure-checkout-accepts-settled-concurrent-winner ()
+  (pcase-let* ((`(,root ,_base ,head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-raced-checkout-" t))
+               (magnus-review-directory-root storage)
+               (review (magnus-test-review--checkout-review
+                        root "raced-checkout"))
+               (checkout (magnus-review-checkout-path review))
+               (git-output (symbol-function 'magnus-review--git-output))
+               (raced nil))
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'magnus-review--git-output)
+              (lambda (directory &rest arguments)
+                (if (and (not raced)
+                         (equal arguments
+                                (list "worktree" "add" "--detach"
+                                      checkout head)))
+                    (progn
+                      (setq raced t)
+                      (apply git-output directory arguments)
+                      (signal 'magnus-review-git-error
+                              '("simulated concurrent loser")))
+                  (apply git-output directory arguments)))))
+          (should (equal (magnus-review-ensure-checkout review head)
+                         checkout))
+          (should raced)
+          (should (string= (magnus-review-resolve-oid checkout "HEAD") head))
+          (should-not (magnus-review-worktree-dirty-status checkout)))
+      (delete-directory storage t)
+      (delete-directory root t))))
 
 (defun magnus-test-review--unchanged-acknowledgements (review)
   "Return REVIEW's canonical unchanged checkpoint token/round pairs."
@@ -835,6 +1117,9 @@
               (should (eq (magnus-review-execution review)
                           'waiting-for-checkpoint))
               (should (= (length (magnus-review-rounds review)) 1))
+              ;; The direct marker below models the ignored durable event
+              ;; transport, not this untracked legacy-ingress test fixture.
+              (delete-file file)
               (let ((round-two
                      (magnus-review-handle-ready-marker
                       root (list :request-id (magnus-review-id review)
@@ -939,7 +1224,10 @@
                        (list candidate exact-request
                              (magnus-review-checkpoint-request-token
                               exact-request)))
-                 t)))
+                 t))
+              ((symbol-function
+                'magnus-review-controller--require-committed-work)
+               #'ignore))
       (should (eq (magnus-review-rereview review) review)))
     (should (equal delivered (list review request token)))
     (should (equal (magnus-review-checkpoint-token review) token))))
@@ -970,7 +1258,14 @@
              message))
     (should (string-match-p
              (regexp-quote "$MAGNUS_COORD_WRITER_ID") message))
-    (should (string-match-p (regexp-quote "author-uuid") message))))
+    (should (string-match-p (regexp-quote "author-uuid") message))
+    (should (string-match-p
+             (regexp-quote
+              "Do not modify files or create another commit")
+             message))
+    (should (string-match-p
+             (regexp-quote "tell the user to ask you to commit first")
+             message))))
 
 (ert-deftest magnus-review-checkpoint-recovery-delivers-only-pending-request ()
   (let* ((request
@@ -1608,6 +1903,70 @@
     (should (eq (magnus-review-controller--provider author 'opposite)
                 'claude))))
 
+(ert-deftest magnus-review-request-refuses-uncommitted-work-before-allocation ()
+  (pcase-let* ((`(,root ,_base ,_head) (magnus-test-review--repository))
+               (author
+                (magnus-instance--create
+                 :id "dirty-author" :name "quick-wren" :provider 'claude
+                 :directory root))
+               (magnus-reviews nil)
+               (provider-checked nil)
+               (reviewer-selected nil)
+               (review-created nil))
+    (unwind-protect
+        (let ((context (magnus-review-request-context author)))
+          (with-temp-file (expand-file-name "sample.el" root)
+            (insert "uncommitted change\n"))
+          (cl-letf
+              (((symbol-function 'magnus-provider-symbol-operation-p)
+                (lambda (&rest _arguments)
+                  (setq provider-checked t)
+                  t))
+               ((symbol-function
+                 'magnus-review-controller--reviewer-selection)
+                (lambda (&rest _arguments)
+                  (setq reviewer-selected t)
+                  (list :name "keen-owl")))
+               ((symbol-function 'magnus-review-create)
+                (lambda (&rest _arguments)
+                  (setq review-created t))))
+            (let ((err
+                   (should-error
+                    (magnus-review-request author :context context)
+                    :type 'user-error)))
+              (should
+               (equal (error-message-string err)
+                      "work is uncommitted. Ask instance to commit first"))))
+          (should-not provider-checked)
+          (should-not reviewer-selected)
+          (should-not review-created)
+          (should-not magnus-reviews))
+      (delete-directory root t))))
+
+(ert-deftest magnus-review-request-rejects-a-context-from-the-authors-old-root ()
+  (pcase-let* ((`(,old-root ,_old-base ,_old-head)
+                (magnus-test-review--repository))
+               (`(,new-root ,_new-base ,_new-head)
+                (magnus-test-review--repository))
+               (author
+                (magnus-instance--create
+                 :id "moving-author" :name "quick-wren" :provider 'claude
+                 :directory old-root))
+               (magnus-reviews nil)
+               (context (magnus-review-request-context author)))
+    (unwind-protect
+        (progn
+          (setf (magnus-instance-directory author) new-root)
+          (let ((err
+                 (should-error
+                  (magnus-review-request author :context context)
+                  :type 'user-error)))
+            (should
+             (equal (error-message-string err)
+                    "Review request context is stale; request it again"))))
+      (delete-directory old-root t)
+      (delete-directory new-root t))))
+
 (ert-deftest magnus-review-request-context-describes-the-exact-existing-action ()
   (let ((author
          (magnus-instance--create
@@ -1802,8 +2161,10 @@
 
 (ert-deftest magnus-review-start-cleanup-errors-do-not-escape ()
   (let* ((review (magnus-review--create
-                  :id "start-cleanup" :reviewer-name "wise-deer"))
-         (round (magnus-review-round--create :number 1))
+                  :id "start-cleanup" :reviewer-name "wise-deer"
+                  :project-hash (make-string 64 ?a)))
+         (round (magnus-review-round--create
+                 :number 1 :head-oid magnus-test-review--head-oid))
          (attempt (magnus-review-attempt--create
                    :number 1 :token "0123456789abcdef"
                    :execution 'starting))
@@ -1811,7 +2172,7 @@
           (make-hash-table :test #'equal)))
     (cl-letf (((symbol-function 'magnus-review-append-attempt)
                (lambda (&rest _args) attempt))
-              ((symbol-function 'magnus-review-worktree-create)
+              ((symbol-function 'magnus-review-ensure-checkout)
                (lambda (&rest _args) (error "worktree launch failed")))
               ((symbol-function 'magnus-review-fail-attempt)
                (lambda (&rest _args) (error "manifest is read-only"))))

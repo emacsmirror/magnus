@@ -141,8 +141,10 @@ Emacs normally consumes `ESC` as a Meta prefix. In Magnus terminal buffers,
 
 Put point on an author agent in `*magnus*` and press `v RET`. Magnus then:
 
-1. asks the author to finish and commit a coherent checkpoint;
-2. records the exact base and head Git object IDs;
+1. requires a clean author worktree, otherwise telling you to ask the instance
+   to commit first;
+2. asks the author to publish its current committed checkpoint and records the
+   exact base and head Git object IDs;
 3. assigns a durable reviewer identity, reusing existing expertise matching
    when possible;
 4. chooses the provider opposite the author by default;
@@ -152,6 +154,10 @@ Put point on an author agent in `*magnus*` and press `v RET`. Magnus then:
 The request popup offers optional provider (`p`), model (`m`), and reasoning
 effort (`e`) overrides. Reviews run one at a time by default, keeping laptop
 load predictable; customize `magnus-review-max-concurrent` if desired.
+
+Reviewers run in private detached checkouts derived from the immutable round
+number and HEAD. Different rounds never share a mutable worktree, and Magnus
+rejects tracked, untracked, or ignored residue in a managed checkout.
 
 Each raw JSONL or stderr artifact is capped by
 `magnus-review-max-stream-artifact-bytes` (8 MiB by default); a sibling

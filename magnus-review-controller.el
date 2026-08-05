@@ -828,9 +828,10 @@ the message; callers include stable idempotency keys for replay."
      (concat
       "[MAGNUS-REVIEW-CHECKPOINT request=%s checkpoint=%s]\n"
       "Prepare checkpoint request #%d for an independent review of: %s\n\n"
-      "Finish the coherent work that belongs to this task, run appropriate "
-      "validation, and commit only your own changes. Preserve unrelated dirty "
-      "work. Infer the task's upstream merge-base and current committed HEAD; "
+      "Magnus reviews committed work only. Do not modify files or create "
+      "another commit for this checkpoint. If the "
+      "worktree is now dirty, stop and tell the user to ask you to commit "
+      "first. Infer the task's upstream merge-base and current committed HEAD; "
       "Magnus's current suggestion is base=%s head=%s. Verify them yourself.\n\n"
       "Then publish exactly one immutable `review.ready' event using the "
       "protocol in .claude/magnus-instructions.md. Use your next durable "
@@ -883,17 +884,17 @@ request is accepted only while it remains the canonical pending request."
                   (magnus-review-ui-current-review))
              (user-error "No review selected"))))
   (let ((request (magnus-review-pending-checkpoint-request review)))
-    (cond
-     ((null request)
+    (unless request
       (user-error "Review by %s is not waiting for a checkpoint"
                   (magnus-review-reviewer-name review)))
-     ((magnus-review-controller--deliver-checkpoint review request)
+    (magnus-review-controller--require-committed-work
+     (magnus-review-project-root review))
+    (if (magnus-review-controller--deliver-checkpoint review request)
       (message "Magnus: resent checkpoint request %d to %s"
                (magnus-review-checkpoint-request-number request)
-               (magnus-review-author-name review)))
-     (t
+               (magnus-review-author-name review))
       (message "Magnus: checkpoint request will reach %s when it resumes"
-               (magnus-review-author-name review)))))
+               (magnus-review-author-name review))))
   review)
 
 (defun magnus-review-controller--matching-open-review (author root task)
@@ -949,6 +950,21 @@ as checkpoint authority."
       (list :action action :state-key state-key
             :request request :round round :execution execution))))
 
+(defun magnus-review-controller--require-committed-work (root)
+  "Require ROOT to have no tracked or untracked work outside commits."
+  (when (magnus-review-worktree-dirty-status root)
+    (user-error "%s" magnus-review-uncommitted-message)))
+
+(defun magnus-review-controller--request-context-key (context)
+  "Return the complete durable identity represented by request CONTEXT."
+  (let ((author (plist-get context :author))
+        (review (plist-get context :review)))
+    (list (and author (magnus-instance-id author))
+          (plist-get context :root)
+          (plist-get context :task)
+          (and review (magnus-review-id review))
+          (plist-get context :state-key))))
+
 (defun magnus-review-request-context (author)
   "Return the current task-scoped review context for AUTHOR.
 The returned plist contains :root, :task, :review, :action, and :state-key.
@@ -973,16 +989,20 @@ can reject a popup whose review changed without changing its broad ACTION."
 CONTEXT, when non-nil, must be a freshly validated value returned by
 `magnus-review-request-context'; interactive callers normally leave it nil."
   (interactive (list (magnus-review-controller--author-at-point)))
-  (let* ((context (or context (magnus-review-request-context author)))
+  (let* ((supplied-context context)
+         (context (magnus-review-request-context author))
          (root (plist-get context :root))
          (task (plist-get context :task))
          (existing (plist-get context :review))
          (operation (magnus-review-controller--operation existing)))
-    (unless (eq author (plist-get context :author))
+    (when (and supplied-context
+               (not (eq author (plist-get supplied-context :author))))
       (user-error "Review request context belongs to a different agent"))
-    (when (and (plist-member context :state-key)
-               (not (equal (plist-get context :state-key)
-                           (plist-get operation :state-key))))
+    (when (and supplied-context
+               (not (equal
+                     (magnus-review-controller--request-context-key
+                      supplied-context)
+                     (magnus-review-controller--request-context-key context))))
       (user-error "Review request context is stale; request it again"))
     (if existing
         (pcase (plist-get operation :action)
@@ -993,6 +1013,7 @@ CONTEXT, when non-nil, must be a freshly validated value returned by
           (_ (user-error "Review by %s is already %s"
                          (magnus-review-reviewer-name existing)
                          (plist-get operation :action))))
+      (magnus-review-controller--require-committed-work root)
       (let* ((reviewer-provider
               (magnus-review-controller--provider author provider))
              (_supported
@@ -1039,6 +1060,8 @@ CONTEXT, when non-nil, must be a freshly validated value returned by
              (user-error "No review selected"))))
   (if (magnus-review-pending-checkpoint-request review)
       (magnus-review-resend-checkpoint review)
+    (magnus-review-controller--require-committed-work
+     (magnus-review-project-root review))
     (magnus-review-await-checkpoint review)
     (let ((request (magnus-review-pending-checkpoint-request review)))
       (unless request
@@ -1575,12 +1598,14 @@ SECONDS is the configured duration captured when this owner was started."
           ;; queue entry must never abort the global pump and strand later work.
           (setq attempt (magnus-review-append-attempt review round)
                 token (magnus-review-attempt-token attempt))
-          (magnus-review-worktree-create review
-                                          (magnus-review-round-head-oid round))
-          (let* ((prior (magnus-review-controller--prior-result review round))
+          (let* ((checkout (magnus-review-round-checkout-path review round))
+                 (_checkout
+                  (magnus-review-ensure-checkout
+                   review (magnus-review-round-head-oid round) round))
+                 (prior (magnus-review-controller--prior-result review round))
                  (request
                   (list
-                   :directory (magnus-review-checkout-path review)
+                   :directory checkout
                    :evidence-directory (magnus-review-round-directory review round)
                    :prompt (magnus-review-controller--review-prompt
                             review round prior)

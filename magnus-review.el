@@ -302,12 +302,21 @@ checkpoint request so an author can recover after context loss or compaction.")
   (expand-file-name "manifest.json" (magnus-review-directory review)))
 
 (defun magnus-review-checkout-path (review)
-  "Return REVIEW's managed Git worktree path."
+  "Return REVIEW's legacy shared Git worktree path."
   (expand-file-name "checkout" (magnus-review-directory review)))
 
-(defun magnus-review--worktree-marker-path (review)
-  "Return REVIEW's private worktree ownership marker path."
-  (expand-file-name "worktree-owner.json" (magnus-review-directory review)))
+(defun magnus-review-round-checkout-path (review round)
+  "Return REVIEW's immutable Git worktree path for ROUND."
+  (let ((number (if (magnus-review-round-p round)
+                    (magnus-review-round-number round)
+                  round))
+        (head (and (magnus-review-round-p round)
+                   (magnus-review-round-head-oid round))))
+    (magnus-review--positive-number number "round")
+    (unless (magnus-review--valid-oid-p head)
+      (magnus-review--signal "Review round has invalid HEAD: %S" head))
+    (expand-file-name (format "checkouts/%03d-%s" number head)
+                      (magnus-review-directory review))))
 
 (defun magnus-review--positive-number (value kind)
   "Return positive integer VALUE or signal, naming it KIND."
@@ -364,6 +373,9 @@ checkpoint request so an author can recover after context loss or compaction.")
 
 (defun magnus-review--ensure-private-directory (directory)
   "Create DIRECTORY if needed and require it to be a private real directory."
+  ;; A trailing slash makes some file APIs follow a terminal directory symlink
+  ;; before inspection.  Normalize it away before the explicit refusal below.
+  (setq directory (directory-file-name (expand-file-name directory)))
   (when (file-remote-p directory)
     (magnus-review--signal "Managed review path may not be remote: %s" directory))
   (when (file-symlink-p directory)
@@ -609,6 +621,17 @@ This is intended for raw JSONL and stderr streams; it never follows symlinks."
                  "--untracked-files=normal")))
     (unless (string-empty-p status) status)))
 
+(defun magnus-review--managed-worktree-dirty-status (checkout)
+  "Return every non-committed path in managed CHECKOUT, including ignored paths."
+  (let ((status (magnus-review--git-output
+                 checkout "status" "--porcelain=v1"
+                 "--untracked-files=all" "--ignored")))
+    (unless (string-empty-p status) status)))
+
+(defconst magnus-review-uncommitted-message
+  "work is uncommitted. Ask instance to commit first"
+  "Message shown when a committed review checkpoint cannot be accepted.")
+
 (defun magnus-review-inspect-scope (project-root base-revision head-revision)
   "Return validated Git evidence for BASE-REVISION..HEAD-REVISION.
 The result is a plist suitable for status/transient presentation."
@@ -646,7 +669,7 @@ The result is a plist suitable for status/transient presentation."
             :dirty-status dirty-status
             :dirty-warning
             (and dirty-status
-                 "Working tree has uncommitted changes; they are excluded from this review.")))))
+                 magnus-review-uncommitted-message)))))
 
 (defun magnus-review-suggest-upstream-scope (project-root &optional head-revision)
   "Suggest an upstream merge-base scope for PROJECT-ROOT.
@@ -1964,204 +1987,105 @@ Malformed records are skipped with a warning; valid records remain available."
 
 ;;; Managed immutable review worktree
 
-(defun magnus-review--worktree-marker-object
-    (review head state &optional previous-head)
-  "Return ownership marker for REVIEW at HEAD in STATE.
-PREVIOUS-HEAD records the safe rollback point of a preparing update."
-  `((schema_version . 1)
-    (state . ,state)
-    (review_id . ,(magnus-review-id review))
-    (project_hash . ,(magnus-review-project-hash review))
-    (project_root . ,(magnus-review-project-root review))
-    (checkout . ,(magnus-review-checkout-path review))
-    (common_git_dir
-     . ,(magnus-review--git-common-directory
-         (magnus-review-project-root review)))
-    (head_oid . ,head)
-    (previous_head_oid . ,previous-head)
-    (created_at . ,(float-time))))
-
-(defun magnus-review--write-worktree-marker
-    (review head state &optional previous-head)
-  "Write REVIEW's ownership marker for HEAD in STATE and PREVIOUS-HEAD."
-  (magnus-review--atomic-write-string
-   (magnus-review--worktree-marker-path review)
-   (concat (json-serialize
-            (magnus-review--worktree-marker-object
-             review head state previous-head)
-                           :null-object nil :false-object :json-false)
-           "\n")))
-
-(defun magnus-review--worktree-marker-matches-p (review marker)
-  "Return non-nil when MARKER identifies REVIEW's derived checkout and repo."
-  (let ((checkout (magnus-review-checkout-path review)))
-    (and (eql (alist-get 'schema_version marker) 1)
-         (member (alist-get 'state marker) '("preparing" "ready"))
-         (stringp (alist-get 'review_id marker))
-         (string= (alist-get 'review_id marker) (magnus-review-id review))
-         (stringp (alist-get 'project_hash marker))
-         (string= (alist-get 'project_hash marker)
-                  (magnus-review-project-hash review))
-         (stringp (alist-get 'project_root marker))
-         (string= (alist-get 'project_root marker)
-                  (magnus-review-project-root review))
-         (stringp (alist-get 'checkout marker))
-         (string= (alist-get 'checkout marker) checkout)
-         (stringp (alist-get 'common_git_dir marker))
-         (or (null (alist-get 'previous_head_oid marker))
-             (magnus-review--valid-oid-p
-              (alist-get 'previous_head_oid marker)))
-         (equal (file-truename (alist-get 'common_git_dir marker))
-                (file-truename
-                 (magnus-review--git-common-directory
-                  (magnus-review-project-root review)))))))
-
-(defun magnus-review--owned-worktree-p (review)
-  "Return non-nil when REVIEW's checkout has a matching ownership marker."
-  (let ((marker-path (magnus-review--worktree-marker-path review))
-        (checkout (magnus-review-checkout-path review)))
-    (and (file-exists-p marker-path)
-         (not (file-symlink-p marker-path))
-         (file-directory-p checkout)
-         (not (file-symlink-p checkout))
-         (condition-case err
-             (let ((marker (magnus-review--read-json-file marker-path)))
-               (and (magnus-review--worktree-marker-matches-p review marker)
-                    (string= (alist-get 'state marker) "ready")
-                    (equal (file-truename
-                            (magnus-review--git-output
-                             checkout "rev-parse" "--show-toplevel"))
-                           (file-truename checkout))
-                    (equal (file-truename
-                            (magnus-review--git-common-directory checkout))
-                           (file-truename
-                            (alist-get 'common_git_dir marker)))
-                    (string= (magnus-review-resolve-oid checkout "HEAD")
-                             (alist-get 'head_oid marker))))
-           (error
-            (message "Magnus: could not verify review worktree ownership: %s"
-                     (error-message-string err))
-            nil)))))
-
-(defun magnus-review-worktree-repair (review)
-  "Adopt a checkout left between worktree creation and ready-marker commit.
-Return non-nil when an owned worktree is ready.  A preparing marker without a
-checkout is removed so a later create can safely retry."
-  (let ((marker-path (magnus-review--worktree-marker-path review))
-        (checkout (magnus-review-checkout-path review)))
-    (when (file-exists-p marker-path)
-      (let ((marker (magnus-review--read-json-file marker-path)))
-        (unless (magnus-review--worktree-marker-matches-p review marker)
-          (magnus-review--signal "Refusing mismatched worktree marker"))
-        (cond
-         ((not (file-exists-p checkout))
-          (unless (string= (alist-get 'state marker) "preparing")
-            (magnus-review--signal "Ready marker has lost its worktree"))
-          (delete-file marker-path)
-          nil)
-         ((or (file-symlink-p checkout) (not (file-directory-p checkout)))
-          (magnus-review--signal "Review checkout is not a real directory"))
-         (t
-          (let ((actual (magnus-review-resolve-oid checkout "HEAD")))
-            (unless (and
-                     (equal (file-truename
-                             (magnus-review--git-output
-                              checkout "rev-parse" "--show-toplevel"))
-                            (file-truename checkout))
-                     (equal (file-truename
-                             (magnus-review--git-common-directory checkout))
-                            (file-truename
-                             (alist-get 'common_git_dir marker)))
-                     (or (string= actual (alist-get 'head_oid marker))
-                         (and (string= (alist-get 'state marker) "preparing")
-                              (alist-get 'previous_head_oid marker)
-                              (string= actual
-                                       (alist-get 'previous_head_oid marker)))))
-            (magnus-review--signal
-             "Preparing checkout does not match its ownership marker"))
-            (magnus-review--write-worktree-marker review actual "ready")
-            t)))))))
-
-(defun magnus-review-worktree-create (review &optional head-revision)
-  "Create REVIEW's detached managed worktree at HEAD-REVISION.
-If the owned worktree already exists, update it safely instead."
-  (let* ((project-root (magnus-review-project-root review))
-         (head (magnus-review-resolve-oid
-                project-root (or head-revision (magnus-review-head-oid review))))
-         (checkout (magnus-review-checkout-path review))
-         (marker (magnus-review--worktree-marker-path review))
-         (created nil))
-    (magnus-review--ensure-review-directories review)
+(defun magnus-review--verified-clean-checkout-head (review &optional checkout)
+  "Return REVIEW's proven clean checkout HEAD, or nil when it is absent.
+A present checkout must be the real derived path, the exact Git top-level, and
+a worktree of REVIEW's source repository.  Any ambiguous state signals rather
+than being repaired, removed, or overwritten."
+  (let ((checkout (or checkout (magnus-review-checkout-path review))))
     (cond
-     ((file-exists-p checkout)
-      (unless (or (magnus-review--owned-worktree-p review)
-                  (magnus-review-worktree-repair review))
-        (magnus-review--signal
-         "Refusing unowned checkout at managed path: %s" checkout))
-      (magnus-review-worktree-update review head))
-     ((file-exists-p marker)
-      (magnus-review-worktree-repair review)
-      (magnus-review-worktree-create review head))
+     ((file-symlink-p checkout)
+      (magnus-review--signal
+       "Refusing symlinked review checkout: %s" checkout))
+     ((not (file-exists-p checkout)) nil)
+     ((not (file-directory-p checkout))
+      (magnus-review--signal
+       "Review checkout is not a real directory: %s" checkout))
      (t
       (condition-case error-data
           (progn
-            ;; Persist intent first.  If Emacs dies after Git creates the
-            ;; worktree, `magnus-review-worktree-repair' can prove and adopt it.
-            (magnus-review--write-worktree-marker review head "preparing")
-            (magnus-review--git-output project-root
-                                       "worktree" "add" "--detach"
-                                       checkout head)
-            (setq created t)
-            (set-file-modes checkout #o700)
-            (magnus-review--write-worktree-marker review head "ready")
-            checkout)
-        (error
-         (when (and created
-                    (not (magnus-review--owned-worktree-p review)))
-           ;; This path was proven absent above and created by this invocation.
-           (ignore-errors
-             (magnus-review--git-output project-root
-                                        "worktree" "remove" "--force"
-                                        checkout)))
-         (when (and (file-exists-p marker)
-                    (not (file-exists-p checkout)))
-           (ignore-errors (delete-file marker)))
-         (signal (car error-data) (cdr error-data))))))))
+            (unless (string=
+                     (magnus-review-git-root checkout)
+                     (magnus-review--canonical-directory checkout))
+              (magnus-review--signal
+               "Review checkout is not its exact Git top-level: %s" checkout))
+            (unless (string=
+                     (magnus-review--git-common-directory checkout)
+                     (magnus-review--git-common-directory
+                      (magnus-review-project-root review)))
+              (magnus-review--signal
+               "Review checkout belongs to a different repository: %s"
+               checkout))
+            (when (magnus-review--git-output-optional
+                   checkout "symbolic-ref" "--quiet" "HEAD")
+              (magnus-review--signal
+               "Review checkout is not detached: %s" checkout))
+            (when-let ((dirty
+                        (magnus-review--managed-worktree-dirty-status checkout)))
+              (magnus-review--signal
+               "Refusing to overwrite modified review worktree %s:\n%s"
+               checkout dirty))
+            (magnus-review-resolve-oid checkout "HEAD"))
+        (magnus-review-git-error
+         (magnus-review--signal
+          "Cannot prove review checkout ownership at %s: %s"
+          checkout (error-message-string error-data))))))))
 
-(defun magnus-review-worktree-update (review &optional head-revision)
-  "Move REVIEW's owned, clean worktree to exact HEAD-REVISION."
-  (unless (magnus-review--owned-worktree-p review)
-    (magnus-review--signal "Review worktree is absent or not owned by Magnus"))
-  (let* ((checkout (magnus-review-checkout-path review))
+(defun magnus-review-ensure-checkout (review head-revision &optional round)
+  "Ensure REVIEW has a proven clean detached checkout at HEAD-REVISION.
+The immutable requested HEAD and Git's own worktree metadata are the only
+sources of truth.  Legacy Magnus marker files are deliberately ignored.
+Foreign, dirty, symlinked, or otherwise ambiguous paths are never deleted or
+pruned.  If an identical concurrent operation wins a Git race, its fully
+verified result is accepted.  With ROUND, require its immutable HEAD and use a
+round-specific path; without it, use the legacy shared path."
+  (let* ((project-root (magnus-review-project-root review))
          (head (magnus-review-resolve-oid
-                (magnus-review-project-root review)
-                (or head-revision (magnus-review-head-oid review))))
-         (previous-head (magnus-review-resolve-oid checkout "HEAD"))
-         (dirty (magnus-review-worktree-dirty-status checkout)))
-    (when dirty
+                project-root head-revision))
+         (checkout (if round
+                       (magnus-review-round-checkout-path review round)
+                     (magnus-review-checkout-path review))))
+    (when (and round
+               (not (string= head (magnus-review-round-head-oid round))))
       (magnus-review--signal
-       "Refusing to overwrite modified review worktree %s:\n%s"
-       checkout dirty))
-    (if (string= previous-head head)
-        checkout
-      ;; A kill between checkout and the final marker can be reconciled to
-      ;; either the target or the proven previous HEAD.
-      (magnus-review--write-worktree-marker
-       review head "preparing" previous-head)
-      (condition-case error-data
-          (progn
-            (magnus-review--git-output checkout "checkout" "--detach" head)
-            (let ((actual (magnus-review-resolve-oid checkout "HEAD")))
-              (unless (string= actual head)
-                (magnus-review--signal
-                 "Review worktree stopped at unexpected commit %s" actual)))
-            (magnus-review--write-worktree-marker review head "ready")
-            checkout)
-        (error
-         ;; Repair settles a clean previous/target state; a third state remains
-         ;; deliberately quarantined for manual inspection.
-         (ignore-errors (magnus-review-worktree-repair review))
-         (signal (car error-data) (cdr error-data)))))))
+       "Checkout HEAD does not match immutable round %d"
+       (magnus-review-round-number round)))
+    (magnus-review--ensure-review-directories review)
+    (magnus-review--ensure-private-directory (file-name-directory checkout))
+    (let ((current
+           (magnus-review--verified-clean-checkout-head review checkout)))
+      (unless (and current (string= current head))
+        (condition-case error-data
+            (if current
+                (magnus-review--git-output
+                 checkout "checkout" "--detach" head)
+              (magnus-review--git-output
+               project-root "worktree" "add" "--detach" checkout head))
+          (error
+           ;; Git may report a lock or path collision after another Emacs has
+           ;; already completed this same transition.  Accept only the exact,
+           ;; clean, fully proven target; otherwise preserve the original error.
+           (unless
+               (condition-case verification-error
+                   (string=
+                    (or (magnus-review--verified-clean-checkout-head
+                         review checkout)
+                        "")
+                    head)
+                 (error
+                  (message
+                   "Magnus: concurrent checkout revalidation failed: %s"
+                   (error-message-string verification-error))
+                  nil))
+             (signal (car error-data) (cdr error-data)))))))
+    (let ((actual
+           (magnus-review--verified-clean-checkout-head review checkout)))
+      (unless (and actual (string= actual head))
+        (magnus-review--signal
+         "Review worktree stopped at unexpected commit %s"
+         (or actual "<absent>"))))
+    (set-file-modes checkout #o700)
+    checkout))
 
 ;;; Coordination checkpoint integration
 
@@ -2302,12 +2226,18 @@ startup recovery can continue launching it idempotently."
              ""))
           review)
          (t
+          (when (magnus-review-worktree-dirty-status directory)
+            (magnus-review--signal "%s" magnus-review-uncommitted-message))
           (let ((resolved-base (magnus-review-resolve-oid directory base))
-                (resolved-head (magnus-review-resolve-oid directory head)))
+                (resolved-head (magnus-review-resolve-oid directory head))
+                (current-head (magnus-review-resolve-oid directory "HEAD")))
             (unless (and (string= resolved-base base)
                          (string= resolved-head head))
               (magnus-review--signal
                "Review-ready values must be exact commit object IDs"))
+            (unless (string= resolved-head current-head)
+              (magnus-review--signal
+               "Review-ready HEAD is no longer current; publish a fresh checkpoint"))
             (if (and latest
                      (string= resolved-base
                               (magnus-review-round-base-oid latest))
