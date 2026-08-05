@@ -1,215 +1,50 @@
 # Magnus
 
-[![MELPA](https://melpa.org/packages/magnus-badge.svg)](https://melpa.org/#/magnus) [![CI](https://github.com/hrishikeshs/magnus/actions/workflows/ci.yml/badge.svg)](https://github.com/hrishikeshs/magnus/actions/workflows/ci.yml)
+[![MELPA](https://melpa.org/packages/magnus-badge.svg)](https://melpa.org/#/magnus)
+[![CI](https://github.com/hrishikeshs/magnus/actions/workflows/ci.yml/badge.svg)](https://github.com/hrishikeshs/magnus/actions/workflows/ci.yml)
 
-A magit-inspired interface for managing Claude Code and Codex agents within Emacs.
+Magnus is a Magit-inspired control room for Claude Code and Codex agents in
+Emacs. It keeps each interactive agent in its native terminal UI, gives the
+team durable identities and coordination state, and can send committed work to
+a fresh model for an independent review.
 
-Run multiple AI agents in parallel, let them communicate to avoid conflicts,
-handle their permission requests one at a time, and ask a fresh model to review
-committed work without leaving Emacs.
-
-## Screenshots
-
-**Agents coordinating via shared task list:**
-![Coordination in action](screenshots/user-action.png)
-
-**Two agents working side by side:**
-![Multiple Claude instances](screenshots/multiple-claude-instances.png)
-
-**Coordination diff view:**
-![Diff view](screenshots/diff-view.png)
+No background server, Magnus-specific plugin, or agent skill is required.
+Magnus launches the provider CLIs directly and supplies a shared onboarding and
+coordination protocol.
 
 ## Why Magnus?
 
-When working with Claude Code, you often want multiple agents working simultaneously:
-- One agent refactoring the auth module
-- Another writing tests
-- A third updating documentation
+The useful way to run coding agents is often hands-on: keep two agents beside
+your editor, watch what they do, redirect one mid-task, and ask another to
+review the result. Magnus makes that workflow feel native to Emacs:
 
-But this creates problems:
-- **File conflicts**: Agents might edit the same files
-- **Context sharing**: How do agents know what others are doing?
-- **Permission chaos**: Multiple agents asking for input at once
-
-Magnus solves all of this.
-
-## Features
-
-### Instance Management
-Spawn, kill, suspend/resume, rename, and switch between Claude Code instances running in vterm buffers. Each instance gets a randomly generated name (like `swift-fox` or `keen-owl`) and runs in its own terminal. Change an instance's working directory with session resume — Claude keeps its full conversation history.
-
-### Optional Codex Instances
-
-Run `M-x magnus-create-codex` to create a Codex instance. Codex is strictly
-opt-in: existing commands, saved state, Claude behavior, and Claude storage
-paths remain unchanged. Each Codex instance runs the full native Codex TUI in
-a vterm buffer and is labeled `[codex]` in the status buffer. Only the `codex`
-executable is required; customize its path with `magnus-codex-executable`.
-
-Inside a Codex buffer, use the TUI exactly as you would in a terminal: type at
-its composer, answer approvals in its native UI, and use Magnus's `C-g`
-binding to send Escape. Direct messages and coordination nudges are typed into
-that same vterm through a serialized queue, making the TUI the only session
-owner. Magnus holds automated delivery while you are actively in that TUI to
-avoid interfering with its composer. Archiving interrupts and closes the TUI;
-revisiting the agent resumes its persisted session in a fresh one.
-
-For a new agent, Magnus correlates its unique onboarding prompt with the new
-local Codex rollout record and saves that session ID. Concurrent launches are
-matched by their prompt rather than by whichever file is newest. Capture is
-bounded and fail-safe: if Codex's local record cannot be identified, the live
-TUI remains usable, but that session cannot be resurrected automatically.
-Magnus's onboarding includes named identity, first-person memory, coordination
-etiquette, and candid `[thinking]`/`[response]` engineering journals. Claude's
-established prompt remains unchanged.
-
-### Durable Cross-Provider Reviews
-
-Put point on an agent in `*magnus*`, press `v`, then `RET`, and Magnus handles
-the rest. It asks the author for a coherent committed checkpoint, infers the
-exact Git range, chooses a durable reviewer identity using the existing
-expertise index, and runs a headless reviewer from the opposite provider by
-default.
-Provider, model, and reasoning effort remain optional transient overrides.
-As point moves through `*magnus*`, the echo area shows context-sensitive key
-hints that follow your own key bindings. On an agent, `v` requests a review;
-on a review, the same key opens that review's actions.
-
-Reviews are durable work objects rather than terminal instances. Their exact
-base and head commits, attempts, provider session, findings, delivery state,
-and read state survive Emacs restarts under `~/.magnus/reviews/`. Re-reviewing
-keeps the reviewer identity and provider session, gives prior findings stable
-IDs, and adds a new immutable round. Headless execution is serialized by
-default to keep laptop resource use modest.
-
-While a model is actively reviewing an agent, that agent's status row shows a
-small animated `[review /]` badge. Queued work and checkpoint waiting remain
-static so motion always means actual reviewer execution.
-
-Completed reviews appear in their own status section with an unread dot. Press
-`RET` to open a Magit-style diff reader: files and hunks fold with `TAB`, `n/p`
-navigate sections, `N/P` jump between findings, `RET` opens source from the
-exact reviewed commit, and `e` opens the corresponding current worktree file.
-Use `[` and `]` to move between review rounds and `?` for re-review, retry,
-interrupt, delivery, and archive actions. Completion never steals focus;
-Magnus also delivers the durable report location back to the author agent.
-
-### Agent Coordination
-Agents communicate through a shared `.magnus-coord.md` file:
-
-```markdown
-## Active Work
-| Agent | Area | Status | Files |
-|-------|------|--------|-------|
-| swift-fox | auth module | in-progress | src/auth.ts, src/session.ts |
-| keen-owl | api tests | in-progress | tests/api/*.test.ts |
-
-## Discoveries
-- The user API returns 404 (not 403) for deleted users — handle both (swift-fox)
-- Test fixtures in tests/helpers/ are shared, don't modify without checking (keen-owl)
-
-## Log
-[10:30] swift-fox: Starting work on auth. Will touch src/auth/*.ts
-[10:31] keen-owl: Got it, I'll avoid those files. Working on API tests.
-[10:45] swift-fox: Auth done, committed. @keen-owl you can add auth tests now.
-[10:46] keen-owl: Thanks! On it.
-
-## Decisions
-- Using JWT for session tokens (swift-fox + keen-owl agreed)
-```
-
-Agents are automatically instructed to check and update this file, preventing them from stepping on each other's work.
-
-#### Knowledge Sharing
-
-Agents share discoveries — API quirks, gotchas, patterns — in the **Discoveries** section of the coordination file. Other agents read these on check-in and when reminded, so insights propagate naturally without you having to relay information between agents.
-
-Agents are also nudged to write detailed commit messages capturing what they learned, so knowledge persists in git history even after the coordination file is cleaned up.
-
-#### Automatic Housekeeping
-
-The coordination file stays lean automatically:
-- **Log** is trimmed to the last 25 entries on each reminder cycle (configurable via `magnus-coord-log-max-entries`)
-- **Discoveries** and **Decisions** are cleared when the last agent leaves a project, keeping the file fresh for the next work session
-
-### Shared Context Buffer
-A per-project scratch buffer where you can paste notes, links, Confluence pages, Jira tickets, or any context you want all agents to access.
-
-- Paste URLs and magnus fetches + caches the content
-- Export to a file agents can read, or copy to clipboard
-- Persists across Emacs sessions (stored in `~/.emacs.d/magnus-context/`)
-
-### Thinking Trace
-Press `t` on any instance to open a trace buffer that reads its provider's
-session JSONL directly. Claude traces include its recorded thinking blocks;
-Codex traces include visible `[thinking]` engineering journals, user messages,
-and responses. Codex's encrypted internal reasoning is deliberately not shown.
-
-The trace auto-refreshes so you can watch agents work in real time.
-
-### Direct Messaging
-Press `m` to send a message directly to an agent from the status buffer. The message appears in the agent's terminal as if you typed it — Claude acts on it immediately. Agents also receive periodic reminders (every 10 min) that rotate through different messages — nudging them to check the coordination file, share discoveries, and update their status.
-
-### Attention Queue
-When agents need user input (permission prompts, confirmations), they join a queue:
-
-```
-Instances: 3 [2 need attention]
-```
-
-Magnus focuses one instance at a time. Handle the request, press `a`, and the next agent gets focus. No more competing popups.
-
-### Auto-Approve
-Common safe operations (file reads, edits, grep, tests) can be auto-approved so agents don't block on routine permissions. When a yes/no prompt matches an allowlisted pattern, Magnus sends `y` automatically.
-
-Built-in allowlist includes: `Read`, `Write`, `Edit`, `Glob`, `Grep`, safe Bash commands (`git`, `ls`, `npm test`, `cargo build`, `pytest`, etc.). Customize via `magnus-attention-auto-approve-patterns`. Set to `nil` to disable.
-
-### Health Monitoring
-Magnus tracks agent health by hashing buffer content every 30 seconds. Status indicators appear next to each instance in the status buffer:
-
-- `+` (green) — active, buffer is changing
-- `~` (yellow) — stale, no buffer changes for 2+ minutes
-- `!` (red) — stuck, stale for 3+ consecutive checks
-- `x` — dead, no buffer or process
-
-Toggle health monitoring with `H` in the transient menu. Customize thresholds via `magnus-health-check-interval`, `magnus-health-stale-threshold`, and `magnus-health-stuck-threshold`.
-
-### Headless Mode
-Fire-and-forget agents that run as background processes instead of vterm buffers. Ideal for self-contained tasks where you don't need interactive input.
-
-```
-M-x magnus-create-headless RET "List all .el files and summarize them" RET
-```
-
-Or press `h` in the create dispatch menu (`c` then `h`). Headless agents:
-- Run via `claude --print` with stream-json output
-- Show output in a read-only buffer
-- Cannot receive messages or need permission prompts
-- Show as `[finished]` or `[errored]` in the status buffer when done
-- Are automatically skipped by the attention queue
-
-### Persistence
-Everything persists across Emacs sessions:
-- Running instances (reconnects if still alive)
-- Context buffers
-- Coordination state
-- Review checkpoints, reports, sessions, rounds, and unread state
+- run Claude Code and Codex side by side in `vterm`;
+- switch, message, suspend, archive, and resurrect named agents;
+- see health, attention, active work, and reviews in one `*magnus*` buffer;
+- coordinate concurrent writers without a shared mutable-state bottleneck;
+- run durable, headless, cross-provider reviews of exact Git evidence;
+- read findings in a folding Magit-style diff rather than a raw model transcript;
+- retain agent memory, provider sessions, reviews, and shared project context.
 
 ## Requirements
 
-- Emacs 28.1+
-- [vterm](https://github.com/akermu/emacs-libvterm)
-- [transient](https://github.com/magit/transient) (built into Emacs 28+)
-- [magit-section](https://github.com/magit/magit) (for the review reader)
-- Claude Code CLI (for Claude instances or Claude-backed reviews)
-- Codex CLI (for Codex instances or Codex-backed reviews)
+- Emacs 28.1 or newer. CI tests Emacs 28.1, 29.4, and 30.2.
+- [vterm](https://github.com/akermu/emacs-libvterm) 0.0.2 or newer.
+- [transient](https://github.com/magit/transient) 0.4.0 or newer.
+- [magit-section](https://github.com/magit/magit) 3.3.0 or newer.
+- Git for immutable review ranges and review navigation.
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) for Claude
+  agents, ordinary headless tasks, or Claude-backed reviews.
+- [Codex CLI](https://github.com/openai/codex) for Codex agents or
+  Codex-backed reviews.
 
-The default opposite-provider review requires the other provider's CLI. For
-example, reviewing a Claude author with the default settings launches Codex.
+Only the CLI for the provider you use is required. The default review policy
+chooses the provider opposite the author, so install both CLIs for the complete
+cross-provider workflow.
 
 ## Installation
 
-### From MELPA
+### MELPA
 
 ```elisp
 (use-package magnus
@@ -218,319 +53,389 @@ example, reviewing a Claude author with the default settings launches Codex.
          ("C-c M" . magnus-create-instance)))
 ```
 
-Or: `M-x package-install RET magnus RET`
+Or run `M-x package-install RET magnus RET`.
 
-### From GitHub (Emacs 29+)
+### package-vc (Emacs 29+)
 
-```elisp
-;; One-liner
+Run:
+
+```text
 M-x package-vc-install RET https://github.com/hrishikeshs/magnus RET
 ```
 
-Or in your config:
+Or add this to your configuration:
+
 ```elisp
 (unless (package-installed-p 'magnus)
   (package-vc-install "https://github.com/hrishikeshs/magnus"))
 
 (use-package magnus
-  :bind (("C-c m" . magnus)
-         ("C-c M" . magnus-create-instance)))
+  :bind (("C-c m" . magnus)))
 ```
 
-### With straight.el
+### straight.el
 
 ```elisp
 (straight-use-package
  '(magnus :type git :host github :repo "hrishikeshs/magnus"))
 ```
 
-### With quelpa
+### quelpa
 
 ```elisp
 (quelpa '(magnus :fetcher github :repo "hrishikeshs/magnus"))
 ```
 
-After upgrading Magnus in a running Emacs—through `M-x magnus-upgrade`,
-package-menu, package-vc, straight, or another package manager—restart Emacs
-before opening Magnus again. This prevents already-loaded functions and
-instance structures from being mixed with the newly installed package version.
-`magnus-upgrade` enforces this restart for upgrades initiated by versions that
-include the guard.
+After changing the installed Magnus version, restart Emacs before using it.
+This avoids mixing already-loaded structures and functions with a different
+package version. `M-x magnus-upgrade` performs a guarded package reinstall and
+then asks for the same restart.
 
-## Quick Start
+## Quick start
 
-1. `M-x magnus` (or `C-c m`) — Open the status buffer
-2. `c` — Create a new Claude Code instance
-3. Choose a directory, and a vterm buffer opens with Claude running
-4. Create more instances with `c`
-5. Switch between them with `RET`
-6. Watch them coordinate in the status buffer
-7. On an agent, press `v RET` to request an independent review
+1. Run `M-x magnus` to open the status buffer.
+2. Press `c` for a Claude Code agent, or press `?` and then `X` for Codex.
+3. Choose a project directory and work in the native TUI that opens.
+4. Create another agent and use `RET` in `*magnus*` to move between them.
+5. Put point on an agent and press `v RET` to request an independent review.
+6. When the review completes, press `RET` on its row to read the result.
 
-## Key Bindings
+The minibuffer shows context-sensitive hints as point moves among agents,
+reviews, and review rounds. Press `?` at any time for the complete dispatcher.
 
-### Status Buffer (`*magnus*`)
+## Native interactive agents
 
-| Key   | Action                       |
-|-------|------------------------------|
-| `c`   | Create new instance          |
-| `RET` | Visit agent or review        |
-| `k`   | Archive instance             |
-| `R`   | Resurrect archived instance  |
-| `r`   | Rename instance              |
-| `s/S` | Suspend/resume instance      |
-| `d`   | Change directory             |
-| `m`   | Send message to agent        |
-| `t`   | Open thinking trace          |
-| `v`   | Request/configure review     |
-| `V`   | Actions for review at point  |
-| `x`   | Open context buffer          |
-| `C`   | Open coordination file       |
-| `a/A` | Next/show attention requests |
-| `P`   | Archive all instances        |
-| `z`   | Toggle Do Not Disturb        |
-| `F`   | Session retrospective        |
-| `n/p` | Navigate agents and reviews  |
-| `g`   | Refresh                      |
-| `?`   | Show transient help menu     |
-| `q`   | Quit                         |
+Claude Code and Codex both run directly in `vterm`; Magnus does not emulate
+their interfaces or take a second ownership path through an app server. Their
+normal terminal composers, approval prompts, slash commands, and streaming
+output remain available.
 
-Review rows use the same `n/p` navigation. `RET` opens the newest unread
-completed round (or the latest round when everything is read).
+Each Magnus instance has:
 
-### Transient Menu (`?`)
+- a friendly display name such as `swift-fox`;
+- a durable UUID used as its coordination writer identity;
+- provider session metadata used to resume archived work;
+- a first-person memory at `.claude/agents/NAME/memory.md`;
+- the same provider-neutral onboarding and authorization boundaries.
 
-Press `?` in the status buffer to see all commands organized by category:
+Instance names are unique within Magnus because terminal buffers and legacy
+name-based routing use them directly. Rename is intentionally available only
+after an instance is archived: Magnus moves `.claude/agents/OLD/` to the new
+home transactionally, while the durable UUID, provider session, and review
+history stay unchanged.
 
-**Instance Actions**
-| Key | Action              |
-|-----|---------------------|
-| `c` | Create instance     |
-| `k` | Archive instance    |
-| `R` | Resurrect archived  |
-| `r` | Rename instance     |
-| `s` | Suspend instance    |
-| `S` | Resume instance     |
-| `d` | Change directory    |
-| `m` | Send message        |
-| `t` | Thinking trace      |
-| `P` | Archive all instances |
+With a current Claude CLI, Magnus assigns each fresh terminal an exact
+`--session-id` and waits for that session's own JSONL record. If the installed
+CLI lacks that option, Magnus falls back to detecting the one new session and
+allows only one unresolved fresh Claude launch per physical project in that
+Emacs session. That serialized compatibility path prevents its concurrent
+launches from claiming each other's history.
 
-**Context (shared notes)**
-| Key | Action                    |
-|-----|---------------------------|
-| `x` | Open context buffer       |
-| `e` | Export to file in project |
-| `w` | Copy to clipboard         |
+Magnus passes `MAGNUS_COORD_WRITER_ID` and `MAGNUS_COORD_WRITER_NAME` only to
+the agent process. It does not mutate Emacs's global process environment.
 
-**Coordination (agent communication)**
-| Key | Action                   |
-|-----|--------------------------|
-| `C` | Open coordination file   |
-| `I` | Open agent instructions  |
+Emacs normally consumes `ESC` as a Meta prefix. In Magnus terminal buffers,
+`C-g` sends Escape to either provider's TUI.
 
-**Independent Reviews**
-| Key | Action                       |
-|-----|------------------------------|
-| `v` | Review agent / review actions |
-| `o` | Open review at point         |
-| `V` | Review actions (alias)       |
+## Independent reviews
 
-The shortest request is `v RET`; `? v RET` remains available from the full
-dispatcher. The popup names the selected agent and makes clear whether `RET`
-will create a reviewer, request a new round, retry a failure, or do nothing
-because work is already pending. For a new durable reviewer, `p`, `m`, and `e`
-override provider, model, and reasoning effort respectively. Re-reviews and
-retries preserve the existing reviewer identity, provider, and session.
+Put point on an author agent in `*magnus*` and press `v RET`. Magnus then:
 
-The `? V` action popup (or `?` inside a review reader) provides:
+1. asks the author to finish and commit a coherent checkpoint;
+2. records the exact base and head Git object IDs;
+3. assigns a durable reviewer identity, reusing existing expertise matching
+   when possible;
+4. chooses the provider opposite the author by default;
+5. runs the reviewer headlessly and stores a structured, line-addressed report;
+6. notifies the author where the durable notes live.
 
-| Key   | Action                                      |
-|-------|---------------------------------------------|
-| `RET` | Open the review                             |
-| `r`   | Request or resend the next checkpoint      |
-| `t`   | Retry a failed or interrupted round        |
-| `i`   | Interrupt a running headless reviewer      |
-| `d`   | Retry delivery of review notes to author   |
-| `k`   | Archive the durable review                 |
+The request popup offers optional provider (`p`), model (`m`), and reasoning
+effort (`e`) overrides. Reviews run one at a time by default, keeping laptop
+load predictable; customize `magnus-review-max-concurrent` if desired.
 
-A manual interrupt remains stopped across Emacs restarts until you explicitly
-retry it. From a historical review round, delivery retry targets that round;
-from the status buffer it selects the newest completed undelivered round.
-While a review is waiting, `r` resends its existing opaque correlation token
-so an author can recover after compaction. If the author reports the already
-reviewed Git head, Magnus finishes that request as a no-op and preserves the
-existing verdict and findings; a later re-review allocates a fresh token.
-A token already bound to one round cannot name a newer Git scope: Magnus
-ignores that stale marker, and `r` intentionally issues the fresh token for the
-next round.
+Each raw JSONL or stderr artifact is capped by
+`magnus-review-max-stream-artifact-bytes` (8 MiB by default); a sibling
+`.truncated` diagnostic records overflow. A review attempt also has a watchdog,
+controlled by `magnus-review-attempt-timeout` (one hour by default), so a lost
+provider process cannot hold the review queue forever.
 
-**Attention & Health**
-| Key | Action                      |
-|-----|-----------------------------|
-| `a` | Next in attention queue     |
-| `A` | Show attention queue        |
-| `T` | Toggle attention monitoring |
-| `H` | Toggle health monitoring    |
+Reviews are durable work objects, not disposable output buffers. Their
+checkpoint requests, immutable rounds, attempts, provider session ID,
+findings, delivery state, and read state survive Emacs restarts under
+`~/.magnus/reviews/`. A later round keeps the same reviewer identity and
+provider session, so the reviewer can verify fixes against its earlier
+findings. Archive the review when that body of work is finished.
 
-**Navigation**
-| Key   | Action                |
-|-------|-----------------------|
-| `RET` | Visit agent or review |
-| `n`   | Next item             |
-| `p`   | Previous item         |
+While a reviewer is executing, the author row shows an animated review badge.
+Completed reviews appear in a separate section with an unread marker. The
+reader presents the exact `base..head` diff using `magit-section`:
 
-### Trace Buffer (`*trace:<name>*`)
+| Key | Review reader action |
+|-----|----------------------|
+| `TAB` | Fold or unfold a file, hunk, or finding |
+| `n` / `p` | Next or previous visible section |
+| `N` / `P` | Next or previous finding |
+| `RET` | Open the file from the reviewed Git snapshot |
+| `e` | Open the corresponding current worktree file |
+| `[` / `]` | Previous or next review round |
+| `?` | Open review actions |
+| `g` | Refresh |
+| `q` | Close |
 
-| Key | Action          |
-|-----|-----------------|
-| `g` | Refresh         |
-| `G` | Jump to end     |
-| `q` | Close           |
+The review actions popup can request another round, resend a checkpoint request,
+retry a failed round, interrupt a running reviewer, retry delivery, or archive
+the review. Manual interruption remains durable until you explicitly retry.
 
-### Review Buffer (`*magnus-review: ...*`)
+## Coordination without shared-file collisions
 
-| Key   | Action                                      |
-|-------|---------------------------------------------|
-| `TAB` | Fold/unfold file, hunk, or finding section |
-| `n/p` | Next/previous visible section               |
-| `N/P` | Next/previous finding                       |
-| `RET` | Open the exact reviewed snapshot            |
-| `e`   | Open the file in the current worktree       |
-| `[/]` | Previous/next review round                  |
-| `?`   | Review actions                              |
-| `g`   | Refresh                                     |
-| `q`   | Close                                       |
+New Magnus agents publish immutable JSON events to their own inbox:
 
-### Context Buffer
-
-| Key       | Action                      |
-|-----------|-----------------------------|
-| `C-c C-u` | Insert URL and fetch content|
-| `C-c C-f` | Fetch URL at point          |
-| `C-c C-e` | Export to `.magnus-context.md` in project |
-| `C-c C-c` | Copy buffer to clipboard    |
-| `C-c C-s` | Save                        |
-
-## How Coordination Works
-
-When you create an instance, magnus:
-
-1. Creates `.magnus-coord.md` in the project root
-2. Creates `.claude/magnus-instructions.md` with the coordination protocol
-3. Creates `.claude/skills/coordinate/SKILL.md` with check-in steps
-4. Logs "Joined the session" in the coordination file
-5. Sends a welcome message with an onboarding checklist to the agent
-
-Agents go through a checklist before writing any code:
-1. Read the instructions file
-2. Read the coordination file and check the Active Work table
-3. Announce planned work and files in the Log section
-4. Check for conflicts with other agents
-5. Add their row to the Active Work table
-6. Only then begin coding
-
-### Automatic @mention Notifications
-
-When an agent writes `@swift-fox` in the coordination file, swift-fox automatically receives a notification with the message context. This enables real-time communication between agents without requiring them to poll the file.
-
-The coordination skill file (`.claude/skills/coordinate/SKILL.md`) reinforces the protocol by teaching agents structured check-in steps they can follow independently.
-
-This is advisory coordination — agents are instructed to follow the protocol, and Claude is good at it.
-
-## Tips
-
-### ESC key in Claude buffers
-
-Emacs intercepts `ESC` as a Meta prefix, so it never reaches Claude Code. Magnus automatically maps `C-g` to send ESC to Claude in all instance buffers. Use `C-g` wherever Claude expects you to press Escape (cancel, go back, dismiss).
-
-### Helm / Projectile users
-
-Magnus avoids triggering interactive Helm/Projectile prompts when creating instances. If you still experience hangs, set a default directory:
-
-```elisp
-(setq magnus-default-directory "~/workspace")
+```text
+.magnus-coord/
+├── writers/
+│   ├── WRITER-UUID-A/
+│   │   ├── EVENT-ID.json
+│   │   └── ...
+│   └── WRITER-UUID-B/
+│       └── EVENT-ID.json
+└── current.md
 ```
 
-## Customization
+Each writer owns one monotonically sequenced event stream. Writers never
+replace one another's files, so two agents can announce work, record a
+discovery, or acknowledge a review checkpoint concurrently without a
+last-writer-wins rewrite of shared state.
+
+Magnus validates and reduces those events into
+`.magnus-coord/current.md`. This file is a generated, human-readable view of
+active work, discoveries, decisions, and recent log messages. It is read-only
+state: agents and users should not edit it. Retention is bounded and old event
+evidence is garbage-collected only after a current projection is safely
+written.
+
+For Magnus-managed writers, a lifecycle overlay reconciles the generated
+Active Work view with the live registry. A stopped or archived agent, or one
+moved to another project, cannot remain visibly active merely because its final
+`active.clear` was never written. The underlying durable event evidence is
+retained.
+
+The recognized event operations are:
+
+- append a log message;
+- set or clear the writer's active work;
+- put or remove a discovery or decision;
+- publish the exact Git checkpoint for a pending review.
+
+Magnus writes the current event schema and atomic-publication instructions to
+`.claude/magnus-instructions.md`. The shared onboarding tells both providers to
+read that file and the current projection. Nothing has to be installed into a
+Claude or Codex plugin/skill directory.
+
+On Git worktrees, registration adds `/.magnus-coord/` and the generated
+`.claude/magnus-instructions.md` to that repository's local
+`.git/info/exclude`. This keeps newly generated, untracked coordination
+artifacts out of ordinary `git add -A` and review diffs without changing the
+project's tracked `.gitignore`.
+
+Conversational log effects notify live agents only after Magnus begins watching
+a project; startup does not replay old chatter. The generated current view is
+the durable catch-up path. In contrast, unresolved `review.ready` evidence is
+replayed and settled exactly so a review checkpoint survives an Emacs restart.
+
+### Legacy compatibility
+
+`.magnus-coord.md` remains a compatibility ingress for agents and tools using
+the pre-0.2 shared-file protocol. Magnus reads it alongside event state and
+continues to deliver legacy mentions, direct messages, summons, and review-ready
+markers. New agents use immutable events; `.magnus-coord/current.md` is the
+canonical generated view.
+
+Press `J` to read that generated current view and `C` to inspect or maintain
+the legacy ingress. A manual `g` in `*magnus*` polls every active or watched
+project, retries transient event-store reads, and re-arms exhausted checkpoint
+delivery. Automatic presentation refreshes deliberately avoid that filesystem
+work.
+
+## Status-buffer commands
+
+These commands are bound directly in `*magnus*`:
+
+| Key | Action |
+|-----|--------|
+| `RET` | Visit the agent or review at point |
+| `c` | Create a Claude Code agent |
+| `v` | Request a review, or show actions for the review at point |
+| `V` | Show actions for the review at point |
+| `k` | Archive an agent |
+| `R` | Resurrect an archived agent |
+| `r` | Rename an archived agent and migrate its memory home |
+| `s` / `S` | Suspend or resume a Claude Code agent |
+| `d` | Change project and start a fresh provider session |
+| `m` | Send a message to an agent |
+| `t` | Open the provider trace |
+| `x` | Open shared project context |
+| `J` | Open the generated current coordination view |
+| `C` | Open the legacy coordination ingress |
+| `a` / `A` | Visit the next attention request / show the queue |
+| `P` | Archive all agents |
+| `z` | Toggle Do Not Disturb |
+| `F` | Generate a session retrospective |
+| `n` / `p` | Navigate agents and reviews |
+| `g` | Refresh |
+| `?` | Open all commands |
+| `q` | Quit |
+
+The `?` dispatcher additionally exposes:
+
+| Key | Action |
+|-----|--------|
+| `c` | Create a Claude Code agent |
+| `X` | Create a Codex agent |
+| `h` | Create a headless Claude task |
+| `o` | Open the completed review at point |
+| `D` | Run `magnus-doctor` |
+| `J` | Open generated `.magnus-coord/current.md` |
+| `C` | Open legacy `.magnus-coord.md` |
+| `I` | Open generated agent coordination instructions |
+| `H` / `T` | Toggle health / attention monitoring |
+
+## Traces, attention, and health
+
+Press `t` on an agent to read its provider's local session record. Claude
+traces include recorded thinking blocks. Codex traces include visible
+`[thinking]` engineering journals, user messages, and responses; encrypted
+internal reasoning is intentionally not displayed. In a trace buffer, `TAB`
+toggles the thinking block at point, `t` toggles all thinking, `n` / `p` move
+between responses, `[` loads earlier history, `g` refreshes, `G` jumps to the
+end, and `q` closes the window. Disk reads are chunked by
+`magnus-trace-read-chunk-bytes`; an unfinished JSONL record is retained only up
+to `magnus-trace-max-record-bytes`, then skipped through its newline. Initial
+entries and rendered buffer lines have separate bounds.
+
+Magnus detects approval and confirmation prompts and places agents in an
+attention queue. Safe, configurable patterns may be auto-approved; set
+`magnus-attention-auto-approve-patterns` to `nil` to disable that behavior.
+
+Health indicators summarize terminal activity:
+
+- `+` — active and changing;
+- `~` — stale;
+- `!` — stuck across consecutive checks;
+- `x` — no live buffer or process.
+
+## Shared context and headless tasks
+
+Press `x` for a persistent per-project scratch buffer. It can hold notes and
+links, fetch and cache URL content, export to `.magnus-context.md`, or copy its
+contents for an agent. Context is stored outside the repository under
+`~/.magnus/context/` by default.
+
+`M-x magnus-create-headless` (or `? h` in the status buffer) runs a
+fire-and-forget Claude task without a `vterm`. Output appears in a read-only
+buffer and the instance ends as `finished` or `errored`; an externally
+terminated process is shown as `stopped`. This is distinct from the
+provider-neutral headless runner used internally for reviews.
+
+The context buffer binds `C-c C-u` to insert and fetch a URL, `C-c C-f` to
+fetch the URL at point, `C-c C-e` to export project context, `C-c C-c` to copy
+it, and `C-c C-s` to save.
+
+Automatic low-priority model work—expertise indexing, session retrospectives,
+and optional dashboard fortunes—shares one FIFO and runs at most one provider
+process at a time. `magnus-background-queue-limit`,
+`magnus-background-output-limit`, and `magnus-background-timeout` bound its
+waiting work, retained output, and runtime. Expertise indexing reads only the
+prefix allowed by `magnus-agents-index-memory-limit`, and synchronous expertise
+matching has its own `magnus-expertise-match-timeout`.
+
+`M-x magnus-health-bloomberg` uses bundled static dashboard messages by
+default. Set `magnus-health-dashboard-ai-messages` to non-nil only if you want
+Claude-generated fortunes; those requests join the same low-priority FIFO.
+
+## Persistence and diagnostics
+
+Magnus keeps durable user data under `~/.magnus/` by default:
+
+| Path | Contents |
+|------|----------|
+| `~/.magnus/state.el` | Agent registry and provider session metadata |
+| `~/.magnus/reviews/` | Review manifests, rounds, evidence, and reports |
+| `~/.magnus/context/` | Per-project shared context |
+| `~/.magnus/url-cache/` | Fetched context URLs |
+| `~/.magnus/agents-index.el` | Dormant-agent expertise index |
+| `~/.magnus/attention.el` | Learned attention data |
+
+Run `M-x magnus-doctor`, or press `? D`, for read-only checks of the Emacs
+version, required libraries, provider CLIs, Git, durable storage paths, and
+registered agent directories. It also reports transient coordination reads and
+bounded review-checkpoint retries. If a checkpoint retry is exhausted, fix the
+reported cause and press `g` in `*magnus*` to re-arm the exact durable evidence.
+
+## Useful customization
 
 ```elisp
-;; Path to claude executable (default: "claude")
+;; Provider executables.
 (setq magnus-claude-executable "/path/to/claude")
-
-;; Path to codex executable for optional native TUI instances
 (setq magnus-codex-executable "/path/to/codex")
 
-;; Default directory for new instances
-(setq magnus-default-directory "~/projects")
+;; Default project for new agents.
+(setq magnus-default-directory "~/workspace")
 
-;; Where to store instance state (default: ~/.magnus/state.el)
-(setq magnus-state-file "~/.magnus/state.el")
-
-;; Durable review defaults
+;; Durable review defaults.
 (setq magnus-review-default-provider nil) ; opposite the author
 (setq magnus-review-default-effort 'high)
-(setq magnus-review-max-concurrent 1)     ; laptop-friendly serialization
+(setq magnus-review-max-concurrent 1)
 (setq magnus-review-directory-root "~/.magnus/reviews")
+(setq magnus-review-max-stream-artifact-bytes (* 8 1024 1024))
+(setq magnus-review-attempt-timeout 3600)
 
-;; Attention check interval in seconds (default: 10)
-(setq magnus-attention-check-interval 10)
+;; Shared low-priority model work.
+(setq magnus-background-queue-limit 32)
+(setq magnus-background-output-limit (* 256 1024))
+(setq magnus-background-timeout 90)
+(setq magnus-agents-index-memory-limit (* 64 1024))
+(setq magnus-expertise-match-timeout 15)
+(setq magnus-health-dashboard-ai-messages nil) ; static fortunes only
 
-;; Patterns that indicate an instance needs attention
-(setq magnus-attention-patterns
-      '("\\[y/n\\]" "\\[Y/n\\]" "Allow\\?" "Proceed\\?"))
-
-;; Auto-approve patterns (set to nil to disable auto-approval)
-(setq magnus-attention-auto-approve-patterns
-      '("Read" "Write" "Edit" "Glob" "Grep"
-        "Bash(git " "Bash(npm test" "Bash(cargo build"))
-
-;; Disable automatic @mention notifications (default: t)
-(setq magnus-coord-mention-notify nil)
-
-;; Coordination reminder interval in seconds (default: 600 / 10 min)
-(setq magnus-coord-reminder-interval 300)  ;; 5 minutes
-(setq magnus-coord-reminder-interval nil)  ;; disable reminders
-
-;; Max log entries before trimming (default: 25, nil to disable)
-(setq magnus-coord-log-max-entries 50)
-
-;; Health monitoring check interval in seconds (default: 30)
+;; UI and monitoring.
+(setq magnus-status-show-context-hints t)
+(setq magnus-status-review-animation-interval 0.4) ; nil for a static badge
+(setq magnus-attention-auto-approve-patterns nil)  ; disable auto-approval
 (setq magnus-health-check-interval 30)
-
-;; Time before an agent is considered stale (default: 120s)
 (setq magnus-health-stale-threshold 120)
-
-;; Consecutive stale checks before "stuck" (default: 3)
 (setq magnus-health-stuck-threshold 3)
 
-;; Tools allowed in headless mode (default: "Read Write Edit Glob Grep Bash")
-(setq magnus-headless-allowed-tools "Read Write Edit Glob Grep Bash")
+;; Bounded provider traces.
+(setq magnus-trace-read-chunk-bytes (* 64 1024))
+(setq magnus-trace-max-record-bytes (* 1024 1024))
+
+;; Coordination retention and reminders.
+(setq magnus-coord-state-log-limit 25)
+(setq magnus-coord-state-knowledge-limit 100)
+(setq magnus-coord-reminder-interval 600) ; nil disables reminders
 ```
 
-## Architecture
+Use `M-x customize-group RET magnus RET` for the full set of options.
 
+## Development
+
+The standard checks are intentionally simple:
+
+```sh
+make test
+make lint
+make lint-compile
+make package-lint
+make clean
 ```
-magnus/
-├── magnus.el              # Entry point, customization
-├── magnus-instances.el    # Instance data structure and registry
-├── magnus-persistence.el  # Save/restore state across sessions
-├── magnus-process.el      # Process management (vterm + headless)
-├── magnus-provider.el     # Additive provider dispatch
-├── magnus-provider-codex.el # Optional native Codex TUI provider
-├── magnus-provider-claude.el # Read-only Claude review adapter
-├── magnus-headless.el     # Provider-neutral JSONL runner
-├── magnus-review.el       # Durable review records + Git evidence
-├── magnus-review-controller.el # Review execution + delivery
-├── magnus-review-ui.el    # Magit-style review reader
-├── magnus-trace.el        # Thinking trace JSONL viewer
-├── magnus-status.el       # Status buffer UI
-├── magnus-transient.el    # Transient popup menus
-├── magnus-context.el      # Shared context buffer + URL fetching
-├── magnus-coord.el        # Agent coordination protocol
-├── magnus-attention.el    # Permission request queue
-└── magnus-health.el       # Agent health monitoring
-```
+
+CI installs package dependencies and runs all four checks on Emacs 28.1, 29.4,
+and 30.2.
+
+The implementation keeps provider transport, terminal setup, headless
+execution, durable reviews, coordination storage/reduction/runtime, and UI in
+separate modules. See the Commentary section at the top of each `.el` file for
+that module's boundary.
 
 ## License
 
