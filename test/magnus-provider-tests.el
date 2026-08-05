@@ -370,17 +370,20 @@ DATE defaults to the original deterministic test fixture date."
                             (overlay-get overlay 'magnus-thinking))
                           (overlays-in (point-min) (point-max)))))))
 
-(ert-deftest magnus-codex-trace-never-runs-claude-session-inference ()
-  (let ((instance (magnus-instances-create "/tmp" "waiting-codex" 'codex)))
-    (with-temp-buffer
-      (magnus-trace-mode)
-      (setq magnus-trace--instance instance)
-      (cl-letf (((symbol-function 'magnus-process--list-sessions)
-                 (lambda (&rest _arguments)
-                   (ert-fail "Codex trace attempted Claude session discovery"))))
-        (magnus-trace-refresh))
-      (should (string-match-p "Waiting for session" (buffer-string)))
-      (should-not (magnus-instance-session-id instance)))))
+(ert-deftest magnus-trace-never-guesses-a-project-session ()
+  (dolist (provider '(claude codex))
+    (let ((instance
+           (magnus-instances-create
+            "/tmp" (format "waiting-%s" provider) provider)))
+      (with-temp-buffer
+        (magnus-trace-mode)
+        (setq magnus-trace--instance instance)
+        (cl-letf (((symbol-function 'magnus-process--list-sessions)
+                   (lambda (&rest _arguments)
+                     (ert-fail "Trace attempted project-wide session discovery"))))
+          (magnus-trace-refresh))
+        (should (string-match-p "Waiting for session" (buffer-string)))
+        (should-not (magnus-instance-session-id instance))))))
 
 (ert-deftest magnus-trace-retains-partial-jsonl-records ()
   (let* ((file (make-temp-file "magnus-trace-partial-"))
@@ -479,13 +482,88 @@ DATE defaults to the original deterministic test fixture date."
       (setq magnus-trace--instance instance
             magnus-trace--pending-text "stale-fragment"
             magnus-trace--file-offset 999)
-      (cl-letf (((symbol-function 'magnus-trace--read-snapshot)
-                 (lambda (_file)
-                   (list (list line) "current-fragment" 42))))
+      (cl-letf (((symbol-function 'magnus-trace--tail-snapshot)
+                 (lambda (_file _keep)
+                   (list :lines (list line)
+                         :start 0
+                         :total 1
+                         :skip 0
+                         :pending "current-fragment"
+                         :discarding nil
+                         :size 42))))
         (magnus-trace--trim "snapshot.jsonl"))
       (should (= magnus-trace--file-offset 42))
       (should (equal magnus-trace--pending-text "current-fragment"))
       (should (string-match-p "snapshot-message" (buffer-string))))))
+
+(ert-deftest magnus-trace-tail-pagination-and-trim-bound-read-ranges ()
+  (let* ((file (make-temp-file "magnus-trace-bounded-"))
+         (instance (magnus-instances-create "/tmp" "bounded-codex" 'codex))
+         (magnus-trace-max-initial-entries 3)
+         (magnus-trace-max-buffer-lines nil)
+         (magnus-trace-read-chunk-bytes 257)
+         (read-range (symbol-function 'magnus-trace--read-range))
+         ranges)
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (dotimes (index 600)
+              (insert
+               (magnus-test--codex-event-line
+                "user_message" (format "bounded-%03d" index))
+               "\n")))
+          (with-temp-buffer
+            (magnus-trace-mode)
+            (setq magnus-trace--instance instance)
+            (cl-letf (((symbol-function 'magnus-trace--read-range)
+                       (lambda (path start end)
+                         (push (- end start) ranges)
+                         (funcall read-range path start end))))
+              (magnus-trace--append-new-entries file)
+              (should (= magnus-trace--skip-count 597))
+              (should-not (string-match-p "bounded-596" (buffer-string)))
+              (should (string-match-p "bounded-599" (buffer-string)))
+              (magnus-trace-load-earlier)
+              (should (= magnus-trace--skip-count 594))
+              (should (string-match-p "bounded-596" (buffer-string)))
+              (magnus-trace--trim file)
+              (should (= magnus-trace--skip-count 597))
+              (should-not (string-match-p "bounded-596" (buffer-string)))
+              (should (string-match-p "bounded-599" (buffer-string)))))
+          (should (> (length ranges) 3))
+          (should (cl-every
+                   (lambda (length)
+                     (<= length magnus-trace-read-chunk-bytes))
+                   ranges)))
+      (delete-file file))))
+
+(ert-deftest magnus-trace-bounds-an-unfinished-record ()
+  (let* ((file (make-temp-file "magnus-trace-oversized-"))
+         (instance (magnus-instances-create "/tmp" "oversized" 'claude))
+         (magnus-trace-read-chunk-bytes 11)
+         (magnus-trace-max-record-bytes 128))
+    (unwind-protect
+        (with-temp-buffer
+          (magnus-trace-mode)
+          (setq magnus-trace--instance instance)
+          (with-temp-file file
+            (insert "{" (make-string 256 ?x)))
+          (magnus-trace--append-new-entries file)
+          (should (string-empty-p magnus-trace--pending-text))
+          (should magnus-trace--discarding-incomplete-record-p)
+          (write-region
+           (concat
+            "\n"
+            (json-encode
+             '((type . "user")
+               (message . ((content . "after-oversized")))))
+            "\n")
+           nil file t 'silent)
+          (magnus-trace--append-new-entries file)
+          (should-not magnus-trace--discarding-incomplete-record-p)
+          (should (string-empty-p magnus-trace--pending-text))
+          (should (string-match-p "after-oversized" (buffer-string))))
+      (delete-file file))))
 
 (ert-deftest magnus-codex-trace-pagination-uses-provider-adapter ()
   (let* ((file (make-temp-file "magnus-trace-codex-"))
