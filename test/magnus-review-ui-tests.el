@@ -10,20 +10,17 @@
 (defconst magnus-test-review-ui--head-oid
   "2222222222222222222222222222222222222222")
 
-(defun magnus-test-review-ui--complete-attempt ()
-  "Return a canonical completed attempt for reader fixtures."
-  (magnus-review-attempt--create
-   :number 1 :token "reader-fixture-attempt"
-   :started-at 1 :finished-at 2 :execution 'complete))
-
 (defun magnus-test-review-ui--round (number)
   "Return a canonical review round numbered NUMBER."
   (magnus-review-round--create
    :number number
    :base-oid magnus-test-review-ui--base-oid
    :head-oid magnus-test-review-ui--head-oid
+   :created-at 1
+   :completed-at 2
    :verdict 'comment
-   :attempts (list (magnus-test-review-ui--complete-attempt))))
+   :read-state 'unread
+   :metadata '((finding_count . 1))))
 
 (defun magnus-test-review-ui--review (&rest rounds)
   "Return a canonical review containing ROUNDS."
@@ -35,8 +32,14 @@
    :author-name "author"
    :reviewer-name "reviewer"
    :reviewer-provider 'codex
+   :model "gpt-test"
+   :effort 'high
+   :task "Review the committed implementation"
+   :lifecycle 'open
+   :created-at 1
+   :updated-at 2
    :rounds rounds
-   :checkpoint-requests nil))
+   :session-id "reviewer-session"))
 
 (defun magnus-test-review-ui--patch (&optional patch-path)
   "Return a one-file unified patch for PATCH-PATH."
@@ -95,6 +98,47 @@
                    '(1 nil 2)))
     (should (equal (mapcar #'magnus-review-ui--diff-line-new-line lines)
                    '(nil 1 2)))))
+
+(ert-deftest magnus-review-ui-renders-a-magit-style-completed-round ()
+  (let* ((round (magnus-test-review-ui--round 1))
+         (review (magnus-test-review-ui--review round))
+         (files
+          (magnus-review-ui--parse-evidence
+           (magnus-test-review-ui--patch)
+           "M\0lib/sample.el\0")))
+    (with-temp-buffer
+      (magnus-review-ui-mode)
+      (setq-local magnus-review-ui--review review)
+      (setq-local magnus-review-ui--round round)
+      (setq-local
+       magnus-review-ui--result
+       `(:result
+         (:base_oid ,magnus-test-review-ui--base-oid
+          :head_oid ,magnus-test-review-ui--head-oid
+          :verdict "comment"
+          :summary "The implementation is sound."
+          :findings
+          ((:id "F-001" :severity "high" :kind "line"
+            :path "lib/sample.el" :head_line 1
+            :title "Guard this branch"
+            :evidence "The new value can be nil."
+            :recommendation "Validate before use.")))))
+      (let ((inhibit-read-only t))
+        (magnus-review-ui--render files))
+      (let ((text (buffer-string)))
+        (should (string-match-p "Review of author" text))
+        (should (string-match-p
+                 "Reviewer: reviewer \\[codex · gpt-test · high\\]" text))
+        (should (string-match-p "Round: 1 of 1" text))
+        (should (string-match-p "The implementation is sound" text))
+        (should (string-match-p "HIGH F-001  Guard this branch" text))
+        (should (string-match-p "modified  lib/sample.el" text)))
+      (should magit-root-section)
+      (should (derived-mode-p 'magit-section-mode))
+      (should (eq (lookup-key magnus-review-ui-mode-map (kbd "RET"))
+                  #'magnus-review-ui-visit-snapshot))
+      (should (eq (lookup-key magnus-review-ui-mode-map (kbd "?"))
+                  #'magnus-review-ui-actions)))))
 
 (ert-deftest magnus-review-ui-rejects-disagreeing-evidence-paths ()
   (should-error

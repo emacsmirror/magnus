@@ -91,7 +91,7 @@
 (defun magnus-transient--review-request-busy-p ()
   "Return non-nil when the selected review already has pending work."
   (memq (plist-get (magnus-transient--current-review-request-context) :action)
-        '(queued running)))
+        '(asking queued running)))
 
 (defun magnus-transient--review-request-heading ()
   "Describe the exact task-scoped operation in the request transient."
@@ -107,8 +107,8 @@
                          author-name reviewer-name))
       ('retry (format "Retry %s's review of %s"
                       reviewer-name author-name))
-      ('waiting (format "Review of %s — awaiting its committed checkpoint"
-                        author-name))
+      ('asking (format "Asking %s which commits belong to its work"
+                       author-name))
       ('queued (format "%s's review of %s — queued"
                        reviewer-name author-name))
       ('running (format "%s is reviewing %s now"
@@ -137,7 +137,7 @@
       ('retry (if (eq execution 'interrupted)
                   "Retry interrupted review"
                 "Retry failed review"))
-      ('waiting "Resend current checkpoint request")
+      ('asking "Waiting for the author to identify its committed range")
       ('queued "Review is queued")
       ('running "Review is in progress")
       (_ "Start review"))))
@@ -206,7 +206,7 @@ review actions."
 ;;; Durable reviews
 
 (transient-define-prefix magnus-review-request-menu ()
-  "Request a durable independent review for the instance at point."
+  "Request an independent review for the instance at point."
   [1 :description magnus-transient--review-request-heading
    (1 "RET" magnus-transient-request-review
     :description magnus-transient--review-request-action-description
@@ -268,23 +268,71 @@ review actions."
     "No review selected"))
 
 (defun magnus-transient--review-rereview-description ()
-  "Describe the selected review's checkpoint action."
-  (if (eq (plist-get magnus-transient--review-action-context :action)
-          'waiting)
-      "Resend checkpoint request"
-    "Request re-review"))
+  "Describe the selected review's next-round action."
+  "Ask author for the next committed round")
+
+(defun magnus-transient--review-action-current-review ()
+  "Return the review named by the current action popup, or nil."
+  (when-let ((context magnus-transient--review-action-context))
+    (magnus-review-get (plist-get context :review-id))))
+
+(defun magnus-transient--review-action-state ()
+  "Return the selected review's current execution state, or nil."
+  (when-let ((review (magnus-transient--review-action-current-review)))
+    (magnus-review-execution review)))
+
+(defun magnus-transient--review-open-inapt-p ()
+  "Return non-nil when the selected review has no completed report."
+  (let ((review (magnus-transient--review-action-current-review)))
+    (or (null review) (null (magnus-review-rounds review)))))
+
+(defun magnus-transient--review-rereview-inapt-p ()
+  "Return non-nil unless the selected lineage can start another round."
+  (or (not (eq (magnus-transient--review-action-state) 'complete))
+      (when-let ((review (magnus-transient--review-action-current-review)))
+        (eq (magnus-review-lifecycle review) 'archived))))
+
+(defun magnus-transient--review-retry-inapt-p ()
+  "Return non-nil unless the selected review has disposable failed work."
+  (not (memq (magnus-transient--review-action-state)
+             '(failed interrupted))))
+
+(defun magnus-transient--review-fresh-session-inapt-p ()
+  "Return non-nil unless failed reviewer work can use a fresh session."
+  (let ((review (magnus-transient--review-action-current-review)))
+    (or (not (memq (magnus-transient--review-action-state)
+                   '(failed interrupted)))
+        (null review)
+        (null (magnus-review-controller-candidate-round review)))))
+
+(defun magnus-transient--review-interrupt-inapt-p ()
+  "Return non-nil unless the selected review has disposable active work."
+  (not (memq (magnus-transient--review-action-state)
+             '(asking-scope queued running))))
+
+(defun magnus-transient--review-archive-inapt-p ()
+  "Return non-nil when the selected review is already archived."
+  (let ((review (magnus-transient--review-action-current-review)))
+    (or (null review) (eq (magnus-review-lifecycle review) 'archived))))
 
 (transient-define-prefix magnus-review-actions-menu ()
-  "Actions for one durable review."
+  "Actions for one review lineage."
   [1 "Review"
    :description magnus-transient--review-description
-   (1 "RET" "Open" magnus-transient-review-open)
+   (1 "RET" "Open completed report" magnus-transient-review-open
+    :inapt-if magnus-transient--review-open-inapt-p)
    (1 "r" magnus-transient-review-rereview
-    :description magnus-transient--review-rereview-description)
-   (1 "t" "Retry failed round" magnus-transient-review-retry)
-   (1 "i" "Interrupt running review" magnus-transient-review-interrupt)
-   (1 "d" "Retry author delivery" magnus-transient-review-delivery)
-   (1 "k" "Archive" magnus-transient-review-archive)])
+    :description magnus-transient--review-rereview-description
+    :inapt-if magnus-transient--review-rereview-inapt-p)
+   (1 "t" "Retry failed work" magnus-transient-review-retry
+    :inapt-if magnus-transient--review-retry-inapt-p)
+   (1 "f" "Retry with fresh reviewer session"
+    magnus-transient-review-fresh-session
+    :inapt-if magnus-transient--review-fresh-session-inapt-p)
+   (1 "i" "Interrupt active work" magnus-transient-review-interrupt
+    :inapt-if magnus-transient--review-interrupt-inapt-p)
+   (1 "k" "Archive" magnus-transient-review-archive
+    :inapt-if magnus-transient--review-archive-inapt-p)])
 
 (defun magnus-review-actions (&optional review round)
   "Open actions for REVIEW and optional ROUND.
@@ -356,7 +404,7 @@ When called from the status buffer, use the review at point."
       (magnus-review-ui-open (magnus-transient--selected-review) nil))))
 
 (defun magnus-transient-review-rereview ()
-  "Request a new committed checkpoint for the selected review."
+  "Ask the author to identify the selected review's next committed round."
   (interactive)
   (magnus-review-rereview (magnus-transient--review-for-mutation))
   (magnus-status-refresh))
@@ -367,8 +415,14 @@ When called from the status buffer, use the review at point."
   (magnus-review-retry (magnus-transient--review-for-mutation))
   (magnus-status-refresh))
 
+(defun magnus-transient-review-fresh-session ()
+  "Retry prepared failed work in a fresh reviewer provider session."
+  (interactive)
+  (magnus-review-restart-session (magnus-transient--review-for-mutation))
+  (magnus-status-refresh))
+
 (defun magnus-transient-review-interrupt ()
-  "Interrupt the selected review's running headless attempt."
+  "Interrupt the selected review's ephemeral query or provider run."
   (interactive)
   (let ((review (magnus-transient--review-for-mutation)))
     (when (yes-or-no-p
@@ -377,16 +431,8 @@ When called from the status buffer, use the review at point."
       (magnus-review-interrupt review)
       (magnus-status-refresh))))
 
-(defun magnus-transient-review-delivery ()
-  "Retry delivery of the selected completed review to its author."
-  (interactive)
-  (let ((review (magnus-transient--review-for-mutation)))
-    (magnus-review-retry-delivery
-     review (magnus-transient--review-action-round review))
-    (magnus-status-refresh)))
-
 (defun magnus-transient-review-archive ()
-  "Archive the selected durable review without deleting its reports."
+  "Archive the selected review without deleting completed reports."
   (interactive)
   (let ((review (magnus-transient--review-for-mutation)))
     (if (eq (magnus-review-lifecycle review) 'archived)
@@ -394,7 +440,7 @@ When called from the status buffer, use the review at point."
       (when (yes-or-no-p
              (format "Archive review of %s? "
                      (magnus-review-author-name review)))
-        (magnus-review-archive review)
+        (magnus-review-controller-archive review)
         (magnus-status-refresh)
         (message "Archived review by %s"
                  (magnus-review-reviewer-name review))))))
@@ -460,7 +506,7 @@ or the best status-buffer project directory."
     (user-error "No instances to get project directory from")))
 
 ;; The review reader calls this dispatcher from its `?' binding.  Controller
-;; setup installs the same value after restart recovery; assigning it here also
+;; setup installs the same value during Magnus startup; assigning it here also
 ;; makes direct loading of the UI and transient modules behave consistently.
 (setq magnus-review-ui-action-function #'magnus-review-actions)
 

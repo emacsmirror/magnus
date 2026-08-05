@@ -21,7 +21,7 @@
 ;;
 ;;   :directory   Existing working directory (required)
 ;;   :prompt      Provider prompt (required)
-;;   :purpose     `review' (the default) or `agent'
+;;   :purpose     `review' or `agent' (required)
 ;;   :session-id  Session to resume, or nil for a fresh session
 ;;   :model       Optional provider model name
 ;;   :effort      Optional provider effort symbol or string
@@ -183,7 +183,7 @@ still delivered to :on-error, while the result reports how many were omitted."
     (signal 'wrong-type-argument (list 'listp request)))
   (let ((directory (plist-get request :directory))
         (prompt (plist-get request :prompt))
-        (purpose (or (plist-get request :purpose) 'review))
+        (purpose (plist-get request :purpose))
         (buffer (plist-get request :buffer)))
     (unless (and (stringp directory) (file-directory-p directory))
       (user-error "Headless directory does not exist: %s" directory))
@@ -222,8 +222,7 @@ still delivered to :on-error, while the result reports how many were omitted."
   "Return REQUEST enriched with normalized schema fields.
 The returned plist contains :owned-schema-file when this function created the
 file and the caller is responsible for deleting it."
-  (let* ((prepared (plist-put (copy-sequence request) :purpose
-                              (or (plist-get request :purpose) 'review)))
+  (let* ((prepared (copy-sequence request))
          (schema-file (plist-get prepared :schema-file))
          (schema-json (magnus-headless--schema-json
                        (plist-get prepared :schema))))
@@ -526,22 +525,10 @@ structured-result event."
                    (run-at-time 0 nil #'magnus-headless--finalize process)))))
 
 (defun magnus-headless--provider-spec (provider request)
-  "Return PROVIDER's launch specification for REQUEST.
-Generic adapters are preferred.  The former review-only operation remains a
-compatibility fallback exclusively for review requests."
-  (let ((purpose (plist-get request :purpose)))
-    (cond
-     ((magnus-provider-symbol-operation-p provider 'headless-spec)
-      (magnus-provider-call-symbol provider 'headless-spec request))
-     ((and (eq purpose 'review)
-           (magnus-provider-symbol-operation-p
-            provider 'headless-review-spec))
-      (magnus-provider-call-symbol provider 'headless-review-spec request))
-     ((eq purpose 'review)
-      (user-error "Provider `%s' does not support headless reviews" provider))
-     (t
-      (user-error "Provider `%s' does not support headless agent work"
-                  provider)))))
+  "Return PROVIDER's generic headless launch specification for REQUEST."
+  (unless (magnus-provider-symbol-operation-p provider 'headless-spec)
+    (user-error "Provider `%s' does not support headless work" provider))
+  (magnus-provider-call-symbol provider 'headless-spec request))
 
 (defun magnus-headless--validate-spec (provider spec purpose)
   "Validate PROVIDER launch SPEC for PURPOSE and return it."

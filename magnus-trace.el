@@ -106,6 +106,24 @@ buffer's retained fragment without bound."
 (defvar magnus-trace--timer nil
   "Timer for auto-refreshing trace buffers.")
 
+(define-error 'magnus-trace-cursor-error "Magnus trace cursor error")
+(define-error 'magnus-trace-cursor-stale "Magnus trace cursor is stale"
+  'magnus-trace-cursor-error)
+
+(cl-defstruct (magnus-trace-cursor
+               (:constructor magnus-trace-cursor--create))
+  "An in-memory reader pinned to one exact instance trace.
+The cursor deliberately carries no restart or replay semantics."
+  instance
+  instance-id
+  provider
+  session-id
+  file
+  file-identity
+  offset
+  pending
+  discarding)
+
 ;;; Major mode
 
 (define-derived-mode magnus-trace-mode special-mode "Trace"
@@ -126,6 +144,20 @@ buffer's retained fragment without bound."
   (define-key map (kbd "q") #'quit-window))
 
 ;;; Core functions
+
+(defun magnus-trace-resolve-file (instance)
+  "Return the exact current trace file for INSTANCE, or nil.
+Claude traces are resolved from the captured session ID and project path.
+External providers resolve their own exact trace through `trace-file'.  This
+function never guesses from other sessions in the project."
+  (when (magnus-instance-session-id instance)
+    (let ((file
+           (if (magnus-provider-external-p instance)
+               (magnus-provider-call instance 'trace-file)
+             (magnus-process--session-jsonl-path
+              (magnus-instance-directory instance)
+              (magnus-instance-session-id instance)))))
+      (and file (expand-file-name file)))))
 
 (defun magnus-trace--reset-read-state (&optional clear-buffer)
   "Reset JSONL reader state.
@@ -174,24 +206,11 @@ When CLEAR-BUFFER is non-nil, also erase rendered content and overlays."
   (interactive)
   (when magnus-trace--instance
     (let* ((instance magnus-trace--instance)
-           (session-id (magnus-instance-session-id instance))
-           (directory (magnus-instance-directory instance))
-           (external (magnus-provider-external-p instance)))
+           (session-id (magnus-instance-session-id instance)))
       ;; Session capture is owned by the exact provider launch.  Guessing from
       ;; a project-wide newest JSONL file can attach two concurrent agents to
       ;; the same conversation, so an unresolved trace simply keeps waiting.
-      (let ((jsonl-file
-             (when session-id
-               (if external
-                   ;; External providers may rotate files while preserving a
-                   ;; stable session ID, so let the provider resolve each time.
-                   (magnus-provider-call instance 'trace-file)
-                 (if (and (equal session-id magnus-trace--session-id)
-                          magnus-trace--jsonl-file
-                          (file-exists-p magnus-trace--jsonl-file))
-                     magnus-trace--jsonl-file
-                   (magnus-process--session-jsonl-path
-                    directory session-id))))))
+      (let ((jsonl-file (magnus-trace-resolve-file instance)))
         (if (and jsonl-file (file-exists-p jsonl-file))
             (progn
               (unless (and (equal jsonl-file magnus-trace--jsonl-file)
@@ -594,28 +613,169 @@ bounded even when a preceding record has no nearby newline."
             :start (if pairs (caar pairs) end)
             :count found))))
 
-(defun magnus-trace--normalize-entry (entry)
-  "Normalize provider JSONL ENTRY for the shared renderer, or return nil."
-  (let ((instance magnus-trace--instance))
-    (if (and instance
-             (magnus-provider-external-p instance)
-             (magnus-provider-operation-p instance 'trace-entry))
-        (magnus-provider-call instance 'trace-entry entry)
-      entry)))
+(defun magnus-trace-normalize-entry (instance entry)
+  "Normalize provider JSONL ENTRY for INSTANCE, or return nil.
+The returned value uses Magnus's canonical Claude-style trace shape."
+  (if (and instance
+           (magnus-provider-external-p instance)
+           (magnus-provider-operation-p instance 'trace-entry))
+      (magnus-provider-call instance 'trace-entry entry)
+    entry))
 
-(defun magnus-trace--render-json-line (line)
-  "Parse and render one provider JSONL LINE.
-Return non-nil when LINE parsed, even when the provider ignores its record."
+(defun magnus-trace--decode-line (instance line)
+  "Decode and normalize one trace LINE for INSTANCE.
+Return (t . ENTRY) after successful JSON parsing.  ENTRY may be nil when the
+provider intentionally ignores the record.  Return nil for malformed JSON."
   (condition-case err
-      (let* ((entry (json-parse-string line :object-type 'alist))
-             (normalized (magnus-trace--normalize-entry entry)))
-        (when normalized
-          (magnus-trace--render-entry normalized))
-        t)
+      (cons t
+            (magnus-trace-normalize-entry
+             instance
+             (json-parse-string line :object-type 'alist)))
     (error
      (message "Magnus: skipped malformed trace record: %s"
               (error-message-string err))
      nil)))
+
+(defun magnus-trace--response-texts (text)
+  "Return assistant-visible response segments from TEXT.
+Thinking marker segments are deliberately omitted."
+  (when (and (stringp text) (not (string-empty-p text)))
+    (if (magnus-trace--text-has-markers-p text)
+        (let (responses)
+          (dolist (segment (magnus-trace-parse-content text))
+            (when (eq (plist-get segment :type) 'response)
+              (push (plist-get segment :text) responses)))
+          (nreverse responses))
+      (list text))))
+
+(defun magnus-trace-entry-assistant-texts (entry)
+  "Return assistant-visible text strings from canonical trace ENTRY.
+User, tool, and thinking-only entries return nil.  Both vector and list
+content are accepted, and visible response markers are unwrapped."
+  (when (and (listp entry)
+             (equal (alist-get 'type entry) "assistant"))
+    (let* ((message (alist-get 'message entry))
+           (content (and (listp message) (alist-get 'content message)))
+           texts)
+      (cond
+       ((stringp content)
+        (setq texts (magnus-trace--response-texts content)))
+       ((or (vectorp content) (listp content))
+        (seq-doseq (block content)
+          (when (and (listp block)
+                     (equal (alist-get 'type block) "text"))
+            (dolist (text
+                     (magnus-trace--response-texts
+                      (alist-get 'text block)))
+              (push text texts))))
+        (setq texts (nreverse texts))))
+      texts)))
+
+(defun magnus-trace--cursor-signal-stale (format-string &rest arguments)
+  "Signal a stale trace cursor with FORMAT-STRING and ARGUMENTS."
+  (signal 'magnus-trace-cursor-stale
+          (list (apply #'format format-string arguments))))
+
+(defun magnus-trace-cursor-create (instance)
+  "Create an in-memory cursor at the current end of INSTANCE's trace.
+Signal `magnus-trace-cursor-error' until the instance has an exact captured
+session and an existing trace file.  Existing records are intentionally not
+replayed."
+  (let* ((session-id (magnus-instance-session-id instance))
+         (file (and session-id (magnus-trace-resolve-file instance))))
+    (unless session-id
+      (signal 'magnus-trace-cursor-error
+              '("Instance does not have a captured provider session")))
+    (unless (and file (file-regular-p file))
+      (signal 'magnus-trace-cursor-error
+              '("Instance trace file is not available yet")))
+    (let* ((canonical-file (file-truename file))
+           (attributes (file-attributes canonical-file))
+           (identity (file-attribute-file-identifier attributes)))
+      (magnus-trace-cursor--create
+       :instance instance
+       :instance-id (magnus-instance-id instance)
+       :provider (or (magnus-instance-provider instance) 'claude)
+       :session-id session-id
+       :file canonical-file
+       :file-identity identity
+       :offset (file-attribute-size attributes)
+       :pending ""
+       :discarding nil))))
+
+(defun magnus-trace--cursor-validate (cursor)
+  "Return the current file size for CURSOR, or signal that it is stale."
+  (unless (magnus-trace-cursor-p cursor)
+    (signal 'wrong-type-argument (list 'magnus-trace-cursor-p cursor)))
+  (let* ((instance (magnus-trace-cursor-instance cursor))
+         (session-id (magnus-instance-session-id instance))
+         (provider (or (magnus-instance-provider instance) 'claude)))
+    (unless (and (equal (magnus-instance-id instance)
+                        (magnus-trace-cursor-instance-id cursor))
+                 (eq provider (magnus-trace-cursor-provider cursor)))
+      (magnus-trace--cursor-signal-stale
+       "The Magnus instance identity or provider changed"))
+    (unless (equal session-id (magnus-trace-cursor-session-id cursor))
+      (magnus-trace--cursor-signal-stale
+       "The provider session changed from %s to %s"
+       (magnus-trace-cursor-session-id cursor) session-id))
+    (let ((file (magnus-trace-resolve-file instance)))
+      (unless (and file (file-regular-p file))
+        (magnus-trace--cursor-signal-stale
+         "The trace file disappeared or is no longer resolvable"))
+      (let* ((canonical-file (file-truename file))
+             (attributes (file-attributes canonical-file))
+             (identity (file-attribute-file-identifier attributes))
+             (size (file-attribute-size attributes)))
+        (unless (and (equal canonical-file (magnus-trace-cursor-file cursor))
+                     (equal identity
+                            (magnus-trace-cursor-file-identity cursor)))
+          (magnus-trace--cursor-signal-stale
+           "The provider replaced the trace file"))
+        (when (< size (magnus-trace-cursor-offset cursor))
+          (magnus-trace--cursor-signal-stale
+           "The trace file was truncated"))
+        size))))
+
+(defun magnus-trace-cursor-read (cursor)
+  "Read newly completed assistant response strings from CURSOR.
+Advance CURSOR in place.  Partial and oversized records reuse the trace
+viewer's bounded scanner.  Signal `magnus-trace-cursor-stale' rather than
+silently following a replacement session, file, or truncated history."
+  (let* ((size (magnus-trace--cursor-validate cursor))
+         (start (magnus-trace-cursor-offset cursor))
+         (file (magnus-trace-cursor-file cursor))
+         texts)
+    (when (> size start)
+      (let ((state
+             (magnus-trace--scan-forward
+              file start size
+              (magnus-trace-cursor-pending cursor)
+              (magnus-trace-cursor-discarding cursor)
+              (lambda (_record-start line)
+                (when line
+                  (when-let ((decoded
+                              (magnus-trace--decode-line
+                               (magnus-trace-cursor-instance cursor) line)))
+                    (dolist (text
+                             (magnus-trace-entry-assistant-texts
+                              (cdr decoded)))
+                      (push text texts))))))))
+        (setf (magnus-trace-cursor-offset cursor) size
+              (magnus-trace-cursor-pending cursor)
+              (plist-get state :pending)
+              (magnus-trace-cursor-discarding cursor)
+              (plist-get state :discarding))))
+    (nreverse texts)))
+
+(defun magnus-trace--render-json-line (line)
+  "Parse and render one provider JSONL LINE.
+Return non-nil when LINE parsed, even when the provider ignores its record."
+  (when-let ((decoded
+              (magnus-trace--decode-line magnus-trace--instance line)))
+    (when (cdr decoded)
+      (magnus-trace--render-entry (cdr decoded)))
+    t))
 
 (defun magnus-trace--append-new-entries (jsonl-file)
   "Append new entries from JSONL-FILE to the current trace buffer.

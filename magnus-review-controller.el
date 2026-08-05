@@ -1,4 +1,4 @@
-;;; magnus-review-controller.el --- Durable review orchestration -*- lexical-binding: t -*-
+;;; magnus-review-controller.el --- Ephemeral review orchestration -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2026 Hrishikesh S
 ;; Author: Hrishikesh S <hrish2006@gmail.com>
@@ -8,11 +8,11 @@
 
 ;;; Commentary:
 
-;; This module connects interactive Magnus agents to durable review records and
-;; provider-neutral headless execution.  Reviews are not ordinary
-;; `magnus-instance' objects: they have independent rounds, attempt tokens,
-;; delivery state, and human unread state.  The controller owns those state
-;; transitions while `magnus-review.el' owns persistence and Git isolation.
+;; This module connects interactive Magnus agents to completed review lineages
+;; and provider-neutral headless execution.  Asking an author for an exact Git
+;; range, waiting in the model queue, and running a reviewer are deliberately
+;; ephemeral.  Only successful rounds, their evidence, and the last successful
+;; reviewer session cross an Emacs restart.
 
 ;;; Code:
 
@@ -20,18 +20,18 @@
 (require 'json)
 (require 'seq)
 (require 'subr-x)
+(require 'magnus-background)
 (require 'magnus-coord)
-(require 'magnus-headless)
 (require 'magnus-instances)
 (require 'magnus-provider)
 (require 'magnus-review)
 (require 'magnus-terminal)
+(require 'magnus-trace)
 
 (declare-function magnus--generate-random-name "magnus")
 (declare-function magnus-expertise-match "magnus")
 (declare-function magnus-review-actions "magnus-transient")
 (declare-function magnus-status-refresh "magnus-status")
-(defvar magnus-process-ready-hook)
 (defvar magnus-coord--do-not-disturb)
 (defvar magnus-review-ui-action-function nil
   "Review-reader action dispatcher, installed when transient UI is loaded.")
@@ -56,41 +56,53 @@ Completion never changes the selected window or opens the review reader."
   :type 'boolean
   :group 'magnus)
 
-(defcustom magnus-review-max-concurrent 1
-  "Maximum number of headless reviews running at once.
-The default deliberately serializes expensive model work on a laptop."
-  :type 'natnum
+(defcustom magnus-review-timeout 3600
+  "Maximum seconds one ephemeral reviewer process may run."
+  :type 'number
   :group 'magnus)
 
-(defcustom magnus-review-attempt-timeout 3600
-  "Maximum seconds one headless review attempt may run.
-When positive, Magnus marks the exact process/round/attempt owner failed, kills
-its subprocess, and advances the review queue after this interval.  Nil or a
-non-positive value disables the watchdog.  A late watchdog can never affect a
-replacement attempt because ownership includes the process and attempt token."
-  :type '(choice (const :tag "No timeout" nil) number)
+(defcustom magnus-review-scope-timeout 180
+  "Maximum seconds to wait for an author agent to identify its Git range."
+  :type 'number
   :group 'magnus)
 
-(defvar magnus-review-controller--processes (make-hash-table :test #'equal)
-  "Map review IDs to their currently owned headless process.")
+(defcustom magnus-review-delivery-timeout 180
+  "Maximum seconds a review-scope question may wait for terminal delivery.
+This bound ends when the author's TUI accepts the message; the separate
+`magnus-review-scope-timeout' begins only after that receipt."
+  :type 'number
+  :group 'magnus)
 
-(defvar magnus-review-controller--queue nil
-  "FIFO list of review IDs waiting for a global execution slot.")
+(defcustom magnus-review-scope-poll-interval 1
+  "Seconds between reads of an author's provider transcript."
+  :type 'number
+  :group 'magnus)
+
+(defcustom magnus-review-lineage-prompt-limit (* 512 1024)
+  "Maximum encoded bytes of canonical prior-round context in one prompt.
+Magnus fails closed instead of dropping old finding identities when a lineage
+exceeds this bound."
+  :type 'integer
+  :group 'magnus)
+
+(defconst magnus-review-controller--result-artifact-limit (* 10 1024 1024)
+  "Maximum bytes accepted from one durable structured-result artifact.")
+
+(cl-defstruct (magnus-review-controller-runtime
+               (:constructor magnus-review-controller--make-runtime))
+  "One disposable scope query or reviewer execution."
+  review-id phase nonce cursor delivery-timer timer deadline
+  round job-key job error
+  fresh-session-p)
+
+(defvar magnus-review-controller--runtimes (make-hash-table :test #'equal)
+  "Review ID to its current ephemeral runtime.")
 
 (defvar magnus-review-controller--shutting-down nil
   "Non-nil while Magnus is preventing new review work during shutdown.")
 
-(defvar magnus-review-controller--recovering nil
-  "Non-nil while startup reconstructs the complete durable review queue.")
-
 (defvar magnus-review-controller-changed-hook nil
   "Hook run after a controller-visible review state transition.")
-
-(defun magnus-review-controller-active-p ()
-  "Return non-nil while the controller owns a headless review attempt.
-Registry ownership spans provider startup through exact completion release, so
-callers can use this predicate to reject unsafe durable-state reloads."
-  (> (hash-table-count magnus-review-controller--processes) 0))
 
 (defconst magnus-review-controller--result-schema
   '((type . "object")
@@ -190,40 +202,80 @@ callers can use this predicate to reject unsafe durable-state reloads."
         (concat (substring value 0 limit) "…")
       value)))
 
-(defun magnus-review-controller--prior-ledger (prior)
-  "Build complete, bounded re-review context from canonical PRIOR.
-The ledger keeps every finding ID but bounds prose per entry, so JSON is never
-cut in the middle of a document."
-  (when prior
-    `((schema_version . 1)
-      (verdict . ,(magnus-review-controller--field prior :verdict))
-      (summary
-       . ,(magnus-review-controller--truncate-string
-           (magnus-review-controller--field prior :summary) 3000))
-      (findings
-       . ,(vconcat
-           (mapcar
-            (lambda (finding)
-              `((id . ,(magnus-review-controller--field finding :id))
-                (severity
-                 . ,(magnus-review-controller--field finding :severity))
-                (title
-                 . ,(magnus-review-controller--field finding :title))
-                (path . ,(magnus-review-controller--field finding :path))
-                (head_line
-                 . ,(magnus-review-controller--field finding :head_line))
-                (explanation
-                 . ,(magnus-review-controller--truncate-string
-                     (magnus-review-controller--field finding :explanation)
-                     1200))))
-            (magnus-review-controller--prior-findings prior)))))))
+(defun magnus-review-controller--history-round-ledger
+    (result number latest-p)
+  "Return bounded canonical RESULT context for round NUMBER.
+LATEST-P retains more explanatory prose for the immediately preceding round."
+  `((round_number . ,number)
+    (base_oid . ,(magnus-review-controller--field result :base_oid))
+    (head_oid . ,(magnus-review-controller--field result :head_oid))
+    (verdict . ,(magnus-review-controller--field result :verdict))
+    (summary
+     . ,(magnus-review-controller--truncate-string
+         (magnus-review-controller--field result :summary)
+         (if latest-p 3000 800)))
+    (findings
+     . ,(vconcat
+         (mapcar
+          (lambda (finding)
+            `((id . ,(magnus-review-controller--field finding :id))
+              (severity
+               . ,(magnus-review-controller--field finding :severity))
+              (title . ,(magnus-review-controller--field finding :title))
+              (path . ,(magnus-review-controller--field finding :path))
+              (head_line
+               . ,(magnus-review-controller--field finding :head_line))
+              (explanation
+               . ,(magnus-review-controller--truncate-string
+                   (magnus-review-controller--field finding :explanation)
+                   (if latest-p 1200 400)))))
+          (magnus-review-controller--prior-findings result))))
+    (prior_findings
+     . ,(vconcat
+         (mapcar
+          (lambda (disposition)
+            `((id . ,(magnus-review-controller--field disposition :id))
+              (disposition
+               . ,(magnus-review-controller--field
+                   disposition :disposition))
+              (explanation
+               . ,(magnus-review-controller--truncate-string
+                   (magnus-review-controller--field
+                    disposition :explanation)
+                   (if latest-p 800 300)))))
+          (magnus-review-controller--array
+           (magnus-review-controller--field result :prior_findings)
+           'prior_findings))))))
 
-(defun magnus-review-controller--review-prompt (review round &optional prior)
-  "Build the evidence-first prompt for REVIEW ROUND.
-PRIOR is the previous canonical structured result, when this is a re-review."
-  (let ((prior-json
-         (when-let ((ledger (magnus-review-controller--prior-ledger prior)))
-           (json-encode ledger)))
+(defun magnus-review-controller--history-json (history)
+  "Encode complete canonical HISTORY within its configured prompt bound."
+  (when history
+    (unless (and (integerp magnus-review-lineage-prompt-limit)
+                 (> magnus-review-lineage-prompt-limit 0))
+      (error "Review lineage prompt limit is invalid: %S"
+             magnus-review-lineage-prompt-limit))
+    (let* ((count (length history))
+           (number 0)
+           (json
+            (json-encode
+             `((schema_version . 1)
+               (rounds
+                . ,(vconcat
+                    (mapcar
+                     (lambda (result)
+                       (cl-incf number)
+                       (magnus-review-controller--history-round-ledger
+                        result number (= number count)))
+                     history)))))))
+      (when (> (string-bytes json) magnus-review-lineage-prompt-limit)
+        (error
+         "Canonical review lineage is %d bytes; configured prompt limit is %d"
+         (string-bytes json) magnus-review-lineage-prompt-limit))
+      json)))
+
+(defun magnus-review-controller--review-prompt (review round &optional history)
+  "Build the evidence-first prompt for REVIEW ROUND from canonical HISTORY."
+  (let ((history-json (magnus-review-controller--history-json history))
         (patch-path (magnus-review-controller--patch-path review round))
         (evidence-command
          (mapconcat
@@ -262,8 +314,10 @@ PRIOR is the previous canonical structured result, when this is a re-review."
       "For line findings, use a repository-relative path and a line number in the "
       "HEAD version that is visible in the diff. Use file/general findings when no "
       "honest line anchor exists. Keep one issue per finding. Magnus assigns stable "
-      "IDs. On a re-review, set prior_id for a still-present finding and account for "
-      "every earlier finding in prior_findings. Echo schema_version=1 and the exact "
+      "IDs. On a re-review, set prior_id for a still-present or resurfaced finding. "
+      "Account for every finding from the immediately preceding round in "
+      "prior_findings; any older ID in the lineage ledger may be reused when that "
+      "issue genuinely resurfaces. Echo schema_version=1 and the exact "
       "base_oid/head_oid above in the structured result. On a resumed session, this "
       "current snapshot and prior ledger supersede every earlier assumption. The "
       "tests array must state checks actually performed and material validation "
@@ -280,8 +334,8 @@ PRIOR is the previous canonical structured result, when this is a re-review."
      (magnus-review-round-head-oid round)
      evidence-command
      patch-path
-     (if prior-json
-         (concat "\nPrevious canonical review result:\n" prior-json "\n")
+     (if history-json
+         (concat "\nCanonical review lineage history:\n" history-json "\n")
        "\nThis is the first review round; prior_findings must be an empty array.\n"))))
 
 (defun magnus-review-controller--field (object key)
@@ -344,10 +398,12 @@ PRIOR is the previous canonical structured result, when this is a re-review."
     (concat "F-" (substring (secure-hash 'sha256 material) 0 12))))
 
 (defun magnus-review-controller--normalize-finding
-    (review raw prior-ids used-ids referenced-prior &optional canonical-p)
+    (review raw known-ids used-ids referenced-prior
+            &optional canonical-p)
   "Normalize one RAW finding for REVIEW.
-PRIOR-IDS and USED-IDS are equal-tested hash tables.  When CANONICAL-P,
-preserve and validate Magnus-assigned IDs and anchor downgrade metadata."
+KNOWN-IDS reserves identities from the complete lineage; USED-IDS tracks this
+result.  When CANONICAL-P, preserve and validate Magnus-assigned IDs and
+anchor downgrade metadata."
   (let* ((severity (magnus-review-controller--field raw :severity))
          (kind (magnus-review-controller--field raw :kind))
          (title (magnus-review-controller--required-string
@@ -393,7 +449,7 @@ preserve and validate Magnus-assigned IDs and anchor downgrade metadata."
       ("general" (setq path nil line nil end-line nil)))
     (when (and line end-line (< end-line line))
       (error "Finding `%s' ends before it begins" title))
-    (when (and prior-id (not (gethash prior-id prior-ids)))
+    (when (and prior-id (not (gethash prior-id known-ids)))
       (error "Finding `%s' references unknown prior ID %s" title prior-id))
     (when (and prior-id (gethash prior-id referenced-prior))
       (error "Multiple current findings reference prior ID %s" prior-id))
@@ -413,10 +469,10 @@ preserve and validate Magnus-assigned IDs and anchor downgrade metadata."
            (suffix 2))
       (if canonical-p
           (when (or (gethash id used-ids)
-                    (and (null prior-id) (gethash id prior-ids)))
+                    (and (null prior-id) (gethash id known-ids)))
             (error "Duplicate canonical review finding ID: %s" id))
         (while (or (gethash id used-ids)
-                   (and (null prior-id) (gethash id prior-ids)))
+                   (and (null prior-id) (gethash id known-ids)))
           (setq id (format "%s-%d" base-id suffix)
                 suffix (1+ suffix))))
       (puthash id t used-ids)
@@ -471,10 +527,12 @@ preserve and validate Magnus-assigned IDs and anchor downgrade metadata."
            (magnus-review-controller--array value field))))
 
 (defun magnus-review-controller-normalize-result
-    (review round raw &optional prior canonical-p)
+    (review round raw &optional prior canonical-p history)
   "Validate and canonicalize RAW structured output for REVIEW ROUND.
 PRIOR is the previous canonical result during a re-review.  CANONICAL-P means
-RAW is a Magnus-published artifact whose IDs and anchor metadata must survive."
+RAW is a Magnus-published artifact whose IDs and anchor metadata must survive.
+HISTORY is the ordered canonical lineage before PRIOR and globally reserves
+finding identities."
   (let* ((schema-version
           (magnus-review-controller--field raw :schema_version))
          (base-oid (magnus-review-controller--field raw :base_oid))
@@ -490,6 +548,7 @@ RAW is a Magnus-published artifact whose IDs and anchor metadata must survive."
                         'findings))
          (prior-findings (magnus-review-controller--prior-findings prior))
          (prior-ids (make-hash-table :test #'equal))
+         (known-ids (make-hash-table :test #'equal))
          (used-ids (make-hash-table :test #'equal))
          (referenced-prior (make-hash-table :test #'equal))
          findings dispositions)
@@ -509,15 +568,21 @@ RAW is a Magnus-published artifact whose IDs and anchor metadata must survive."
       (error "Unknown review verdict: %S" verdict))
     (when (> (length raw-findings) 200)
       (error "Review result contains more than 200 findings"))
+    (dolist (historical (append history (and prior (list prior))))
+      (dolist (finding (magnus-review-controller--prior-findings historical))
+        (let ((id (magnus-review-controller--field finding :id)))
+          (when (and (stringp id) (not (string-empty-p id)))
+            (puthash id t known-ids)))))
     (dolist (finding prior-findings)
       (let ((id (magnus-review-controller--field finding :id)))
         (when (and (stringp id) (not (string-empty-p id)))
-          (puthash id t prior-ids))))
+          (puthash id t prior-ids)
+          (puthash id t known-ids))))
     (setq findings
           (mapcar (lambda (finding)
                     (magnus-review-controller--normalize-finding
-                     review finding prior-ids used-ids referenced-prior
-                     canonical-p))
+                     review finding known-ids used-ids
+                     referenced-prior canonical-p))
                   raw-findings))
     (setq dispositions
           (let ((raw-dispositions
@@ -530,16 +595,22 @@ RAW is a Magnus-published artifact whose IDs and anchor metadata must survive."
              raw-dispositions prior-ids)))
     (dolist (finding findings)
       (when-let ((prior-id (magnus-review-controller--field finding :prior_id)))
-        (let* ((entry (seq-find
-                       (lambda (candidate)
-                         (equal prior-id
-                                (magnus-review-controller--field candidate :id)))
-                       dispositions))
-               (state (and entry
-                           (magnus-review-controller--field entry :disposition))))
-          (unless (member state '("still_present" "uncertain"))
-            (error "Current finding %s contradicts prior disposition %S"
-                   prior-id state)))))
+        ;; A historical-but-inactive finding may legitimately resurface.  Only
+        ;; findings active in the immediately preceding round require a current
+        ;; disposition entry.
+        (when (gethash prior-id prior-ids)
+          (let* ((entry (seq-find
+                         (lambda (candidate)
+                           (equal
+                            prior-id
+                            (magnus-review-controller--field candidate :id)))
+                         dispositions))
+                 (state
+                  (and entry
+                       (magnus-review-controller--field entry :disposition))))
+            (unless (member state '("still_present" "uncertain"))
+              (error "Current finding %s contradicts prior disposition %S"
+                     prior-id state))))))
     (dolist (entry dispositions)
       (when (string= (magnus-review-controller--field entry :disposition)
                      "still_present")
@@ -702,7 +773,72 @@ shown beneath unrelated code."
           (magnus-review-controller--set-field finding 'end_line line)))))
     result))
 
-;;; Author intent and checkpoint delivery
+;;; Author intent and ephemeral scope discovery
+
+(defun magnus-review-controller--runtime (review)
+  "Return REVIEW's disposable runtime, if any."
+  (gethash (magnus-review-id review) magnus-review-controller--runtimes))
+
+(defun magnus-review-controller-candidate-round (review)
+  "Return REVIEW's unpublished candidate round, if one is retained."
+  (when-let ((runtime (magnus-review-controller--runtime review)))
+    (magnus-review-controller-runtime-round runtime)))
+
+(defun magnus-review-controller-error (review)
+  "Return REVIEW's bounded ephemeral failure diagnostic, if any."
+  (when-let ((runtime (magnus-review-controller--runtime review)))
+    (magnus-review-controller-runtime-error runtime)))
+
+(defun magnus-review-controller--runtime-state (review)
+  "Return REVIEW's controller-visible execution state, or nil."
+  (when-let ((runtime (magnus-review-controller--runtime review)))
+    (pcase (magnus-review-controller-runtime-phase runtime)
+      ('asking-scope 'asking-scope)
+      ('queued
+       (let ((job (magnus-review-controller-runtime-job runtime)))
+         (if (and job
+                  (eq (magnus-background-job-state job) 'running))
+             'running
+           'queued)))
+      ('running 'running)
+      ('failed 'failed)
+      ('interrupted 'interrupted)
+      (state state))))
+
+(defun magnus-review-controller--cancel-scope-timer (runtime)
+  "Cancel and forget RUNTIME's transcript polling timer."
+  (when-let ((timer (magnus-review-controller-runtime-timer runtime)))
+    (setf (magnus-review-controller-runtime-timer runtime) nil)
+    (when (timerp timer)
+      (cancel-timer timer))))
+
+(defun magnus-review-controller--cancel-delivery-timer (runtime)
+  "Cancel and forget RUNTIME's pre-acceptance delivery watchdog."
+  (when-let ((timer
+              (magnus-review-controller-runtime-delivery-timer runtime)))
+    (setf (magnus-review-controller-runtime-delivery-timer runtime) nil)
+    (when (timerp timer)
+      (cancel-timer timer))))
+
+(defun magnus-review-controller--cancel-delivery (runtime)
+  "Cancel terminal messages still queued under exact RUNTIME ownership."
+  (magnus-terminal-cancel-scope runtime))
+
+(defun magnus-review-controller--changed ()
+  "Notify presentation code that ephemeral review state changed."
+  (run-hooks 'magnus-review-controller-changed-hook))
+
+(defun magnus-review-controller--fail-runtime (runtime message)
+  "Mark RUNTIME failed in memory with MESSAGE."
+  (magnus-review-controller--cancel-scope-timer runtime)
+  (magnus-review-controller--cancel-delivery-timer runtime)
+  (magnus-review-controller--cancel-delivery runtime)
+  (setf (magnus-review-controller-runtime-phase runtime) 'failed
+        (magnus-review-controller-runtime-job runtime) nil
+        (magnus-review-controller-runtime-error runtime)
+        (magnus-review-controller--truncate-string message 12000))
+  (magnus-review-controller--changed)
+  runtime)
 
 (defun magnus-review-controller--author-at-point ()
   "Return the interactive Magnus author instance at point."
@@ -756,7 +892,7 @@ shown beneath unrelated code."
               :reason "fresh independent reviewer"))))
 
 (defun magnus-review-controller--instance-running-p (instance)
-  "Return non-nil when INSTANCE can accept a durable controller message."
+  "Return non-nil when INSTANCE can accept a controller message."
   (if (magnus-provider-external-p instance)
       (condition-case err
           (magnus-provider-call instance 'running-p)
@@ -770,138 +906,171 @@ shown beneath unrelated code."
            (get-buffer-process buffer)
            (process-live-p (get-buffer-process buffer))))))
 
-(defun magnus-review-controller--send (instance text &optional accepted)
-  "Submit durable controller TEXT to running INSTANCE.
+(defun magnus-review-controller--send
+    (instance text &optional accepted scope)
+  "Submit controller TEXT to running INSTANCE.
 ACCEPTED is called only after the provider transport accepts the message.
+SCOPE owns queued delivery and defaults to the controller's shared scope.
 Return t when accepted synchronously, `queued' when deferred from a selected
-TUI, and nil on failure.  Acceptance does not assert that the model consumed
-the message; callers include stable idempotency keys for replay."
+TUI, and nil on failure."
   (when (magnus-review-controller--instance-running-p instance)
     (condition-case err
         (if (magnus-provider-external-p instance)
-            (pcase (magnus-provider-call instance 'send text accepted)
+            (pcase (magnus-provider-call
+                    instance 'send text accepted
+                    (or scope 'magnus-review-controller))
               ('submitted t)
               ('queued 'queued)
-              ;; An external provider must expose an actual transport receipt
-              ;; when durable delivery requests ACCEPTED.  Treat older/unknown
-              ;; return values as failure instead of publishing a false `sent'.
               (_ (if accepted
-                     (error "provider did not acknowledge durable delivery")
+                     (error "provider did not acknowledge message delivery")
                    t)))
           (pcase (magnus-terminal-submit
                   instance text accepted
                   :settle-delay magnus-terminal-delivery-retry-delay
-                  :scope 'magnus-review-controller :deduplicate t)
+                  :scope (or scope 'magnus-review-controller) :deduplicate t)
             ('submitted t)
             ('queued 'queued)))
       (error
-       (message "Magnus: durable author delivery failed: %s"
+       (message "Magnus: author message delivery failed: %s"
                 (error-message-string err))
+       nil))))
+
+(defun magnus-review-controller--scope-delivery-timeout
+    (review-id nonce runtime)
+  "Fail REVIEW-ID when NONCE still awaits delivery under exact RUNTIME."
+  (when (and (eq runtime
+                 (gethash review-id magnus-review-controller--runtimes))
+             (eq (magnus-review-controller-runtime-phase runtime)
+                 'asking-scope)
+             (equal nonce
+                    (magnus-review-controller-runtime-nonce runtime))
+             (magnus-review-controller-runtime-delivery-timer runtime))
+    (setf (magnus-review-controller-runtime-delivery-timer runtime) nil)
+    (magnus-review-controller--fail-runtime
+     runtime "the author TUI did not accept the review question before timeout")
+    (when-let ((review (magnus-review-get review-id)))
+      (message "Magnus: timed out delivering the review question to %s"
+               (magnus-review-author-name review)))))
+
+(defun magnus-review-controller--arm-delivery-timeout
+    (review-id nonce runtime)
+  "Arm exact pre-acceptance ownership for REVIEW-ID NONCE and RUNTIME."
+  (unless (and (numberp magnus-review-delivery-timeout)
+               (> magnus-review-delivery-timeout 0))
+    (error "Review delivery timeout is invalid: %S"
+           magnus-review-delivery-timeout))
+  (setf (magnus-review-controller-runtime-delivery-timer runtime)
+        (run-with-timer
+         magnus-review-delivery-timeout nil
+         #'magnus-review-controller--scope-delivery-timeout
+         review-id nonce runtime)))
+
+(defun magnus-review-controller--scope-delivery-accepted
+    (review-id nonce runtime)
+  "Start REVIEW-ID scope polling after NONCE delivery owned by RUNTIME."
+  (when (and (eq runtime
+                 (gethash review-id magnus-review-controller--runtimes))
+             (eq (magnus-review-controller-runtime-phase runtime)
+                 'asking-scope)
+             (equal nonce
+                    (magnus-review-controller-runtime-nonce runtime))
+             (null (magnus-review-controller-runtime-timer runtime)))
+    (magnus-review-controller--cancel-delivery-timer runtime)
+    (condition-case err
+        (let ((timer
+               (run-with-timer
+                (max 0.1 magnus-review-scope-poll-interval)
+                (max 0.1 magnus-review-scope-poll-interval)
+                #'magnus-review-controller--poll-scope review-id nonce)))
+          (setf (magnus-review-controller-runtime-deadline runtime)
+                (+ (float-time) magnus-review-scope-timeout)
+                (magnus-review-controller-runtime-timer runtime) timer)
+          (magnus-review-controller--changed)
+          (when-let ((review (magnus-review-get review-id)))
+            (message
+             "Magnus: asking %s which committed range belongs to its work"
+             (magnus-review-author-name review)))
+          t)
+      (error
+       (magnus-review-controller--fail-runtime
+        runtime
+        (format "could not start review-scope polling: %s"
+                (error-message-string err)))
        nil))))
 
 (defun magnus-review-controller--author-instance (review)
   "Return REVIEW's currently loaded author instance, if any."
   ;; Names are intentionally reusable; only the durable instance ID identifies
-  ;; the author that requested this review.  If it is not loaded, delivery stays
-  ;; pending until that exact Magnus instance is resurrected.
+  ;; the author that requested this review.
   (magnus-instances-get (magnus-review-author-instance-id review)))
 
-(defun magnus-review-controller--checkpoint-message (review request)
-  "Build REVIEW's idempotent author checkpoint message for exact REQUEST."
-  (let* ((root (magnus-review-project-root review))
-         (journal (magnus-coord-display-file root))
-         (instructions (magnus-coord-display-instructions-file root))
-         (token (magnus-review-checkpoint-request-token request))
-         (scope
-          (condition-case err
-              (magnus-review-suggest-upstream-scope root)
-            (error
-             (message "Magnus: could not suggest checkpoint range for %s: %s"
-                      (magnus-review-author-name review)
-                      (error-message-string err))
-             nil)))
-         (base (plist-get scope :base-oid))
-         (head (plist-get scope :head-oid)))
-    (format
-     (concat
-      "[MAGNUS-REVIEW-CHECKPOINT request=%s checkpoint=%s]\n"
-      "Prepare checkpoint request #%d for an independent review of: %s\n\n"
-      "Magnus reviews committed work only. Do not modify source files or create "
-      "another commit for this checkpoint. The sole permitted edit is the "
-      "checkpoint marker requested below. Treat %S and generated instructions "
-      "%S as Magnus control files; if any other worktree path is dirty, stop "
-      "and tell the user to ask you to commit first. Infer the task's upstream "
-      "merge-base and current committed HEAD; "
-      "Magnus's current suggestion is base=%s head=%s. Verify them yourself.\n\n"
-      "Then insert exactly one marker at the top of the Log in %S, "
-      "immediately below its comments and blank preamble, "
-      "using full object IDs (never abbreviations):\n"
-      "[REVIEW-READY request=%s checkpoint=%s base=<FULL_BASE_OID> "
-      "head=<FULL_HEAD_OID>]\n\n"
-      "The checkpoint token is an opaque Magnus correlation token: copy it "
-      "exactly. "
-      "Never generate, hash, derive, or replace it. "
-      "This request is idempotent. If that exact checkpoint was already prepared, "
-      "re-publish the same evidence; do not create an empty or unrelated commit.")
-     (magnus-review-id review)
-     token
-     (magnus-review-checkpoint-request-number request)
-     (magnus-review-task review)
-     journal
-     instructions
-     (or base "not inferred")
-     (or head "not inferred")
-     journal
-     (magnus-review-id review)
-     token)))
+;;; Ephemeral scope protocol
 
-(defun magnus-review-controller--deliver-checkpoint (review &optional request)
-  "Try to deliver REVIEW's exact pending checkpoint REQUEST.
-When REQUEST is nil, capture REVIEW's canonical pending request.  A supplied
-request is accepted only while it remains the canonical pending request."
-  (let ((pending (magnus-review-pending-checkpoint-request review)))
-    (when (and pending (or (null request) (eq request pending)))
-      (when-let ((author (magnus-review-controller--author-instance review)))
-        (magnus-review-controller--send
-         author
-         (magnus-review-controller--checkpoint-message review pending))))))
+(defun magnus-review-controller--nonce ()
+  "Return an unpredictable in-memory scope correlation token."
+  (substring
+   (secure-hash
+    'sha256
+    (format "%s:%s:%s:%s:%s"
+            (float-time) (emacs-pid) (user-uid) (random) (current-time)))
+   0 32))
 
-(defun magnus-review-controller--recover-checkpoint-token (review _marker)
-  "Redeliver REVIEW's canonical request after an author used a stale token."
-  (when-let ((request (magnus-review-pending-checkpoint-request review)))
-    (magnus-review-controller--deliver-checkpoint review request)))
+(defun magnus-review-controller--scope-message (review nonce)
+  "Build REVIEW's ordinary author question correlated by NONCE."
+  (format
+   (concat
+    "[MAGNUS-REVIEW-SCOPE-REQUEST request=%s]\n"
+    "The user wants %s to perform an independent review of your recent "
+    "committed work on: %s\n\n"
+    "Do not modify files or create a commit. Inspect Git and use your own "
+    "task context to identify the exact contiguous committed tree range that "
+    "represents the work to review. BASE is the excluded boundary and HEAD is "
+    "the inclusive final commit. Other agents' interleaved commits may be in "
+    "that range; choose an honest integration range rather than inventing a "
+    "synthetic commit list. Use full object IDs.\n\n"
+    "Reply in your normal assistant response with exactly one of:\n"
+    "[MAGNUS-REVIEW-SCOPE request=%s status=ready base=<FULL_OID> head=<FULL_OID>]\n"
+    "[MAGNUS-REVIEW-SCOPE request=%s status=uncommitted]\n"
+    "[MAGNUS-REVIEW-SCOPE request=%s status=no-commits]\n"
+    "[MAGNUS-REVIEW-SCOPE request=%s status=ambiguous]\n"
+    "Do not write a Magnus coordination file or any other file. The request "
+    "token is opaque; copy it exactly.")
+   nonce
+   (magnus-review-reviewer-name review)
+   (or (magnus-review-task review) "the selected task")
+   nonce nonce nonce nonce))
 
-(defun magnus-review-resend-checkpoint (review)
-  "Resend REVIEW's current checkpoint request without rotating its token."
-  (interactive
-   (list (or (and (fboundp 'magnus-review-ui-current-review)
-                  (magnus-review-ui-current-review))
-             (user-error "No review selected"))))
-  (let ((request (magnus-review-pending-checkpoint-request review)))
-    (unless request
-      (user-error "Review by %s is not waiting for a checkpoint"
-                  (magnus-review-reviewer-name review)))
-    ;; A manual resend is also a recovery action: restore the durable Markdown
-    ;; watcher before asking the author to publish its checkpoint marker.
-    (magnus-coord-start-watching (magnus-review-project-root review))
-    ;; Watcher acquisition synchronously replays durable markers.  That replay
-    ;; may accept this exact request, so never dirty-check or deliver a stale
-    ;; capture after coordination state has already advanced.
-    (if (not (eq request
-                 (magnus-review-pending-checkpoint-request review)))
-        (message "Magnus: checkpoint state advanced while its watcher recovered")
-      (magnus-review-controller--require-committed-work
-       (magnus-review-project-root review))
-      (if (magnus-review-controller--deliver-checkpoint review request)
-          (message "Magnus: resent checkpoint request %d to %s"
-                   (magnus-review-checkpoint-request-number request)
-                   (magnus-review-author-name review))
-        (message "Magnus: checkpoint request will reach %s when it resumes"
-                 (magnus-review-author-name review)))))
-  review)
+(defun magnus-review-controller--scope-fields (body)
+  "Parse whitespace-delimited key=value fields from marker BODY."
+  (let (fields)
+    (dolist (word (split-string body "[ \t]+" t))
+      (when (string-match "\\`\\([^=]+\\)=\\(.+\\)\\'" word)
+        (push (cons (match-string 1 word) (match-string 2 word)) fields)))
+    fields))
+
+(defun magnus-review-controller--parse-scope-response (text nonce)
+  "Return NONCE's first structured scope response found in TEXT."
+  (let ((position 0) found)
+    (while (and (not found)
+                (string-match
+                 "\\[MAGNUS-REVIEW-SCOPE[ \t]+\\([^]\n]+\\)\\]"
+                 text position))
+      (let* ((marker-end (match-end 0))
+             (body (match-string 1 text))
+             (fields
+              (magnus-review-controller--scope-fields
+               body))
+             (request (cdr (assoc "request" fields))))
+        (when (equal request nonce)
+          (setq found
+                (list :status (cdr (assoc "status" fields))
+                      :base (cdr (assoc "base" fields))
+                      :head (cdr (assoc "head" fields)))))
+        (setq position marker-end)))
+    found))
 
 (defun magnus-review-controller--matching-open-review (author root task)
-  "Find AUTHOR's open review for ROOT and TASK."
+  "Find AUTHOR's open review lineage for ROOT and TASK."
   (seq-find
    (lambda (review)
      (and (eq (magnus-review-lifecycle review) 'open)
@@ -912,46 +1081,38 @@ request is accepted only while it remains the canonical pending request."
    (magnus-review-list)))
 
 (defun magnus-review-controller--operation (review)
-  "Classify REVIEW's next user operation and return its stable state key.
-The returned plist contains :action and :state-key, plus the exact canonical
-:request or :round when applicable.  Checkpoint waiting is determined only by
-the schema-2 request ledger; aggregate compatibility caches are never treated
-as checkpoint authority."
+  "Classify REVIEW's next user operation and return a stable state key."
   (if (null review)
       (list :action 'new :state-key '(new))
-    (let* ((request (magnus-review-pending-checkpoint-request review))
+    (let* ((runtime (magnus-review-controller--runtime review))
+           (execution (magnus-review-execution review))
            (round (magnus-review-latest-round review))
-           (attempt (and round (magnus-review-latest-attempt round)))
-           (execution
-            (and round (magnus-review-round-execution round)))
            (action
             (cond
-             (request 'waiting)
-             ((eq execution 'complete) 'rereview)
-             ((memq execution '(failed interrupted)) 'retry)
+             ((eq (magnus-review-lifecycle review) 'archived) 'archived)
+             ((eq execution 'asking-scope) 'asking)
              ((eq execution 'queued) 'queued)
-             ((memq execution '(starting running)) 'running)
-             (t 'new)))
-           (state-key
-            (if request
-                (list
-                 'waiting
-                 (magnus-review-id review)
-                 (magnus-review-lifecycle review)
-                 (magnus-review-checkpoint-request-number request)
-                 (magnus-review-checkpoint-request-token request))
-              (list
-               action
-               (magnus-review-id review)
-               (magnus-review-lifecycle review)
-               (and round (magnus-review-round-number round))
-               execution
-               (and round (magnus-review-round-head-oid round))
-               (and attempt (magnus-review-attempt-number attempt))
-               (and attempt (magnus-review-attempt-token attempt))
-               (and attempt (magnus-review-attempt-execution attempt))))))
-      (list :action action :state-key state-key
-            :request request :round round :execution execution))))
+             ((eq execution 'running) 'running)
+             ((memq execution '(failed interrupted)) 'retry)
+             (round 'rereview)
+             (t 'retry)))
+           (candidate
+            (and runtime (magnus-review-controller-runtime-round runtime))))
+      (list
+       :action action
+       :execution execution
+       :round round
+       :state-key
+       (list action
+             (magnus-review-id review)
+             (magnus-review-lifecycle review)
+             (and round (magnus-review-round-number round))
+             (and round (magnus-review-round-head-oid round))
+             (and runtime (magnus-review-controller-runtime-phase runtime))
+             (and runtime (magnus-review-controller-runtime-nonce runtime))
+             (and candidate (magnus-review-round-number candidate))
+             (and candidate (magnus-review-round-base-oid candidate))
+             (and candidate (magnus-review-round-head-oid candidate)))))))
 
 (defun magnus-review-controller--require-committed-work (root)
   "Require ROOT to have no tracked or untracked work outside commits."
@@ -959,7 +1120,7 @@ as checkpoint authority."
     (user-error "%s" magnus-review-uncommitted-message)))
 
 (defun magnus-review-controller--request-context-key (context)
-  "Return the complete durable identity represented by request CONTEXT."
+  "Return the complete identity represented by request CONTEXT."
   (let ((author (plist-get context :author))
         (review (plist-get context :review)))
     (list (and author (magnus-instance-id author))
@@ -969,11 +1130,7 @@ as checkpoint authority."
           (plist-get context :state-key))))
 
 (defun magnus-review-request-context (author)
-  "Return the current task-scoped review context for AUTHOR.
-The returned plist contains :root, :task, :review, :action, and :state-key.
-ACTION is one of `new', `rereview', `retry', `waiting', `queued', or
-`running'.  STATE-KEY snapshots the exact operation identity so transient UIs
-can reject a popup whose review changed without changing its broad ACTION."
+  "Return the current task-scoped review context for AUTHOR."
   (let* ((root (magnus-review-git-root
                 (magnus-instance-directory author)))
          (task (magnus-review-controller--task author root))
@@ -985,12 +1142,173 @@ can reject a popup whose review changed without changing its broad ACTION."
           :state-key (plist-get operation :state-key)
           :execution (plist-get operation :execution))))
 
+(defun magnus-review-controller--scope-error-message (status)
+  "Return the user-facing failure represented by scope STATUS."
+  (pcase status
+    ("uncommitted" magnus-review-uncommitted-message)
+    ("no-commits" "the instance reported no committed work to review")
+    ("ambiguous" "the instance could not identify one honest committed range")
+    (_ (format "the instance returned unsupported scope status %S" status))))
+
+(defun magnus-review-controller--canonical-scope (review base head)
+  "Validate REVIEW's author-proposed BASE and HEAD and return canonical OIDs."
+  (unless (and (stringp base) (stringp head)
+               (string-match-p
+                "\\`\\(?:[[:xdigit:]]\\{40\\}\\|[[:xdigit:]]\\{64\\}\\)\\'"
+                base)
+               (string-match-p
+                "\\`\\(?:[[:xdigit:]]\\{40\\}\\|[[:xdigit:]]\\{64\\}\\)\\'"
+                head))
+    (signal 'magnus-review-git-error
+            (list "Author scope must use full commit object IDs")))
+  (let* ((root (magnus-review-project-root review))
+         (resolved-base (magnus-review-resolve-oid root base))
+         (resolved-head (magnus-review-resolve-oid root head))
+         (current-head (magnus-review-resolve-oid root "HEAD")))
+    (unless (and (string= (downcase base) resolved-base)
+                 (string= (downcase head) resolved-head))
+      (signal 'magnus-review-git-error
+              (list "Author scope must use canonical full commit object IDs")))
+    (unless (magnus-review-base-ancestor-p root resolved-base resolved-head)
+      (signal 'magnus-review-git-error
+              (list "Author review base is not an ancestor of its head")))
+    (unless (magnus-review-base-ancestor-p root resolved-head current-head)
+      (signal 'magnus-review-git-error
+              (list "Author review head is not reachable from current HEAD")))
+    (magnus-review-controller--require-committed-work root)
+    (cons resolved-base resolved-head)))
+
+(defun magnus-review-controller--scope-finished (review runtime response)
+  "Consume REVIEW RUNTIME's correlated scope RESPONSE."
+  (let ((status (plist-get response :status)))
+    (if (not (equal status "ready"))
+        (let ((failure
+               (magnus-review-controller--scope-error-message status)))
+          (magnus-review-controller--fail-runtime runtime failure)
+          (message "Magnus: %s" failure))
+      (condition-case err
+          (pcase-let* ((`(,base . ,head)
+                        (magnus-review-controller--canonical-scope
+                         review (plist-get response :base)
+                         (plist-get response :head)))
+                       (latest (magnus-review-latest-round review)))
+            (magnus-review-controller--cancel-scope-timer runtime)
+            (if (and latest
+                     (string= base (magnus-review-round-base-oid latest))
+                     (string= head (magnus-review-round-head-oid latest)))
+                (progn
+                  (remhash (magnus-review-id review)
+                           magnus-review-controller--runtimes)
+                  (magnus-review-controller--changed)
+                  (message
+                   "Magnus: %s selected the already-reviewed round %s..%s"
+                   (magnus-review-author-name review)
+                   (substring base 0 8) (substring head 0 8)))
+              (let ((round
+                     (magnus-review-prepare-round
+                      review base head :metadata '((scope_source . author)))))
+                (setf (magnus-review-controller-runtime-round runtime) round
+                      (magnus-review-controller-runtime-phase runtime) 'queued
+                      (magnus-review-controller-runtime-error runtime) nil)
+                (magnus-review-controller--start-round review runtime round))))
+        (error
+         (let ((failure (error-message-string err)))
+           (magnus-review-controller--fail-runtime runtime failure)
+           (message "Magnus: rejected %s's review scope: %s"
+                    (magnus-review-author-name review) failure)))))))
+
+(defun magnus-review-controller--poll-scope (review-id nonce)
+  "Poll REVIEW-ID's author transcript for the response to NONCE."
+  (when-let* ((review (magnus-review-get review-id))
+              (runtime (gethash review-id
+                                magnus-review-controller--runtimes)))
+    (when (and (eq (magnus-review-controller-runtime-phase runtime)
+                   'asking-scope)
+               (equal nonce
+                      (magnus-review-controller-runtime-nonce runtime)))
+      (if (> (float-time)
+             (magnus-review-controller-runtime-deadline runtime))
+          (progn
+            (magnus-review-controller--fail-runtime
+             runtime "the author did not identify a review scope before timeout")
+            (message "Magnus: timed out asking %s for its committed range"
+                     (magnus-review-author-name review)))
+        (condition-case err
+            (let ((texts
+                   (magnus-trace-cursor-read
+                    (magnus-review-controller-runtime-cursor runtime)))
+                  response)
+              (while (and texts (not response))
+                (setq response
+                      (magnus-review-controller--parse-scope-response
+                       (pop texts) nonce)))
+              (when response
+                (magnus-review-controller--scope-finished
+                 review runtime response)))
+          (error
+           (let ((failure
+                  (format "could not read the author's response: %s"
+                          (error-message-string err))))
+             (magnus-review-controller--fail-runtime runtime failure)
+             (message "Magnus: %s" failure))))))))
+
+(defun magnus-review-controller--begin-scope-query (review author)
+  "Ask AUTHOR to identify REVIEW's exact committed range."
+  (when magnus-review-controller--shutting-down
+    (user-error "Magnus is shutting down"))
+  (unless (eq (magnus-review-lifecycle review) 'open)
+    (user-error "Archived reviews cannot accept another round"))
+  (magnus-review-controller--require-committed-work
+   (magnus-review-project-root review))
+  (unless (magnus-review-controller--instance-running-p author)
+    (user-error "Resume %s before requesting its review scope"
+                (magnus-instance-name author)))
+  (let* ((cursor (or (magnus-trace-cursor-create author)
+                     (user-error "No provider trace is available yet for %s"
+                                 (magnus-instance-name author))))
+         (nonce (magnus-review-controller--nonce))
+         (runtime
+          (magnus-review-controller--make-runtime
+           :review-id (magnus-review-id review)
+           :phase 'asking-scope
+           :nonce nonce
+           :cursor cursor)))
+    (puthash (magnus-review-id review) runtime
+             magnus-review-controller--runtimes)
+    (condition-case err
+        (magnus-review-controller--arm-delivery-timeout
+         (magnus-review-id review) nonce runtime)
+      (error
+       (magnus-review-controller--fail-runtime
+        runtime (error-message-string err))))
+    (unless (eq (magnus-review-controller-runtime-phase runtime) 'failed)
+      (let ((delivery
+             (magnus-review-controller--send
+              author (magnus-review-controller--scope-message review nonce)
+              (lambda ()
+                (magnus-review-controller--scope-delivery-accepted
+                 (magnus-review-id review) nonce runtime))
+              runtime)))
+        (pcase delivery
+          ('queued
+           (magnus-review-controller--changed)
+           (message "Magnus: review question is queued for %s"
+                    (magnus-instance-name author)))
+          ('t
+           ;; Providers normally call the receipt synchronously for submitted
+           ;; input.  Preserve the contract for a transport that only reports
+           ;; synchronous acceptance.
+           (magnus-review-controller--scope-delivery-accepted
+            (magnus-review-id review) nonce runtime))
+          (_
+           (magnus-review-controller--fail-runtime
+            runtime "the author TUI did not accept the scope question")))))
+    review))
+
 ;;;###autoload
 (cl-defun magnus-review-request
     (author &key provider model effort context)
-  "Request an independent review of AUTHOR without prompting for Git objects.
-CONTEXT, when non-nil, must be a freshly validated value returned by
-`magnus-review-request-context'; interactive callers normally leave it nil."
+  "Ask AUTHOR for its committed range, then run an independent review."
   (interactive (list (magnus-review-controller--author-at-point)))
   (let* ((supplied-context context)
          (context (magnus-review-request-context author))
@@ -1010,8 +1328,6 @@ CONTEXT, when non-nil, must be a freshly validated value returned by
     (if existing
         (pcase (plist-get operation :action)
           ('rereview (magnus-review-rereview existing))
-          ('waiting
-           (magnus-review-resend-checkpoint existing))
           ('retry (magnus-review-retry existing))
           (_ (user-error "Review by %s is already %s"
                          (magnus-review-reviewer-name existing)
@@ -1021,7 +1337,7 @@ CONTEXT, when non-nil, must be a freshly validated value returned by
               (magnus-review-controller--provider author provider))
              (_supported
               (unless (magnus-provider-symbol-operation-p
-                       reviewer-provider 'headless-review-spec)
+                       reviewer-provider 'headless-spec)
                 (user-error "Provider %s cannot run headless reviews"
                             reviewer-provider)))
              (reviewer-selection
@@ -1046,171 +1362,249 @@ CONTEXT, when non-nil, must be a freshly validated value returned by
                       (or (plist-get reviewer-selection :expertise)
                           (plist-get reviewer-selection :summary))
                       1200))))))
-        (magnus-coord-start-watching root)
-        (if (magnus-review-controller--deliver-checkpoint
-             review (magnus-review-pending-checkpoint-request review))
-            (message "Magnus: %s will review %s after its committed checkpoint"
-                     reviewer-name (magnus-instance-name author))
-          (message "Magnus: review queued; checkpoint request will reach %s when it resumes"
-                   (magnus-instance-name author)))
+        (condition-case err
+            (magnus-review-controller--begin-scope-query review author)
+          (error
+           (let ((runtime
+                  (or (magnus-review-controller--runtime review)
+                      (magnus-review-controller--make-runtime
+                       :review-id (magnus-review-id review)))))
+             (puthash (magnus-review-id review) runtime
+                      magnus-review-controller--runtimes)
+             (magnus-review-controller--fail-runtime
+              runtime (error-message-string err)))
+           (signal (car err) (cdr err))))
         review))))
 
 (defun magnus-review-rereview (review)
-  "Request the next committed round from REVIEW's existing author session."
+  "Ask REVIEW's author to identify the next committed review round."
   (interactive
    (list (or (and (fboundp 'magnus-review-ui-current-review)
                   (magnus-review-ui-current-review))
              (user-error "No review selected"))))
-  (if (magnus-review-pending-checkpoint-request review)
-      (magnus-review-resend-checkpoint review)
-    (magnus-review-controller--require-committed-work
-     (magnus-review-project-root review))
-    (magnus-review-await-checkpoint review)
-    ;; A previous round may have released the project's last watcher.  Acquire
-    ;; durable checkpoint observation before asking the author to publish the
-    ;; next marker.
-    (magnus-coord-start-watching (magnus-review-project-root review))
-    (let ((request (magnus-review-pending-checkpoint-request review)))
-      (unless request
-        (error "Checkpoint transition did not create a pending request"))
-      (magnus-review-controller--deliver-checkpoint review request))
-    (message "Magnus: requested round %d from %s"
-             (1+ (length (magnus-review-rounds review)))
-             (magnus-review-author-name review))
-    review))
+  (when (magnus-review-controller--runtime review)
+    (user-error "Review by %s already has work in progress"
+                (magnus-review-reviewer-name review)))
+  (let ((author (or (magnus-review-controller--author-instance review)
+                    (user-error "The original author instance is not loaded"))))
+    (magnus-review-controller--begin-scope-query review author)))
 
 (defun magnus-review-retry (review)
-  "Retry REVIEW's latest failed or interrupted exact round."
+  "Repeat REVIEW's disposable failed work."
   (interactive
    (list (or (and (fboundp 'magnus-review-ui-current-review)
                   (magnus-review-ui-current-review))
              (user-error "No review selected"))))
-  (let ((round (or (magnus-review-latest-round review)
-                   (user-error "Review has no checkpoint to retry"))))
-    (unless (memq (magnus-review-round-execution round) '(failed interrupted queued))
-      (user-error "Round %d is %s, not retryable"
-                  (magnus-review-round-number round)
-                  (magnus-review-round-execution round)))
-    ;; A model may have completed and durably published its token-scoped result
-    ;; immediately before Emacs died (or before rendering the report failed).
-    ;; Recover that exact attempt before ever allocating a replacement attempt.
-    (unless (magnus-review-controller--adopt-artifacts review round)
-      (magnus-review-controller--enqueue review round))
-    review))
+  (let ((runtime (magnus-review-controller--runtime review)))
+    (unless (and runtime
+                 (memq (magnus-review-controller-runtime-phase runtime)
+                       '(failed interrupted)))
+      (user-error "Review by %s has no failed work to repeat"
+                  (magnus-review-reviewer-name review)))
+    (if-let ((round (magnus-review-controller-runtime-round runtime)))
+        (condition-case err
+            (progn
+              (setf (magnus-review-controller-runtime-phase runtime) 'queued
+                    (magnus-review-controller-runtime-error runtime) nil)
+              (magnus-review-controller--start-round review runtime round))
+          (error
+           (magnus-review-controller--fail-runtime
+            runtime (error-message-string err))
+           (signal (car err) (cdr err))))
+      (let ((author
+             (or (magnus-review-controller--author-instance review)
+                 (user-error "The original author instance is not loaded"))))
+        (magnus-review-controller--begin-scope-query review author)))))
 
-(defun magnus-review-retry-delivery (review &optional round)
-  "Retry author delivery for completed REVIEW ROUND.
-This is distinct from rerunning the reviewer: canonical artifacts and verdict
-remain unchanged while Magnus resubmits their idempotent result notice."
+(defun magnus-review-restart-session (review)
+  "Repeat REVIEW's retained candidate in a fresh provider session.
+The reviewer identity, exact committed evidence, and complete successful
+lineage remain unchanged.  A successful result replaces the lineage's prior
+provider session ID; failed execution remains ephemeral and retryable."
   (interactive
    (list (or (and (fboundp 'magnus-review-ui-current-review)
                   (magnus-review-ui-current-review))
              (user-error "No review selected"))))
-  ;; From the status buffer, choose the newest completed round that still needs
-  ;; delivery.  From the reader, ROUND pins the historical round on screen.
-  (setq round
-        (or round
-            (car
-             (last
-              (cl-remove-if-not
-               (lambda (candidate)
-                 (and (eq (magnus-review-round-execution candidate) 'complete)
-                      (not (eq (magnus-review-round-delivery-state candidate)
-                               'sent))))
-               (magnus-review-rounds review))))
-            (magnus-review-latest-round review)))
-  (unless (and round (eq (magnus-review-round-execution round) 'complete))
-    (user-error "Review has no completed round to deliver"))
-  (when (eq (magnus-review-round-delivery-state round) 'sent)
-    (user-error "Review round %d was already accepted by the author transport"
-                (magnus-review-round-number round)))
-  (let ((outcome (magnus-review-controller--try-delivery review round)))
-    (message (pcase outcome
-               ('queued "Magnus: review delivery queued behind the author TUI")
-               ('t "Magnus: review delivery accepted by the author transport")
-               (_ "Magnus: review delivery is still pending")))
-    outcome))
+  (let* ((runtime (magnus-review-controller--runtime review))
+         (round (and runtime
+                     (magnus-review-controller-runtime-round runtime))))
+    (unless (and runtime round
+                 (memq (magnus-review-controller-runtime-phase runtime)
+                       '(failed interrupted)))
+      (user-error "Review by %s has no failed candidate to restart"
+                  (magnus-review-reviewer-name review)))
+    (setf (magnus-review-controller-runtime-fresh-session-p runtime) t
+          (magnus-review-controller-runtime-phase runtime) 'queued
+          (magnus-review-controller-runtime-job runtime) nil
+          (magnus-review-controller-runtime-error runtime) nil)
+    (condition-case err
+        (progn
+          (magnus-review-controller--start-round review runtime round)
+          (message "Magnus: restarting %s in a fresh reviewer session"
+                   (magnus-review-reviewer-name review))
+          review)
+      (error
+       (magnus-review-controller--fail-runtime
+        runtime (error-message-string err))
+       (signal (car err) (cdr err))))))
 
 (defun magnus-review-interrupt (review)
-  "Interrupt REVIEW's currently running headless attempt.
-The exact process/round/token owner is revoked before cancellation, so its
-sentinel cannot publish a stale failure or completion.  The interrupted round
-keeps its immutable evidence and can be resumed with `magnus-review-retry'."
+  "Interrupt REVIEW's disposable scope query or reviewer execution."
   (interactive
    (list (or (and (fboundp 'magnus-review-ui-current-review)
                   (magnus-review-ui-current-review))
              (user-error "No review selected"))))
-  (let* ((review-id (magnus-review-id review))
-         (owner (gethash review-id magnus-review-controller--processes))
-         (process (plist-get owner :process))
-         (round-number (plist-get owner :round-number))
-         (token (plist-get owner :attempt-token))
-         (context
-          (and owner
-               (magnus-review-controller--context
-                review-id round-number token '(starting running)))))
-    (unless context
-      (user-error "Review by %s has no running attempt to interrupt"
-                  (magnus-review-reviewer-name review)))
-    ;; Revoke ownership first.  `magnus-headless-cancel' can synchronously run
-    ;; a sentinel, and that callback must observe itself as stale.
-    (magnus-review-controller--cancel-watchdog owner)
-    (remhash review-id magnus-review-controller--processes)
-    (unwind-protect
-        (pcase-let ((`(,current-review ,round ,attempt) context))
-          (condition-case err
-              (magnus-review-interrupt-attempt
-               current-review round attempt
-               "Interrupted by user" token 'manual)
-            (error
-             ;; Cancellation remains the user's requested invariant even when
-             ;; persistence is temporarily unavailable.  Startup recovery will
-             ;; reconcile any active manifest left on disk.
-             (display-warning
-              'magnus-review
-              (format "Could not persist interrupted review %s: %s"
-                      review-id (error-message-string err))
-              :warning))))
-      (condition-case err
-          (when (and process (process-live-p process))
-            (magnus-headless-cancel process t))
-        (error
-         (display-warning
-          'magnus-review
-          (format "Could not cancel review process %s: %s"
-                  review-id (error-message-string err))
-          :warning)))
-      ;; The only global execution slot is now free even if persistence or
-      ;; process cancellation reported an error.
-      (magnus-review-controller--pump))
-    (message "Magnus: interrupted review by %s; use retry to resume it"
+  (let ((runtime (or (magnus-review-controller--runtime review)
+                     (user-error "Review by %s has no work to interrupt"
+                                 (magnus-review-reviewer-name review)))))
+    (magnus-review-controller--cancel-scope-timer runtime)
+    (magnus-review-controller--cancel-delivery-timer runtime)
+    (magnus-review-controller--cancel-delivery runtime)
+    (when-let ((key (magnus-review-controller-runtime-job-key runtime)))
+      (magnus-background-cancel key))
+    (setf (magnus-review-controller-runtime-phase runtime) 'interrupted
+          (magnus-review-controller-runtime-job runtime) nil
+          (magnus-review-controller-runtime-error runtime)
+          "Interrupted by user")
+    (magnus-review-controller--changed)
+    (message "Magnus: interrupted review by %s; repeat it from the review menu"
              (magnus-review-reviewer-name review))
     review))
 
 ;;; Canonical artifacts
 
 (defun magnus-review-controller--read-json (path)
-  "Read JSON artifact PATH as alists and vectors."
-  (when (and (file-regular-p path) (not (file-symlink-p path)))
-    (with-temp-buffer
-      (insert-file-contents path)
-      (json-parse-buffer :object-type 'alist :array-type 'array
-                         :null-object nil :false-object :json-false))))
+  "Read regular non-symlink JSON artifact PATH as alists and vectors.
+Signal when the artifact is missing, unsafe, oversized, or malformed."
+  (unless (and (file-regular-p path) (not (file-symlink-p path)))
+    (error "Review result artifact is missing or unsafe: %s" path))
+  (let ((size (file-attribute-size (file-attributes path 'string))))
+    (unless (and (integerp size)
+                 (<= size magnus-review-controller--result-artifact-limit))
+      (error "Review result artifact exceeds %d bytes: %s"
+             magnus-review-controller--result-artifact-limit path)))
+  (with-temp-buffer
+    (insert-file-contents path)
+    (json-parse-buffer :object-type 'alist :array-type 'array
+                       :null-object nil :false-object :json-false)))
 
 (defun magnus-review-controller--result-body (envelope)
   "Return canonical result contained in ENVELOPE."
-  (or (magnus-review-controller--field envelope :result) envelope))
+  (unless (magnus-review-controller--field-present-p envelope :result)
+    (error "Review result envelope has no result body"))
+  (let ((result (magnus-review-controller--field envelope :result)))
+    (unless (listp result)
+      (error "Review result envelope body is not an object"))
+    result))
 
-(defun magnus-review-controller--prior-result (review round)
-  "Return the canonical result preceding REVIEW ROUND, if any."
-  (let* ((number (magnus-review-round-number round))
-         (previous (and (> number 1)
-                        (nth (- number 2) (magnus-review-rounds review)))))
-    (when previous
-      (when-let ((envelope
-                  (magnus-review-controller--read-json
-                   (magnus-review-round-result-path review previous))))
-        (magnus-review-controller--result-body envelope)))))
+(defun magnus-review-controller--validate-envelope (review round envelope)
+  "Validate durable ENVELOPE identity for REVIEW ROUND and return its body."
+  (unless (listp envelope)
+    (error "Review round %d result envelope is not an object"
+           (magnus-review-round-number round)))
+  (dolist (field '(:artifact_schema_version :review_id :round_number
+                   :base_oid :head_oid :result))
+    (unless (magnus-review-controller--field-present-p envelope field)
+      (error "Review round %d envelope is missing `%s'"
+             (magnus-review-round-number round) field)))
+  (unless (equal (magnus-review-controller--field
+                  envelope :artifact_schema_version)
+                 1)
+    (error "Review round %d uses an unsupported result artifact schema"
+           (magnus-review-round-number round)))
+  (unless (equal (magnus-review-controller--field envelope :review_id)
+                 (magnus-review-id review))
+    (error "Review round %d result belongs to a different review"
+           (magnus-review-round-number round)))
+  (unless (equal (magnus-review-controller--field envelope :round_number)
+                 (magnus-review-round-number round))
+    (error "Review round %d result has the wrong round identity"
+           (magnus-review-round-number round)))
+  (dolist (entry `((:base_oid . ,(magnus-review-round-base-oid round))
+                   (:head_oid . ,(magnus-review-round-head-oid round))))
+    (unless (equal (magnus-review-controller--field envelope (car entry))
+                   (cdr entry))
+      (error "Review round %d result has the wrong %s"
+             (magnus-review-round-number round) (car entry))))
+  (magnus-review-controller--result-body envelope))
+
+(defun magnus-review-controller--result-digest (result)
+  "Return the semantic SHA-256 digest of canonical RESULT."
+  (secure-hash
+   'sha256
+   (json-serialize result :null-object nil :false-object :json-false)))
+
+(defun magnus-review-controller--completed-result
+    (review round prior history)
+  "Read and validate one completed REVIEW ROUND after PRIOR and HISTORY.
+HISTORY contains every canonical result older than PRIOR, in round order."
+  (let* ((path (magnus-review-round-result-path review round))
+         (envelope
+          (condition-case err
+              (magnus-review-controller--read-json path)
+            (error
+             (error "Cannot read completed review round %d: %s"
+                    (magnus-review-round-number round)
+                    (error-message-string err)))))
+         (raw (magnus-review-controller--validate-envelope
+               review round envelope)))
+    (condition-case err
+        (let* ((canonical
+                (magnus-review-controller-normalize-result
+                 review round raw prior t history))
+               (findings
+                (magnus-review-controller--array
+                 (magnus-review-controller--field canonical :findings)
+                 'findings))
+               (expected-count
+                (alist-get 'finding_count
+                           (magnus-review-round-metadata round)))
+               (expected-digest
+                (alist-get 'result_sha256
+                           (magnus-review-round-metadata round))))
+          (unless (eq (magnus-review-controller--verdict-symbol canonical)
+                      (magnus-review-round-verdict round))
+            (error "result verdict disagrees with the durable manifest"))
+          (unless (and (integerp expected-count)
+                       (>= expected-count 0)
+                       (= expected-count (length findings)))
+            (error "result finding count disagrees with the durable manifest"))
+          (unless (and (stringp expected-digest)
+                       (string-match-p
+                        "\\`[[:xdigit:]]\\{64\\}\\'" expected-digest)
+                       (string= expected-digest
+                                (magnus-review-controller--result-digest
+                                 canonical)))
+            (error "result digest disagrees with the durable manifest"))
+          canonical)
+      (error
+       (error "Completed review round %d is invalid: %s"
+              (magnus-review-round-number round)
+              (error-message-string err))))))
+
+(defun magnus-review-controller--history (review candidate-round)
+  "Return REVIEW's complete validated lineage before CANDIDATE-ROUND.
+Missing, corrupt, out-of-order, or identity-mismatched durable evidence blocks
+the next round instead of silently forgetting prior findings."
+  (let* ((rounds (magnus-review-rounds review))
+         (expected-candidate (1+ (length rounds)))
+         (number 0)
+         history)
+    (unless (= (magnus-review-round-number candidate-round)
+               expected-candidate)
+      (error "Review candidate round %d is obsolete; expected round %d"
+             (magnus-review-round-number candidate-round)
+             expected-candidate))
+    (dolist (round rounds)
+      (cl-incf number)
+      (unless (= (magnus-review-round-number round) number)
+        (error "Review lineage is not sequential at round %d" number))
+      (let* ((prior (car (last history)))
+             (older (butlast history))
+             (result (magnus-review-controller--completed-result
+                      review round prior older)))
+        (setq history (append history (list result)))))
+    history))
 
 (defun magnus-review-controller--verdict-symbol (result)
   "Return durable verdict symbol for canonical RESULT."
@@ -1304,13 +1698,11 @@ keeps its immutable evidence and can be resumed with `magnus-review-retry'."
      (magnus-review-controller--markdown-list
       tests "No validation was reported.") "\n")))
 
-(defun magnus-review-controller--result-envelope
-    (review round attempt result)
-  "Wrap canonical RESULT in token-scoped durable identity."
+(defun magnus-review-controller--result-envelope (review round result)
+  "Wrap canonical RESULT in immutable REVIEW ROUND identity."
   `((artifact_schema_version . 1)
     (review_id . ,(magnus-review-id review))
     (round_number . ,(magnus-review-round-number round))
-    (attempt_token . ,(magnus-review-attempt-token attempt))
     (base_oid . ,(magnus-review-round-base-oid round))
     (head_oid . ,(magnus-review-round-head-oid round))
     (created_at . ,(float-time))
@@ -1321,548 +1713,77 @@ keeps its immutable evidence and can be resumed with `magnus-review-retry'."
   (concat (json-serialize object :null-object nil :false-object :json-false)
           "\n"))
 
-(defun magnus-review-controller--metadata-put (round key value)
-  "Set ROUND metadata alist KEY to VALUE."
-  (let ((metadata (assq-delete-all key (magnus-review-round-metadata round))))
-    (setf (magnus-review-round-metadata round)
-          (cons (cons key value) metadata))))
-
-(defun magnus-review-controller--publish-result (review round attempt raw)
+(defun magnus-review-controller--publish-result
+    (review round raw &optional session-id)
   "Validate RAW, publish REVIEW ROUND artifacts, and return canonical result."
-  (let* ((prior (magnus-review-controller--prior-result review round))
+  (let* ((history (magnus-review-controller--history review round))
+         (prior (car (last history)))
+         (older (butlast history))
          (patch (magnus-review-controller--patch review round))
          (result
           (magnus-review-controller-anchor-result
            review round
            (magnus-review-controller-normalize-result
-            review round raw prior)
+            review round raw prior nil older)
            patch))
          (envelope
-          (magnus-review-controller--result-envelope
-           review round attempt result))
-         (report (magnus-review-controller--render-report review round result)))
-    ;; The process/round/attempt CAS is checked by the caller immediately before
-    ;; this non-yielding publication block.  Artifacts precede the single
-    ;; manifest completion transition, enabling crash adoption on startup.
+          (magnus-review-controller--result-envelope review round result))
+         (report (magnus-review-controller--render-report review round result))
+         (result-digest (magnus-review-controller--result-digest result))
+         (metadata
+          (cons
+           (cons 'finding_count
+                 (length
+                  (magnus-review-controller--array
+                   (magnus-review-controller--field result :findings)
+                   'findings)))
+           (cons
+            (cons 'result_sha256 result-digest)
+            (assq-delete-all
+             'result_sha256
+             (assq-delete-all
+              'finding_count
+              (copy-tree (magnus-review-round-metadata round))))))))
+    ;; Final artifacts precede the one durable lineage transition.  If Emacs
+    ;; dies before that transition they remain inert and a repeated request may
+    ;; safely overwrite them.
     (magnus-review-write-artifact
      review (magnus-review-round-result-path review round)
-     (magnus-review-controller--json envelope) 'utf-8-unix)
+     (magnus-review-controller--json envelope) 'utf-8-unix t)
     (magnus-review-write-artifact
      review (magnus-review-round-report-path review round)
-     report 'utf-8-unix)
-    (magnus-review-controller--metadata-put
-     round 'finding_count
-     (length (magnus-review-controller--array
-              (magnus-review-controller--field result :findings) 'findings)))
-    (magnus-review-complete-attempt
-     review round attempt (magnus-review-controller--verdict-symbol result)
-     (magnus-review-attempt-token attempt))
+     report 'utf-8-unix t)
+    (magnus-review-complete-round
+     review round (magnus-review-controller--verdict-symbol result)
+     :session-id session-id :metadata metadata)
     result))
 
-;;; Token-guarded execution queue
-
-(defun magnus-review-controller--queue-key (review round)
-  "Return stable queue identity for REVIEW ROUND."
-  (cons (magnus-review-id review) (magnus-review-round-number round)))
-
-(defun magnus-review-controller--enqueue (review round)
-  "Enqueue REVIEW ROUND once and pump the global low-resource queue."
-  (let ((key (magnus-review-controller--queue-key review round)))
-    (when (and (eq (magnus-review-lifecycle review) 'open)
-               (eq round (magnus-review-latest-round review))
-               (memq (magnus-review-round-execution round)
-                     '(queued failed interrupted))
-               (not (member key magnus-review-controller--queue)))
-      (setq magnus-review-controller--queue
-            (append magnus-review-controller--queue (list key))))
-    (magnus-review-controller--pump))
-  round)
-
-(defun magnus-review-controller--context
-    (review-id round-number attempt-token &optional states)
-  "Return current (REVIEW ROUND ATTEMPT) matching durable identity.
-When STATES is non-nil, the current attempt must be in one of them."
-  (when-let* ((review (magnus-review-get review-id))
-              (round (nth (1- round-number) (magnus-review-rounds review)))
-              (attempt (magnus-review-latest-attempt round)))
-    (when (and (eq round (magnus-review-latest-round review))
-               (string= attempt-token (magnus-review-attempt-token attempt))
-               (or (null states)
-                   (memq (magnus-review-attempt-execution attempt) states)))
-      (list review round attempt))))
-
-(defun magnus-review-controller--owner-p
-    (process review-id round-number attempt-token)
-  "Return non-nil when PROCESS owns the exact durable attempt tuple."
-  (let ((owner (gethash review-id magnus-review-controller--processes)))
-    (and owner
-         (eq process (plist-get owner :process))
-         (= round-number (plist-get owner :round-number))
-         (string= attempt-token (plist-get owner :attempt-token)))))
-
-(defun magnus-review-controller--cancel-watchdog (owner)
-  "Cancel OWNER's attempt watchdog, if one is still scheduled."
-  (when-let ((timer (plist-get owner :watchdog-timer)))
-    (when (timerp timer)
-      (cancel-timer timer))))
-
-(defun magnus-review-controller--watchdog-fired
-    (process review-id round-number attempt-token seconds)
-  "Time out PROCESS if it still owns REVIEW-ID ROUND-NUMBER ATTEMPT-TOKEN.
-SECONDS is the configured duration captured when this owner was started."
-  (when (and (magnus-review-controller--owner-p
-              process review-id round-number attempt-token)
-             ;; A terminal subprocess may be waiting for its zero-delay
-             ;; finalizer.  Let that completion win instead of relabeling it as
-             ;; a timeout at the event-loop boundary.
-             (process-live-p process))
-    (let* ((owner (gethash review-id magnus-review-controller--processes))
-           (context
-            (magnus-review-controller--context
-             review-id round-number attempt-token '(starting running)))
-           (reason (format "Review attempt timed out after %.1f seconds"
-                           seconds)))
-      (magnus-review-controller--cancel-watchdog owner)
-      ;; Revoke first: killing the process may synchronously run its sentinel,
-      ;; whose completion must be stale before it can publish or release a slot.
-      (remhash review-id magnus-review-controller--processes)
-      (unwind-protect
-          (progn
-            (condition-case err
-                (magnus-headless-cancel process t)
-              (error
-               (display-warning
-                'magnus-review
-                (format "Could not cancel timed-out review %s: %s"
-                        review-id (error-message-string err))
-                :warning)))
-            (when context
-              (pcase-let ((`(,review ,round ,attempt) context))
-                (condition-case err
-                    (magnus-review-fail-attempt
-                     review round attempt reason attempt-token)
-                  (error
-                   (display-warning
-                    'magnus-review
-                    (format "Could not persist timed-out review %s: %s"
-                            review-id (error-message-string err))
-                    :warning))))))
-        ;; Timeout must release the global low-resource slot even if process
-        ;; cancellation or durable failure persistence is temporarily broken.
-        (magnus-review-controller--pump))
-      (message "Magnus: review %s timed out; use retry from its menu"
-               review-id))))
-
-(defun magnus-review-controller--arm-watchdog
-    (process review-id round-number attempt-token)
-  "Arm the configured watchdog for PROCESS's exact review owner tuple."
-  (when (and (numberp magnus-review-attempt-timeout)
-             (> magnus-review-attempt-timeout 0)
-             (magnus-review-controller--owner-p
-              process review-id round-number attempt-token))
-    (let* ((seconds magnus-review-attempt-timeout)
-           (timer
-            (run-at-time
-             seconds nil #'magnus-review-controller--watchdog-fired
-             process review-id round-number attempt-token seconds))
-           (owner
-            (copy-sequence
-             (gethash review-id magnus-review-controller--processes))))
-      (puthash review-id (plist-put owner :watchdog-timer timer)
-               magnus-review-controller--processes)
-      timer)))
-
-(defun magnus-review-controller--append-raw
-    (process review-id round-number attempt-token line)
-  "Persist one provider LINE if PROCESS still owns its attempt."
-  (when (magnus-review-controller--owner-p
-         process review-id round-number attempt-token)
-    (when-let ((context
-               (magnus-review-controller--context
-                review-id round-number attempt-token '(starting running))))
-      (pcase-let ((`(,review ,round ,attempt) context))
-        (magnus-review-append-artifact-line
-         review (magnus-review-attempt-raw-path review round attempt) line)))))
-
-(defun magnus-review-controller--append-stderr
-    (process review-id round-number attempt-token chunk)
-  "Persist provider stderr CHUNK if PROCESS still owns its attempt."
-  (when (magnus-review-controller--owner-p
-         process review-id round-number attempt-token)
-    (when-let ((context
-               (magnus-review-controller--context
-                review-id round-number attempt-token '(starting running))))
-      (pcase-let ((`(,review ,round ,attempt) context))
-        (dolist (line (split-string chunk "\n" nil))
-          (magnus-review-append-artifact-line
-           review (magnus-review-attempt-stderr-path review round attempt)
-           line))))))
-
-(defun magnus-review-controller--record-session
-    (process review-id round-number attempt-token session-id)
-  "Persist confirmed SESSION-ID for PROCESS's current attempt."
-  (when (magnus-review-controller--owner-p
-         process review-id round-number attempt-token)
-    (when-let ((context
-               (magnus-review-controller--context
-                review-id round-number attempt-token '(starting running))))
-      (apply #'magnus-review-record-session-id
-             (append context (list attempt-token session-id))))))
+;;; Completion diagnostics and presentation
 
 (defun magnus-review-controller--completion-error (result)
   "Return a bounded diagnostic string for failed headless RESULT."
-  (magnus-review-controller--truncate-string
-   (format (concat "exit=%S event=%S stderr=%s decode=%S provider=%S "
-                   "callbacks=%S bounds=%S")
-           (plist-get result :exit-status)
-           (plist-get result :process-event)
-           (string-trim (or (plist-get result :stderr) ""))
-           (plist-get result :decode-errors)
-           (plist-get result :provider-errors)
-           (plist-get result :callback-errors)
-           (list :stderr-dropped-chars
-                 (or (plist-get result :stderr-dropped-chars) 0)
-                 :discarded-jsonl-lines
-                 (or (plist-get result :discarded-jsonl-lines) 0)
-                 :dropped-errors (plist-get result :dropped-errors)))
-   12000))
+  (let ((reported (plist-get result :error-message)))
+    (magnus-review-controller--truncate-string
+     (if (and (stringp reported)
+              (not (string-empty-p (string-trim reported))))
+         (string-trim reported)
+       (format (concat "exit=%S event=%S stderr=%s decode=%S provider=%S "
+                       "callbacks=%S bounds=%S")
+               (plist-get result :exit-status)
+               (plist-get result :process-event)
+               (string-trim (or (plist-get result :stderr) ""))
+               (plist-get result :decode-errors)
+               (plist-get result :provider-errors)
+               (plist-get result :callback-errors)
+               (list :stderr-dropped-chars
+                     (or (plist-get result :stderr-dropped-chars) 0)
+                     :discarded-jsonl-lines
+                     (or (plist-get result :discarded-jsonl-lines) 0)
+                     :dropped-errors (plist-get result :dropped-errors))))
+     12000)))
 
-(defun magnus-review-controller--release
-    (process review-id round-number attempt-token)
-  "Release PROCESS's exact owned slot and pump the next review."
-  (when (magnus-review-controller--owner-p
-         process review-id round-number attempt-token)
-    (magnus-review-controller--cancel-watchdog
-     (gethash review-id magnus-review-controller--processes))
-    (remhash review-id magnus-review-controller--processes)
-    (magnus-review-controller--pump)))
-
-(defun magnus-review-controller--complete
-    (process review-id round-number attempt-token result)
-  "Handle headless PROCESS completion for its exact durable identity."
-  (when (magnus-review-controller--owner-p
-         process review-id round-number attempt-token)
-    (if-let ((context
-              (magnus-review-controller--context
-               review-id round-number attempt-token '(starting running))))
-        (pcase-let ((`(,review ,round ,attempt) context))
-          (unwind-protect
-              (condition-case err
-                  (if (plist-get result :success-p)
-                      (progn
-                        ;; Claude can allocate the requested session UUID before
-                        ;; it emits a session event.  A successful terminal result
-                        ;; confirms that candidate, so persist it before publishing
-                        ;; the review and making a future re-review resumable.
-                        (when-let ((session-id
-                                    (or (plist-get result :session-id)
-                                        (plist-get result
-                                                   :candidate-session-id))))
-                          (magnus-review-record-session-id
-                           review round attempt attempt-token session-id))
-                        (let ((canonical
-                             (magnus-review-controller--publish-result
-                              review round attempt
-                              (plist-get result :structured-result))))
-                          (magnus-review-controller--after-completion
-                           review round canonical)))
-                    (magnus-review-fail-attempt
-                     review round attempt
-                     (magnus-review-controller--completion-error result)
-                     attempt-token)
-                    (message "Magnus: review by %s failed; use retry from its menu"
-                             (magnus-review-reviewer-name review)))
-                (error
-                 ;; Publication may have completed before notification failed.
-                 ;; Only an active attempt is eligible for a failure transition.
-                 (when (memq (magnus-review-attempt-execution attempt)
-                             '(starting running))
-                   (magnus-review-fail-attempt
-                    review round attempt (error-message-string err)
-                    attempt-token))
-                 (message "Magnus: could not publish review by %s: %s"
-                          (magnus-review-reviewer-name review)
-                          (error-message-string err))))
-            (magnus-review-controller--release
-             process review-id round-number attempt-token)))
-      ;; A process should never outlive its tuple.  Remove the dead owner but
-      ;; this was still the exact process holding the global slot, so releasing
-      ;; it must also wake the FIFO.  Truly stale callbacks failed `--owner-p'
-      ;; above and never reach this branch.
-      (magnus-review-controller--release
-       process review-id round-number attempt-token)
-      (message "Magnus: ignored stale completion for review %s round %d"
-               review-id round-number))))
-
-(defun magnus-review-controller--start (review round)
-  "Start one queued REVIEW ROUND and return its process, or nil on failure."
-  (let ((review-id (magnus-review-id review))
-        (round-number (magnus-review-round-number round))
-        attempt token process)
-    (condition-case err
-        (progn
-          ;; Include allocation in the containment boundary.  A stale/closed
-          ;; queue entry must never abort the global pump and strand later work.
-          (setq attempt (magnus-review-append-attempt review round)
-                token (magnus-review-attempt-token attempt))
-          (let* ((checkout (magnus-review-round-checkout-path review round))
-                 (_checkout
-                  (magnus-review-ensure-checkout
-                   review (magnus-review-round-head-oid round) round))
-                 (prior (magnus-review-controller--prior-result review round))
-                 (request
-                  (list
-                   :directory checkout
-                   :evidence-directory (magnus-review-round-directory review round)
-                   :prompt (magnus-review-controller--review-prompt
-                            review round prior)
-                   :session-id (magnus-review-session-id review)
-                   :model (magnus-review-model review)
-                   :effort (magnus-review-effort review)
-                   :schema (magnus-review-controller-result-schema)
-                   :base (magnus-review-round-base-oid round)
-                   :head (magnus-review-round-head-oid round)
-                   :title (format "%s — round %d"
-                                  (magnus-review-task review) round-number)
-                   :name (magnus-review-reviewer-name review)))
-                 (callbacks
-                  (list
-                   :on-raw-event
-                   (lambda (child line)
-                     (magnus-review-controller--append-raw
-                      child review-id round-number token line))
-                   :on-session
-                   (lambda (child session-id)
-                     (magnus-review-controller--record-session
-                      child review-id round-number token session-id))
-                   :on-stderr
-                   (lambda (child chunk)
-                     (magnus-review-controller--append-stderr
-                      child review-id round-number token chunk))
-                   :on-complete
-                   (lambda (child result)
-                     (magnus-review-controller--complete
-                      child review-id round-number token result)))))
-            (setq process
-                  (magnus-headless-start
-                   (magnus-review-reviewer-provider review) request callbacks)))
-          (puthash review-id
-                   (list :process process :round-number round-number
-                         :attempt-token token)
-                   magnus-review-controller--processes)
-          (magnus-review-mark-attempt-running review round attempt token)
-          (magnus-review-controller--arm-watchdog
-           process review-id round-number token)
-          (message "Magnus: %s is reviewing %s (round %d)"
-                   (magnus-review-reviewer-name review)
-                   (magnus-review-author-name review) round-number)
-          process)
-      (error
-       ;; Revoke callback ownership before cancellation can run a sentinel.
-       (magnus-review-controller--cancel-watchdog
-        (gethash review-id magnus-review-controller--processes))
-       (remhash review-id magnus-review-controller--processes)
-       ;; `magnus-review-append-attempt' mutates then saves.  If that save
-       ;; throws, SETQ never receives its return value; recover the just-appended
-       ;; current attempt so this Emacs does not strand the review in `starting'.
-       (unless attempt
-         (when-let ((latest (and (eq round (magnus-review-latest-round review))
-                                 (magnus-review-latest-attempt round))))
-           (when (memq (magnus-review-attempt-execution latest)
-                       '(starting running))
-             (setq attempt latest
-                   token (magnus-review-attempt-token latest)))))
-       (condition-case cleanup-err
-           (when (and process (process-live-p process))
-             (magnus-headless-cancel process t))
-         (error
-          (message "Magnus: failed to cancel rejected review process: %s"
-                   (error-message-string cleanup-err))))
-       (condition-case persist-err
-           (when (and attempt
-                      (memq (magnus-review-attempt-execution attempt)
-                            '(starting running)))
-             (magnus-review-fail-attempt
-              review round attempt (error-message-string err) token))
-         (error
-          ;; The next `magnus-review-load-all' recovers a stranded active state
-          ;; as interrupted; never let this disk failure stall other queue items.
-          (message "Magnus: could not persist failed review start: %s"
-                   (error-message-string persist-err))))
-       (message "Magnus: could not start review by %s: %s"
-                (magnus-review-reviewer-name review)
-                (error-message-string err))
-       nil))))
-
-(defun magnus-review-controller--pump ()
-  "Start queued reviews while the global resource bound permits."
-  (unless (or magnus-review-controller--shutting-down
-              magnus-review-controller--recovering)
-    (while (and magnus-review-controller--queue
-                (< (hash-table-count magnus-review-controller--processes)
-                   magnus-review-max-concurrent))
-      (pcase-let* ((`(,review-id . ,round-number)
-                    (pop magnus-review-controller--queue))
-                   (review (magnus-review-get review-id))
-                   (round (and review
-                               (nth (1- round-number)
-                                    (magnus-review-rounds review)))))
-        (when (and review round
-                   (eq (magnus-review-lifecycle review) 'open)
-                   (eq review (magnus-review-get review-id))
-                   (eq round (magnus-review-latest-round review))
-                   (memq (magnus-review-round-execution round)
-                         '(queued failed interrupted)))
-          (condition-case err
-              (magnus-review-controller--start review round)
-            (error
-             ;; `--start' contains its own failure paths.  This final boundary
-             ;; protects FIFO liveness from an unforeseen controller bug.
-             (display-warning
-              'magnus-review
-              (format "Review %s round %d could not start: %s"
-                      review-id round-number (error-message-string err))
-              :warning))))))))
-
-;;; Delivery, recovery, and lifecycle integration
-
-(defun magnus-review-controller--envelope-valid-p
-    (review round attempt envelope)
-  "Return non-nil when ENVELOPE belongs exactly to REVIEW ROUND ATTEMPT."
-  (and (eql (magnus-review-controller--field
-             envelope :artifact_schema_version) 1)
-       (string= (or (magnus-review-controller--field envelope :review_id) "")
-                (magnus-review-id review))
-       (eql (magnus-review-controller--field envelope :round_number)
-            (magnus-review-round-number round))
-       (string= (or (magnus-review-controller--field envelope :attempt_token)
-                    "")
-                (magnus-review-attempt-token attempt))
-       (string= (or (magnus-review-controller--field envelope :base_oid) "")
-                (magnus-review-round-base-oid round))
-       (string= (or (magnus-review-controller--field envelope :head_oid) "")
-                (magnus-review-round-head-oid round))
-       (magnus-review-controller--field envelope :result)))
-
-(defun magnus-review-controller--adopt-artifacts (review round)
-  "Adopt crash-surviving canonical artifacts for failed REVIEW ROUND.
-Return non-nil when publication was recovered."
-  (when-let ((attempt (magnus-review-latest-attempt round)))
-    (when (memq (magnus-review-attempt-execution attempt)
-                '(failed interrupted))
-      (let* ((result-path (magnus-review-round-result-path review round))
-             (envelope (condition-case err
-                           (magnus-review-controller--read-json result-path)
-                         (error
-                          (message
-                           "Magnus: could not inspect recovered review artifact %s: %s"
-                           result-path (error-message-string err))
-                          nil))))
-        (when (and envelope
-                   (magnus-review-controller--envelope-valid-p
-                    review round attempt envelope))
-          (let* ((persisted
-                  (magnus-review-controller--result-body envelope))
-                 (result
-                  (magnus-review-controller-anchor-result
-                   review round
-                   (magnus-review-controller-normalize-result
-                    review round persisted
-                    (magnus-review-controller--prior-result review round) t)
-                   (magnus-review-controller--patch review round)))
-                 (report-path (magnus-review-round-report-path review round)))
-            ;; Only Magnus's own canonical output is adoptable.  The envelope
-            ;; identity prevents cross-attempt adoption; this comparison also
-            ;; rejects a validly shaped artifact modified after publication.
-            (unless (string=
-                     (json-serialize persisted
-                                     :null-object nil
-                                     :false-object :json-false)
-                     (json-serialize result
-                                     :null-object nil
-                                     :false-object :json-false))
-              (error "Recovered review result is not canonical"))
-            (unless (file-regular-p report-path)
-              (magnus-review-write-artifact
-               review report-path
-               (magnus-review-controller--render-report review round result)))
-            (magnus-review-adopt-completed-attempt
-             review round attempt
-             (magnus-review-controller--verdict-symbol result)
-             (magnus-review-attempt-token attempt))
-            (magnus-review-controller--after-completion review round result)
-            t))))))
-
-(defun magnus-review-controller--delivery-message (review round result)
-  "Build idempotent author delivery for completed REVIEW ROUND RESULT."
-  (let* ((findings
-          (magnus-review-controller--array
-           (magnus-review-controller--field result :findings) 'findings))
-         (summary
-          (magnus-review-controller--truncate-string
-           (magnus-review-controller--field result :summary) 1200)))
-    (format
-     (concat
-      "[MAGNUS-REVIEW-RESULT review=%s round=%d]\n"
-      "%s [%s] completed an independent review of your committed checkpoint.\n"
-      "Verdict: %s · findings: %d\n"
-      "Report: %s\n\n%s\n\n"
-      "Treat the bracketed review/round marker above as an idempotency key; if "
-      "you already handled it, do not duplicate the work. Read the report, "
-      "address each applicable finding, then ask Hrishi for a re-review. The "
-      "reviewer session and finding IDs will be preserved.")
-     (magnus-review-id review)
-     (magnus-review-round-number round)
-     (magnus-review-reviewer-name review)
-     (magnus-review-reviewer-provider review)
-     (magnus-review-controller--field result :verdict)
-     (length findings)
-     (magnus-review-round-report-path review round)
-     summary)))
-
-(defun magnus-review-controller--try-delivery (review &optional round result)
-  "Try durable author delivery for completed REVIEW ROUND and RESULT."
-  (setq round (or round (magnus-review-latest-round review)))
-  (when (and round
-             (eq (magnus-review-round-execution round) 'complete)
-             (not (eq (magnus-review-round-delivery-state round) 'sent)))
-    (setq result
-          (or result
-              (when-let ((envelope
-                          (magnus-review-controller--read-json
-                           (magnus-review-round-result-path review round))))
-                (magnus-review-controller--result-body envelope))))
-    (if-let ((author (magnus-review-controller--author-instance review)))
-        (if result
-            (let ((outcome
-                   (magnus-review-controller--send
-                    author
-                    (magnus-review-controller--delivery-message
-                     review round result)
-                    (lambda ()
-                      ;; A deferred callback may run after archive/close, but it
-                      ;; still belongs to this immutable completed round.
-                      (when (and (eq (magnus-review-round-execution round)
-                                     'complete)
-                                 (not (eq
-                                       (magnus-review-round-delivery-state round)
-                                       'sent)))
-                        (magnus-review-mark-delivered review round))))))
-              (if outcome
-                  outcome
-                (magnus-review-mark-delivery-failed
-                 review "author transport did not accept the review" round)
-                nil))
-          (magnus-review-mark-delivery-failed
-           review "canonical review result is unavailable" round)
-          nil)
-      (magnus-review-mark-delivery-failed
-       review "author instance is not currently loaded" round)
-      nil)))
-
-(defun magnus-review-controller--notify (review round result)
-  "Notify the human that REVIEW ROUND RESULT is ready without stealing focus."
-  (ignore round)
+(defun magnus-review-controller--notify (review _round result)
+  "Notify the human that REVIEW RESULT is ready without stealing focus."
   (when magnus-review-notify-on-completion
     (let ((count
            (length
@@ -1878,261 +1799,271 @@ Return non-nil when publication was recovered."
                    magnus-coord--do-not-disturb)
         (ding t)))))
 
-(defun magnus-review-controller--after-completion (review round result)
-  "Finish delivery and human notification for REVIEW ROUND RESULT."
-  (condition-case err
-      (magnus-review-controller--try-delivery review round result)
-    (error
-     (display-warning
-      'magnus-review
-      (format "Review %s author delivery failed: %s"
-              (magnus-review-id review) (error-message-string err))
-      :warning)))
-  (condition-case err
-      (magnus-review-controller--notify review round result)
-    (error
-     (display-warning
-      'magnus-review
-      (format "Review %s human notification failed: %s"
-              (magnus-review-id review) (error-message-string err))
-      :warning)))
-  (condition-case err
-      (run-hooks 'magnus-review-controller-changed-hook)
-    (error
-     (display-warning
-      'magnus-review
-      (format "Review %s observer failed: %s"
-              (magnus-review-id review) (error-message-string err))
-      :warning))))
-
-(defun magnus-review-controller--ready (review round)
-  "Queue a newly validated REVIEW ROUND."
-  (when (eq (magnus-review-lifecycle review) 'open)
-    (magnus-review-controller--enqueue review round)))
-
-(defun magnus-review-controller--process-ready (instance)
-  "Replay durable deliveries when interactive INSTANCE becomes ready."
-  ;; Completed feedback predates any later checkpoint instruction.
-  (dolist (review (reverse (magnus-review-list)))
-    (when (and (not (eq (magnus-review-lifecycle review) 'archived))
-               (string= (magnus-review-author-instance-id review)
-                        (magnus-instance-id instance)))
-      (dolist (round (magnus-review-rounds review))
-        (when (and (eq (magnus-review-round-execution round) 'complete)
-                   (not (eq (magnus-review-round-delivery-state round) 'sent)))
-          (condition-case err
-              (magnus-review-controller--try-delivery review round)
-            (error
-             (magnus-review-controller--recovery-warning
-              review "resurrection delivery" err)))))))
-  (dolist (review (magnus-review-list))
-    (when (and (eq (magnus-review-lifecycle review) 'open)
-               (string= (magnus-review-author-instance-id review)
-                        (magnus-instance-id instance)))
-      (when-let ((request (magnus-review-pending-checkpoint-request review)))
-        (condition-case err
-            (magnus-review-controller--deliver-checkpoint review request)
-          (error
-           (magnus-review-controller--recovery-warning
-            review "resurrection checkpoint" err)))))))
-
 (defun magnus-review-controller--refresh-status ()
   "Refresh the visible Magnus status buffer after review state changes."
   (when (fboundp 'magnus-status-refresh)
     (magnus-status-refresh)))
 
-(defun magnus-review-controller--recovery-warning (review operation err)
-  "Warn that REVIEW failed startup OPERATION with ERR."
-  (display-warning
-   'magnus-review
-   (format "Review %s: startup %s failed: %s"
-           (magnus-review-id review) operation (error-message-string err))
-   :warning))
+;;; Disposable reviewer execution and best-effort handoff
 
-(defun magnus-review-controller--queue-entry-less-p (left right)
-  "Return non-nil when recovery queue entry LEFT precedes RIGHT."
-  (let ((left-time (plist-get left :created-at))
-        (right-time (plist-get right :created-at))
-        (left-id (plist-get left :review-id))
-        (right-id (plist-get right :review-id)))
-    (cond
-     ((< left-time right-time) t)
-     ((> left-time right-time) nil)
-     ((string-lessp left-id right-id) t)
-     ((string-lessp right-id left-id) nil)
-     (t (< (plist-get left :round-number)
-           (plist-get right :round-number))))))
+(defun magnus-review-controller--job-key (review round prompt)
+  "Return the complete coalescing key for REVIEW ROUND and exact PROMPT."
+  (list 'magnus-review
+        (magnus-review-id review)
+        (magnus-review-round-number round)
+        (magnus-review-round-base-oid round)
+        (magnus-review-round-head-oid round)
+        (magnus-review-reviewer-provider review)
+        (magnus-review-model review)
+        (magnus-review-effort review)
+        (secure-hash 'sha256 prompt)))
+
+(defun magnus-review-controller--cleanup-round (review round)
+  "Best-effort removal of REVIEW ROUND's disposable checkout."
+  (when (fboundp 'magnus-review-cleanup-round-checkout)
+    (condition-case err
+        (magnus-review-cleanup-round-checkout review round)
+      (error
+       (message "Magnus: could not remove disposable review checkout: %s"
+                (error-message-string err))))))
+
+(defun magnus-review-controller--discard-candidate (review round)
+  "Best-effort safe removal of unpublished REVIEW ROUND and its checkout."
+  (condition-case err
+      (magnus-review-discard-candidate review round)
+    (error
+     (message "Magnus: could not discard review candidate: %s"
+              (error-message-string err))
+     nil)))
+
+(defun magnus-review-controller--mark-running (review-id job-key _event)
+  "Mark REVIEW-ID running when JOB-KEY still owns its runtime."
+  (when-let ((runtime (gethash review-id
+                               magnus-review-controller--runtimes)))
+    (when (and (equal job-key
+                      (magnus-review-controller-runtime-job-key runtime))
+               (eq (magnus-review-controller-runtime-phase runtime) 'queued))
+      (setf (magnus-review-controller-runtime-phase runtime) 'running)
+      (magnus-review-controller--changed))))
+
+(defun magnus-review-controller--author-message (review round result)
+  "Build the best-effort author handoff for completed REVIEW ROUND RESULT."
+  (let* ((findings
+          (magnus-review-controller--array
+           (magnus-review-controller--field result :findings) 'findings))
+         (summary
+          (magnus-review-controller--truncate-string
+           (magnus-review-controller--field result :summary) 1200)))
+    (format
+     (concat
+      "[MAGNUS-REVIEW-RESULT review=%s round=%d head=%s]\n"
+      "%s [%s] completed round %d of its independent review.\n"
+      "Verdict: %s · findings: %d\n"
+      "Report: %s\n\n%s\n\n"
+      "Read the report and address every applicable finding. When the user "
+      "requests another round, the same named reviewer and its last successful "
+      "session will receive the new committed range plus all prior findings.")
+     (magnus-review-id review)
+     (magnus-review-round-number round)
+     (magnus-review-round-head-oid round)
+     (magnus-review-reviewer-name review)
+     (magnus-review-reviewer-provider review)
+     (magnus-review-round-number round)
+     (magnus-review-controller--field result :verdict)
+     (length findings)
+     (magnus-review-round-report-path review round)
+     summary)))
+
+(defun magnus-review-controller--handoff (review round result)
+  "Notify REVIEW's author once, best effort, about ROUND RESULT."
+  (if-let ((author (magnus-review-controller--author-instance review)))
+      (unless (magnus-review-controller--send
+               author
+               (magnus-review-controller--author-message review round result))
+        (message
+         "Magnus: review is ready, but %s was unavailable; open it from *magnus*"
+         (magnus-review-author-name review)))
+    (message
+     "Magnus: review is ready, but %s is not loaded; open it from *magnus*"
+     (magnus-review-author-name review))))
+
+(defun magnus-review-controller--complete-job (review-id job-key result)
+  "Consume terminal RESULT when JOB-KEY still owns REVIEW-ID."
+  (when-let* ((review (magnus-review-get review-id))
+              (runtime (gethash review-id
+                                magnus-review-controller--runtimes)))
+    (when (equal job-key
+                 (magnus-review-controller-runtime-job-key runtime))
+      (let ((round (magnus-review-controller-runtime-round runtime)))
+        (if (not (plist-get result :success-p))
+            (let ((failure
+                   (magnus-review-controller--completion-error result)))
+              (magnus-review-controller--fail-runtime runtime failure)
+              (message "Magnus: review by %s failed; repeat it from its menu"
+                       (magnus-review-reviewer-name review)))
+          (let ((canonical
+                 (condition-case err
+                     (let ((session-id (plist-get result :session-id)))
+                       (unless (and (stringp session-id)
+                                    (not (string-empty-p session-id)))
+                         (error
+                          "Reviewer completed without a resumable session ID"))
+                       (magnus-review-controller--publish-result
+                        review round (plist-get result :structured-result)
+                        session-id))
+                   (error
+                    (let ((failure (error-message-string err)))
+                      (magnus-review-controller--fail-runtime runtime failure)
+                      (message "Magnus: could not publish review by %s: %s"
+                               (magnus-review-reviewer-name review) failure)
+                      nil)))))
+            (when canonical
+              ;; Publication is the transaction boundary.  Nothing below may
+              ;; turn this successfully durable round back into a failed
+              ;; runtime merely because presentation or delivery misbehaved.
+              (remhash review-id magnus-review-controller--runtimes)
+              (magnus-review-controller--cleanup-round review round)
+              (condition-case handoff-err
+                  (magnus-review-controller--handoff review round canonical)
+                (error
+                 (message "Magnus: author handoff failed: %s"
+                          (error-message-string handoff-err))))
+              (condition-case notify-err
+                  (magnus-review-controller--notify review round canonical)
+                (error
+                 (message "Magnus: review notification failed: %s"
+                          (error-message-string notify-err))))
+              (condition-case changed-err
+                  (magnus-review-controller--changed)
+                (error
+                 (message "Magnus: review refresh failed: %s"
+                          (error-message-string changed-err)))))))))))
+
+(defun magnus-review-controller--start-round (review runtime round)
+  "Submit REVIEW ROUND through the shared in-memory background runner."
+  (when magnus-review-controller--shutting-down
+    (user-error "Magnus is shutting down"))
+  ;; Validate the entire durable lineage before creating or reusing disposable
+  ;; execution resources.  A later publication validates it again so an
+  ;; artifact changed while the reviewer ran cannot silently reset identity.
+  (let* ((history (magnus-review-controller--history review round))
+         (prompt (magnus-review-controller--review-prompt
+                  review round history))
+         (job-key (magnus-review-controller--job-key review round prompt))
+         (checkout
+          (magnus-review-ensure-checkout
+           review (magnus-review-round-head-oid round) round))
+         (request
+          (list
+           :purpose 'review
+           :directory checkout
+           :evidence-directory (magnus-review-round-directory review round)
+           :prompt prompt
+           :session-id
+           (unless (magnus-review-controller-runtime-fresh-session-p runtime)
+             (magnus-review-session-id review))
+           :model (magnus-review-model review)
+           :effort (magnus-review-effort review)
+           :schema (magnus-review-controller-result-schema)
+           :base (magnus-review-round-base-oid round)
+           :head (magnus-review-round-head-oid round)
+           :title (format "%s — round %d"
+                          (magnus-review-task review)
+                          (magnus-review-round-number round))
+           :name (magnus-review-reviewer-name review))))
+    (setf (magnus-review-controller-runtime-job-key runtime) job-key
+          (magnus-review-controller-runtime-phase runtime) 'queued
+          (magnus-review-controller-runtime-error runtime) nil)
+    (let ((job
+           (magnus-background-submit
+            job-key
+            (magnus-review-reviewer-provider review)
+            request
+            (list
+             :timeout magnus-review-timeout
+             :on-event
+             (lambda (event)
+               (magnus-review-controller--mark-running
+                (magnus-review-id review) job-key event))
+             :on-complete
+             (lambda (result)
+               (magnus-review-controller--complete-job
+                (magnus-review-id review) job-key result))))))
+      (if (null job)
+          (magnus-review-controller--fail-runtime
+           runtime "the shared background queue rejected the review")
+        ;; A launch failure may have completed synchronously inside submit.
+        (when (eq runtime
+                  (gethash (magnus-review-id review)
+                           magnus-review-controller--runtimes))
+          (setf (magnus-review-controller-runtime-job runtime) job)
+          (unless (memq (magnus-review-controller-runtime-phase runtime)
+                        '(failed interrupted))
+            (when (eq (magnus-background-job-state job) 'running)
+              (setf (magnus-review-controller-runtime-phase runtime) 'running))
+            (magnus-review-controller--changed)
+            (message "Magnus: %s is reviewing %s (round %d)"
+                     (magnus-review-reviewer-name review)
+                     (magnus-review-author-name review)
+                     (magnus-review-round-number round)))))
+      job)))
+
+(defun magnus-review-controller-archive (review)
+  "Cancel disposable work and archive completed REVIEW lineage."
+  (when-let ((runtime (magnus-review-controller--runtime review)))
+    (magnus-review-controller--cancel-scope-timer runtime)
+    (magnus-review-controller--cancel-delivery-timer runtime)
+    (magnus-review-controller--cancel-delivery runtime)
+    (when-let ((key (magnus-review-controller-runtime-job-key runtime)))
+      (magnus-background-cancel key))
+    (when-let ((round (magnus-review-controller-runtime-round runtime)))
+      (magnus-review-controller--discard-candidate review round))
+    (remhash (magnus-review-id review) magnus-review-controller--runtimes))
+  (magnus-review-archive review)
+  (magnus-review-controller--changed)
+  review)
 
 (defun magnus-review-controller-setup ()
-  "Connect durable reviews to coordination, execution, and delivery."
+  "Attach ephemeral execution to completed review lineages."
   (setq magnus-review-controller--shutting-down nil
-        magnus-review-controller--recovering t
-        magnus-review-controller--queue nil)
-  (magnus-review-setup-coordination)
-  (add-hook 'magnus-review-ready-hook #'magnus-review-controller--ready)
-  (add-hook 'magnus-review-checkpoint-mismatch-hook
-            #'magnus-review-controller--recover-checkpoint-token)
-  (add-hook 'magnus-process-ready-hook
-            #'magnus-review-controller--process-ready)
+        magnus-review-runtime-state-function
+        #'magnus-review-controller--runtime-state)
+  (clrhash magnus-review-controller--runtimes)
   (add-hook 'magnus-reviews-changed-hook
             #'magnus-review-controller--refresh-status)
   (add-hook 'magnus-review-controller-changed-hook
             #'magnus-review-controller--refresh-status)
   (when (boundp 'magnus-review-ui-action-function)
-    (setq magnus-review-ui-action-function #'magnus-review-actions))
-  (let (eligible watcher-roots)
-    (unwind-protect
-        (progn
-          ;; Reconcile each review independently.  One damaged archive must not
-          ;; prevent healthy projects from recovering or reaching the FIFO.
-          (dolist (review (magnus-review-list))
-            (when (eq (magnus-review-lifecycle review) 'open)
-              (when-let ((round (magnus-review-latest-round review)))
-                (condition-case err
-                    (pcase (magnus-review-round-execution round)
-                      ('interrupted
-                       (unless (magnus-review-controller--adopt-artifacts
-                                review round)
-                         ;; Crash and shutdown interruptions retry once per
-                         ;; startup.  An explicit user interrupt stays stopped
-                         ;; until `magnus-review-retry' is invoked.
-                         (let ((latest-attempt
-                                (magnus-review-latest-attempt round)))
-                           (unless
-                               (and latest-attempt
-                                    (eq
-                                     (magnus-review-attempt-interruption-kind
-                                      latest-attempt)
-                                     'manual))
-                             (push (list
-                                    :created-at
-                                    (or (magnus-review-round-created-at round) 0)
-                                    :review-id (magnus-review-id review)
-                                    :round-number
-                                    (magnus-review-round-number round)
-                                    :key
-                                    (magnus-review-controller--queue-key
-                                     review round))
-                                   eligible)))))
-                      ('failed
-                       (magnus-review-controller--adopt-artifacts review round))
-                      ('queued
-                       (push (list
-                              :created-at
-                              (or (magnus-review-round-created-at round) 0)
-                              :review-id (magnus-review-id review)
-                              :round-number (magnus-review-round-number round)
-                              :key (magnus-review-controller--queue-key
-                                    review round))
-                             eligible)))
-                  (error
-                   (magnus-review-controller--recovery-warning
-                    review "attempt reconciliation" err))))
-              (when (magnus-review-pending-checkpoint-request review)
-                (cl-pushnew (magnus-review-project-root review) watcher-roots
-                            :test #'string=)))
-            (unless (eq (magnus-review-lifecycle review) 'archived)
-              (dolist (round (magnus-review-rounds review))
-                (when (and (eq (magnus-review-round-execution round) 'complete)
-                           (not (eq (magnus-review-round-delivery-state round)
-                                    'sent)))
-                  (condition-case err
-                      (magnus-review-controller--try-delivery review round)
-                    (error
-                     (magnus-review-controller--recovery-warning
-                      review "author delivery" err)))))))
-          ;; A re-review on an older logical review belongs in the FIFO at its
-          ;; round creation time, not at the review's original creation time.
-          (setq magnus-review-controller--queue
-                (mapcar
-                 (lambda (entry) (plist-get entry :key))
-                 (sort eligible
-                       #'magnus-review-controller--queue-entry-less-p)))
-          ;; Watcher startup synchronously replays markers.  It happens only
-          ;; after persisted queue reconstruction, while pumping is suppressed.
-          (dolist (root (sort watcher-roots #'string-lessp))
-            (condition-case err
-                (magnus-coord-start-watching root)
-              (error
-               (display-warning
-                'magnus-review
-                (format "Review watcher startup failed for %s: %s"
-                        root (error-message-string err))
-                :warning)))))
-      ;; Queue progress is a cleanup invariant: even an unforeseen recovery
-      ;; error cannot leave the global execution slot dormant.
-      (setq magnus-review-controller--recovering nil)
-      (condition-case err
-          (magnus-review-controller--pump)
-        (error
-         (display-warning
-          'magnus-review
-          (format "Review queue startup failed: %s" (error-message-string err))
-          :warning))))))
+    (setq magnus-review-ui-action-function #'magnus-review-actions)))
 
 (defun magnus-review-controller-shutdown ()
-  "Interrupt owned headless reviews and detach all controller hooks."
-  (setq magnus-review-controller--shutting-down t
-        magnus-review-controller--queue nil)
-  (unwind-protect
-      (let (owners)
-        (maphash (lambda (review-id owner)
-                   (push (cons review-id owner) owners))
-                 magnus-review-controller--processes)
-        (dolist (entry owners)
-          (let* ((review-id (car entry))
-                 (owner (cdr entry))
-                 (process (plist-get owner :process))
-                 (round-number (plist-get owner :round-number))
-                 (token (plist-get owner :attempt-token)))
-            (unwind-protect
-                (condition-case err
-                    (when-let ((context
-                                (magnus-review-controller--context
-                                 review-id round-number token
-                                 '(starting running))))
-                      (pcase-let ((`(,review ,round ,attempt) context))
-                        (magnus-review-interrupt-attempt
-                         review round attempt
-                         "Magnus shut down during review" token 'shutdown)))
-                  (error
-                   (message "Magnus: could not persist interrupted review %s: %s"
-                            review-id (error-message-string err))))
-              ;; Process cancellation and ownership revocation are invariant even
-              ;; when persistence is unavailable.
-              (magnus-review-controller--cancel-watchdog owner)
-              (remhash review-id magnus-review-controller--processes)
-              (condition-case err
-                  (when (and process (process-live-p process))
-                    (magnus-headless-cancel process t))
-                (error
-                 (message "Magnus: could not cancel review process %s: %s"
-                          review-id (error-message-string err))))))))
-    ;; Hook/timer teardown is itself a cleanup invariant and therefore runs even
-    ;; if an unforeseen owner-loop error escapes the boundaries above.
-    (maphash
-     (lambda (_review-id owner)
-       (condition-case err
-           (magnus-review-controller--cancel-watchdog owner)
-         (error
-          (message "Magnus: could not clear review watchdog: %s"
-                   (error-message-string err)))))
-     magnus-review-controller--processes)
-    (clrhash magnus-review-controller--processes)
-    (magnus-terminal-cancel-scope 'magnus-review-controller)
-    (remove-hook 'magnus-review-ready-hook #'magnus-review-controller--ready)
-    (remove-hook 'magnus-review-checkpoint-mismatch-hook
-                 #'magnus-review-controller--recover-checkpoint-token)
-    (remove-hook 'magnus-process-ready-hook
-                 #'magnus-review-controller--process-ready)
-    (remove-hook 'magnus-reviews-changed-hook
-                 #'magnus-review-controller--refresh-status)
-    (remove-hook 'magnus-review-controller-changed-hook
-                 #'magnus-review-controller--refresh-status)
-    (remove-hook 'magnus-coord-review-ready-hook
-                 #'magnus-review-handle-ready-marker)
-    (when (boundp 'magnus-review-ui-action-function)
-      (setq magnus-review-ui-action-function nil))))
+  "Discard every in-flight review and detach controller hooks."
+  (setq magnus-review-controller--shutting-down t)
+  (let (runtimes)
+    (maphash (lambda (_id runtime) (push runtime runtimes))
+             magnus-review-controller--runtimes)
+    (dolist (runtime runtimes)
+      (magnus-review-controller--cancel-scope-timer runtime)
+      (magnus-review-controller--cancel-delivery-timer runtime)
+      (magnus-review-controller--cancel-delivery runtime)
+      (when-let ((key (magnus-review-controller-runtime-job-key runtime)))
+        (magnus-background-cancel key))
+      (when-let* ((review
+                   (magnus-review-get
+                    (magnus-review-controller-runtime-review-id runtime)))
+                  (round (magnus-review-controller-runtime-round runtime)))
+        (magnus-review-controller--discard-candidate review round))))
+  (clrhash magnus-review-controller--runtimes)
+  (magnus-terminal-cancel-scope 'magnus-review-controller)
+  (when (eq magnus-review-runtime-state-function
+            #'magnus-review-controller--runtime-state)
+    (setq magnus-review-runtime-state-function nil))
+  (remove-hook 'magnus-reviews-changed-hook
+               #'magnus-review-controller--refresh-status)
+  (remove-hook 'magnus-review-controller-changed-hook
+               #'magnus-review-controller--refresh-status)
+  (when (boundp 'magnus-review-ui-action-function)
+    (setq magnus-review-ui-action-function nil)))
 
 (provide 'magnus-review-controller)
 ;;; magnus-review-controller.el ends here

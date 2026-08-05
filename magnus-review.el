@@ -1,4 +1,4 @@
-;;; magnus-review.el --- Durable review records and Git snapshots -*- lexical-binding: t -*-
+;;; magnus-review.el --- Completed review lineages and Git evidence -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2026 Hrishikesh S
 ;; Author: Hrishikesh S <hrish2006@gmail.com>
@@ -9,75 +9,57 @@
 
 ;;; Commentary:
 
-;; This module owns the durable, provider-independent part of Magnus reviews.
-;; A review is not an interactive Magnus instance: it has its own lifecycle,
-;; immutable Git rounds, resumable provider identity, and append-only attempts.
-;; Provider processes and review presentation deliberately live elsewhere.
+;; This module owns the durable, provider-independent result of a Magnus
+;; review.  A lineage remembers its author and reviewer identity, and contains
+;; only successfully completed rounds.  Scope discovery, provider processes,
+;; retries, and failures are deliberately ephemeral controller concerns.
+;;
+;; Each completed round pins an exact Git base and head, immutable patch and
+;; path evidence, a structured result, and a rendered report.  The latest
+;; successful provider session ID is retained so a later round can continue
+;; the reviewer/reviewee conversation without making process recovery durable.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'json)
-(require 'seq)
 (require 'subr-x)
 (require 'magnus-instances)
 
-(declare-function magnus-coord--maybe-stop-watching "magnus-coord"
-                  (directory))
-(declare-function magnus-review-controller-active-p
-                  "magnus-review-controller" ())
-
 (defgroup magnus-review nil
-  "Durable cross-provider reviews managed by Magnus."
+  "Completed cross-provider review lineages managed by Magnus."
   :group 'magnus
   :prefix "magnus-review-")
 
 (defcustom magnus-review-directory-root
   (expand-file-name ".magnus/reviews" (or (getenv "HOME") "~"))
-  "Private directory containing durable Magnus review records."
+  "Private directory containing completed Magnus review lineages."
   :type 'directory
   :group 'magnus-review)
 
 (defcustom magnus-review-max-evidence-bytes (* 64 1024 1024)
-  "Maximum bytes accepted for one immutable review patch.
-This bounds durable storage and accidental giant binary reviews."
+  "Maximum bytes accepted for one immutable review patch."
   :type 'integer
   :group 'magnus-review)
 
-(defcustom magnus-review-max-stream-artifact-bytes (* 8 1024 1024)
-  "Maximum retained bytes for one raw JSONL or stderr review artifact.
-When a stream crosses this bound, Magnus preserves the complete lines already
-written and creates a sibling `.truncated' diagnostic instead of growing the
-artifact without limit."
-  :type 'integer
-  :group 'magnus-review)
-
-(defconst magnus-review-schema-version 2
-  "Current on-disk review manifest schema version.")
+(defconst magnus-review-schema-version 1
+  "Manifest version for completed review lineages.")
 
 (defconst magnus-review--lifecycle-states '(open archived))
-(defconst magnus-review--attempt-execution-states
-  '(starting running complete failed interrupted))
-(defconst magnus-review--verdict-states '(approve comment changes-requested))
-(defconst magnus-review--delivery-states '(not-ready pending sent failed))
-(defconst magnus-review--read-states '(not-ready unread read))
-(defconst magnus-review--terminal-attempt-states '(complete failed interrupted))
-(defconst magnus-review--interruption-kinds '(manual shutdown crash))
-(defconst magnus-review--checkpoint-event-kinds '(round unchanged))
+(defconst magnus-review--verdict-states
+  '(approve comment changes-requested))
+(defconst magnus-review--read-states '(unread read))
 
 (define-error 'magnus-review-error "Magnus review error")
 (define-error 'magnus-review-git-error "Magnus review Git error"
   'magnus-review-error)
-(define-error 'magnus-review-checkpoint-rejected
-  "Magnus review checkpoint permanently rejected" 'magnus-review-error)
 
 ;;; Repository paths
 
 (defun magnus-review-normalize-repository-path (value)
   "Return safe repository-relative VALUE, or nil.
-This normalizer preserves legitimate top-level `a/' and `b/' directories.
-Synthetic Git side prefixes belong only to unified-diff headers and are
-handled by `magnus-review-decode-diff-header-path'."
+This preserves legitimate top-level `a/' and `b/' directories.  Synthetic Git
+side prefixes are handled by `magnus-review-decode-diff-header-path'."
   (when (stringp value)
     (let ((path (string-remove-prefix "./" value)))
       (when (and (not (string-empty-p path))
@@ -96,10 +78,7 @@ handled by `magnus-review-decode-diff-header-path'."
          (eq (aref value (1- (length value))) ?\"))
     (condition-case err
         (pcase-let ((`(,decoded . ,end) (read-from-string value)))
-          (when (and (= end (length value))
-                     (stringp decoded))
-            ;; Git C-quotes UTF-8 bytes with octal escapes.  The Lisp reader
-            ;; returns those octets as a unibyte string.
+          (when (and (= end (length value)) (stringp decoded))
             (if (multibyte-string-p decoded)
                 decoded
               (decode-coding-string decoded 'utf-8-unix))))
@@ -110,10 +89,7 @@ handled by `magnus-review-decode-diff-header-path'."
    (t value)))
 
 (defun magnus-review-decode-diff-header-path (value side-prefix)
-  "Decode unified-diff path VALUE and remove one Git SIDE-PREFIX.
-SIDE-PREFIX is `a/' for an old-file header or `b/' for a new-file header.
-Return the safe repository-relative path, preserving any real leading `a/' or
-`b/' segment after that single synthetic prefix."
+  "Decode unified-diff VALUE and remove one synthetic SIDE-PREFIX."
   (let ((decoded (magnus-review--decode-git-quoted-path value)))
     (when (and (member side-prefix '("a/" "b/"))
                (stringp decoded)
@@ -122,67 +98,32 @@ Return the safe repository-relative path, preserving any real leading `a/' or
        (substring decoded (length side-prefix))))))
 
 (defun magnus-review-canonical-patch-arguments (base head)
-  "Return Git arguments for a canonical patch from BASE to HEAD.
-Explicit side prefixes and color suppression isolate durable review evidence
-from user-level Git presentation settings such as `diff.noprefix'."
+  "Return Git arguments for canonical patch evidence from BASE to HEAD."
   (list "diff" "--binary" "--full-index" "--no-ext-diff" "--no-color"
         "--src-prefix=a/" "--dst-prefix=b/" "--find-renames"
         base head "--"))
 
-;;; Records
-
-(cl-defstruct (magnus-review-checkpoint-event
-               (:constructor magnus-review-checkpoint-event--create)
-               (:copier nil))
-  "One immutable outcome observed for a checkpoint request."
-  kind
-  round-number
-  recorded-at)
-
-(cl-defstruct (magnus-review-checkpoint-request
-               (:constructor magnus-review-checkpoint-request--create)
-               (:copier nil))
-  "One durable request for an exact committed author checkpoint."
-  number
-  token
-  requested-at
-  events)
-
-(cl-defstruct (magnus-review-attempt
-               (:constructor magnus-review-attempt--create)
-               (:copier nil))
-  "One provider invocation within a review round."
-  number
-  token
-  started-at
-  finished-at
-  (execution 'starting)
-  error
-  interruption-kind)
+;;; Completed lineage records
 
 (cl-defstruct (magnus-review-round
                (:constructor magnus-review-round--create)
                (:copier nil))
-  "An immutable Git comparison and its append-only provider attempts."
+  "One successfully completed immutable Git review round.
+Before publication the same structure represents an ephemeral candidate, with
+nil completion, verdict, and read state."
   number
   base-oid
   head-oid
   created-at
   completed-at
   verdict
-  (delivery-state 'not-ready)
-  (delivery-attempts 0)
-  delivery-error
-  delivered-at
-  (read-state 'not-ready)
-  read-at
-  attempts
+  read-state
   metadata)
 
 (cl-defstruct (magnus-review
                (:constructor magnus-review--create)
                (:copier nil))
-  "A durable review task independent of any provider process."
+  "A review lineage containing only successfully completed rounds."
   id
   project-root
   project-hash
@@ -193,31 +134,26 @@ from user-level Git presentation settings such as `diff.noprefix'."
   model
   effort
   task
-  (lifecycle 'open)
   session-id
+  metadata
+  (lifecycle 'open)
   created-at
   updated-at
   archived-at
-  rounds
-  metadata
-  checkpoint-requests)
+  rounds)
 
 (defvar magnus-reviews nil
-  "All reviews loaded in this Emacs session.")
+  "Completed lineages and ephemeral drafts known to this Emacs session.")
 
 (defvar magnus-reviews-changed-hook nil
-  "Hook run after the durable review registry changes.")
+  "Hook run after the in-memory review registry changes.")
 
-(defvar magnus-review-ready-hook nil
-  "Hook run with REVIEW and ROUND after a checkpoint becomes reviewable.")
+(defvar magnus-review-runtime-state-function nil
+  "Optional function returning ephemeral execution state for one review.
+The function receives REVIEW and should return a state symbol or nil.  Magnus
+does not persist its answer.")
 
-(defvar magnus-review-checkpoint-mismatch-hook nil
-  "Hook run after a known review emits a non-current checkpoint token.
-Each function receives REVIEW and the rejected MARKER.  The marker never
-changes review state; controller integrations may resend the durable current
-checkpoint request so an author can recover after context loss or compaction.")
-
-;;; Small validation and path helpers
+;;; Validation and managed paths
 
 (defun magnus-review--signal (format-string &rest args)
   "Signal `magnus-review-error' with FORMAT-STRING and ARGS."
@@ -227,8 +163,7 @@ checkpoint request so an author can recover after context loss or compaction.")
   "Return non-nil when VALUE is a safe review identifier."
   (and (stringp value)
        (<= 1 (length value) 128)
-       (string-match-p
-        "\\`[[:alnum:]][[:alnum:]_.-]*\\'" value)))
+       (string-match-p "\\`[[:alnum:]][[:alnum:]_.-]*\\'" value)))
 
 (defun magnus-review--valid-hash-p (value)
   "Return non-nil when VALUE is a SHA-256 project hash."
@@ -241,20 +176,6 @@ checkpoint request so an author can recover after context loss or compaction.")
        (string-match-p
         "\\`\\(?:[[:xdigit:]]\\{40\\}\\|[[:xdigit:]]\\{64\\}\\)\\'"
         value)))
-
-(defun magnus-review--valid-token-p (value)
-  "Return non-nil when VALUE is a bounded opaque protocol token."
-  (and (stringp value)
-       (<= 16 (length value) 128)
-       (string-match-p "\\`[[:alnum:]_.-]+\\'" value)))
-
-(defun magnus-review--error-string (value)
-  "Normalize arbitrary error VALUE to a bounded durable string."
-  (when value
-    (let ((text (if (stringp value) value (format "%S" value))))
-      (if (> (length text) 10000)
-          (substring text 0 10000)
-        text))))
 
 (defun magnus-review--canonical-directory (directory)
   "Return a canonical local form of DIRECTORY."
@@ -281,42 +202,25 @@ checkpoint request so an author can recover after context loss or compaction.")
   (let* ((parent (file-name-as-directory (expand-file-name parent)))
          (child (expand-file-name component parent)))
     (unless (string-prefix-p parent child)
-      (magnus-review--signal "Review path escapes its managed directory: %s"
+      (magnus-review--signal "Review path escapes managed directory: %s"
                              child))
     child))
 
 (defun magnus-review-directory (review)
-  "Return REVIEW's private durable directory without creating it."
+  "Return REVIEW's private directory without creating it."
   (unless (magnus-review-p review)
     (magnus-review--signal "Not a Magnus review: %S" review))
   (unless (magnus-review--valid-hash-p (magnus-review-project-hash review))
     (magnus-review--signal "Invalid project hash in review %s"
                            (magnus-review-id review)))
-  (let ((project-directory
-         (magnus-review--child-path magnus-review-directory-root
-                                    (magnus-review-project-hash review))))
-    (magnus-review--child-path project-directory (magnus-review-id review))))
+  (magnus-review--child-path
+   (magnus-review--child-path magnus-review-directory-root
+                              (magnus-review-project-hash review))
+   (magnus-review-id review)))
 
 (defun magnus-review-manifest-path (review)
-  "Return REVIEW's manifest path."
+  "Return REVIEW's completed-lineage manifest path."
   (expand-file-name "manifest.json" (magnus-review-directory review)))
-
-(defun magnus-review-checkout-path (review)
-  "Return REVIEW's legacy shared Git worktree path."
-  (expand-file-name "checkout" (magnus-review-directory review)))
-
-(defun magnus-review-round-checkout-path (review round)
-  "Return REVIEW's immutable Git worktree path for ROUND."
-  (let ((number (if (magnus-review-round-p round)
-                    (magnus-review-round-number round)
-                  round))
-        (head (and (magnus-review-round-p round)
-                   (magnus-review-round-head-oid round))))
-    (magnus-review--positive-number number "round")
-    (unless (magnus-review--valid-oid-p head)
-      (magnus-review--signal "Review round has invalid HEAD: %S" head))
-    (expand-file-name (format "checkouts/%03d-%s" number head)
-                      (magnus-review-directory review))))
 
 (defun magnus-review--positive-number (value kind)
   "Return positive integer VALUE or signal, naming it KIND."
@@ -324,81 +228,82 @@ checkpoint request so an author can recover after context loss or compaction.")
     (magnus-review--signal "Invalid %s number: %S" kind value))
   value)
 
+(defun magnus-review--round-component (round)
+  "Return the collision-free managed path component for ROUND."
+  (unless (magnus-review-round-p round)
+    (magnus-review--signal "Not a Magnus review round: %S" round))
+  (magnus-review--positive-number
+   (magnus-review-round-number round) "round")
+  (unless (and (magnus-review--valid-oid-p
+                (magnus-review-round-base-oid round))
+               (magnus-review--valid-oid-p
+                (magnus-review-round-head-oid round)))
+    (magnus-review--signal "Review round has invalid Git evidence"))
+  (format "%03d-%s-%s"
+          (magnus-review-round-number round)
+          (downcase (magnus-review-round-base-oid round))
+          (downcase (magnus-review-round-head-oid round))))
+
 (defun magnus-review-round-directory (review round)
-  "Return the artifact directory for ROUND in REVIEW."
-  (let ((number (if (magnus-review-round-p round)
-                    (magnus-review-round-number round)
-                  round)))
-    (magnus-review--positive-number number "round")
-    (expand-file-name (format "rounds/%03d" number)
-                      (magnus-review-directory review))))
+  "Return the artifact directory for REVIEW candidate or completed ROUND."
+  (magnus-review--child-path
+   (expand-file-name "rounds" (magnus-review-directory review))
+   (magnus-review--round-component round)))
 
-(defun magnus-review-attempt-raw-path (review round attempt)
-  "Return the raw JSONL artifact path for ATTEMPT of ROUND in REVIEW."
-  (let ((number (if (magnus-review-attempt-p attempt)
-                    (magnus-review-attempt-number attempt)
-                  attempt)))
-    (magnus-review--positive-number number "attempt")
-    (expand-file-name (format "attempt-%03d.jsonl" number)
-                      (magnus-review-round-directory review round))))
-
-(defun magnus-review-attempt-stderr-path (review round attempt)
-  "Return the stderr artifact path for ATTEMPT of ROUND in REVIEW."
-  (let ((number (if (magnus-review-attempt-p attempt)
-                    (magnus-review-attempt-number attempt)
-                  attempt)))
-    (magnus-review--positive-number number "attempt")
-    (expand-file-name (format "attempt-%03d.stderr.log" number)
-                      (magnus-review-round-directory review round))))
+(defun magnus-review-round-checkout-path (review round)
+  "Return REVIEW's isolated detached worktree path for ROUND."
+  (magnus-review--child-path
+   (expand-file-name "checkouts" (magnus-review-directory review))
+   (magnus-review--round-component round)))
 
 (defun magnus-review-round-result-path (review round)
-  "Return the canonical structured result path for ROUND in REVIEW."
+  "Return the canonical structured result path for REVIEW ROUND."
   (expand-file-name "result.json"
                     (magnus-review-round-directory review round)))
 
 (defun magnus-review-round-report-path (review round)
-  "Return the rendered Markdown report path for ROUND in REVIEW."
+  "Return the rendered Markdown report path for REVIEW ROUND."
   (expand-file-name "report.md"
                     (magnus-review-round-directory review round)))
 
 (defun magnus-review-round-patch-path (review round)
-  "Return the immutable committed patch evidence path for ROUND in REVIEW."
+  "Return the immutable committed patch path for REVIEW ROUND."
   (expand-file-name "evidence.patch"
                     (magnus-review-round-directory review round)))
 
 (defun magnus-review-round-name-status-path (review round)
-  "Return the NUL-delimited changed-path evidence path for ROUND in REVIEW."
+  "Return the NUL-delimited changed-path evidence path for REVIEW ROUND."
   (expand-file-name "name-status.z"
                     (magnus-review-round-directory review round)))
 
 (defun magnus-review--ensure-private-directory (directory)
-  "Create DIRECTORY if needed and require it to be a private real directory."
-  ;; A trailing slash makes some file APIs follow a terminal directory symlink
-  ;; before inspection.  Normalize it away before the explicit refusal below.
+  "Create DIRECTORY if needed and require a private real directory."
   (setq directory (directory-file-name (expand-file-name directory)))
   (when (file-remote-p directory)
-    (magnus-review--signal "Managed review path may not be remote: %s" directory))
+    (magnus-review--signal "Managed review path may not be remote: %s"
+                           directory))
   (when (file-symlink-p directory)
-    (magnus-review--signal "Refusing symlinked review directory: %s" directory))
+    (magnus-review--signal "Refusing symlinked review directory: %s"
+                           directory))
   (if (file-exists-p directory)
       (unless (file-directory-p directory)
-        (magnus-review--signal "Review path is not a directory: %s" directory))
+        (magnus-review--signal "Review path is not a directory: %s"
+                               directory))
     (make-directory directory t))
   (set-file-modes directory #o700)
   directory)
 
 (defun magnus-review--ensure-review-directories (review &optional round)
-  "Create REVIEW's private directories, and optional ROUND directory."
+  "Create private directories for REVIEW and optional ROUND."
   (let* ((root (directory-file-name
                 (expand-file-name magnus-review-directory-root)))
          (project (magnus-review--child-path
                    root (magnus-review-project-hash review)))
          (directory (magnus-review-directory review)))
-    (magnus-review--ensure-private-directory root)
-    (magnus-review--ensure-private-directory project)
-    (magnus-review--ensure-private-directory directory)
-    (magnus-review--ensure-private-directory
-     (expand-file-name "rounds" directory))
+    (dolist (path (list root project directory
+                        (expand-file-name "rounds" directory)
+                        (expand-file-name "checkouts" directory)))
+      (magnus-review--ensure-private-directory path))
     (when round
       (magnus-review--ensure-private-directory
        (magnus-review-round-directory review round)))
@@ -407,9 +312,7 @@ checkpoint request so an author can recover after context loss or compaction.")
 (defun magnus-review--atomic-write-string (file contents &optional coding)
   "Write CONTENTS atomically to FILE with mode 0600.
 CODING defaults to `utf-8-unix'; use `no-conversion' for Git byte evidence."
-  (let ((directory (file-name-directory file))
-        temporary
-        write-error)
+  (let ((directory (file-name-directory file)) temporary write-error)
     (magnus-review--ensure-private-directory directory)
     (when (file-symlink-p file)
       (magnus-review--signal "Refusing to overwrite symlink: %s" file))
@@ -422,9 +325,6 @@ CODING defaults to `utf-8-unix'; use `no-conversion' for Git byte evidence."
             (progn
               (let ((coding-system-for-write (or coding 'utf-8-unix)))
                 (write-region contents nil temporary nil 'quiet))
-              ;; Set the final mode before the commit point.  Nothing that can
-              ;; fail may follow the rename, or callers could roll memory back
-              ;; after the new manifest is already durable.
               (set-file-modes temporary #o600)
               (rename-file temporary file t)
               (setq temporary nil))
@@ -433,15 +333,13 @@ CODING defaults to `utf-8-unix'; use `no-conversion' for Git byte evidence."
         (condition-case cleanup-error
             (delete-file temporary)
           (error
-           ;; Cleanup must never replace the original persistence error.
            (unless write-error
              (setq write-error cleanup-error))))))
     (when write-error
       (signal (car write-error) (cdr write-error)))))
 
 (defun magnus-review-prepare-artifact-path (review path)
-  "Prepare private directories for REVIEW artifact PATH and return PATH.
-PATH must be lexically below REVIEW's managed rounds directory."
+  "Prepare private directories for REVIEW artifact PATH and return PATH."
   (let* ((root (file-name-as-directory
                 (expand-file-name "rounds" (magnus-review-directory review))))
          (path (expand-file-name path)))
@@ -461,65 +359,45 @@ PATH must be lexically below REVIEW's managed rounds directory."
       (insert-file-contents-literally file))
     (buffer-string)))
 
+(defun magnus-review--completed-artifact-path-p (review path)
+  "Return non-nil when PATH belongs to a completed round of REVIEW."
+  (let ((path (expand-file-name path)))
+    (cl-some
+     (lambda (round)
+       (member path
+               (mapcar #'expand-file-name
+                       (list (magnus-review-round-result-path review round)
+                             (magnus-review-round-report-path review round)
+                             (magnus-review-round-patch-path review round)
+                             (magnus-review-round-name-status-path
+                              review round)))))
+     (magnus-review-rounds review))))
+
 (defun magnus-review-write-artifact
-    (review path contents &optional coding _replace)
+    (review path contents &optional coding replace)
   "Atomically write private REVIEW artifact CONTENTS to PATH.
-An existing identical file is adopted idempotently; a divergent artifact is
-never overwritten.  CODING defaults to UTF-8.  The final optional argument is
-retained for controller compatibility but cannot weaken append-only safety."
+An identical file is adopted.  REPLACE permits replacing an ephemeral
+candidate artifact, but never an artifact belonging to a completed round."
   (setq path (magnus-review-prepare-artifact-path review path))
-  (when (file-exists-p path)
-    (unless (let ((existing (magnus-review--read-artifact-bytes path))
-                  (expected
-                   (if (eq coding 'no-conversion)
+  (let* ((exists (file-exists-p path))
+         (expected (if (eq coding 'no-conversion)
                        contents
                      (encode-coding-string contents
-                                           (or coding 'utf-8-unix)))))
-              (equal existing expected))
+                                           (or coding 'utf-8-unix))))
+         (identical (and exists
+                         (equal (magnus-review--read-artifact-bytes path)
+                                expected))))
+    (when (and exists (not identical)
+               (or (not replace)
+                   (magnus-review--completed-artifact-path-p review path)))
       (magnus-review--signal
-       "Refusing to overwrite append-only review artifact: %s" path)))
-  (unless (file-exists-p path)
-    (magnus-review--atomic-write-string path contents coding))
+       "Refusing to overwrite durable review artifact: %s" path))
+    (unless identical
+      (magnus-review--atomic-write-string path contents coding)))
   (set-file-modes path #o600)
   path)
 
-(defun magnus-review-append-artifact-line
-    (review path line &optional coding)
-  "Append complete LINE to a private REVIEW artifact at PATH.
-This is intended for raw JSONL and stderr streams; it never follows symlinks."
-  (unless (stringp line)
-    (magnus-review--signal "Review artifact line must be a string"))
-  (setq path (magnus-review-prepare-artifact-path review path))
-  (when (and (file-exists-p path)
-             (or (file-symlink-p path) (not (file-regular-p path))))
-    (magnus-review--signal "Unsafe append-only review artifact: %s" path))
-  (let* ((coding-system-for-write (or coding 'utf-8-unix))
-         (encoded
-          (encode-coding-string (concat line "\n") coding-system-for-write))
-         (current
-          (if (file-exists-p path)
-              (file-attribute-size (file-attributes path))
-            0))
-         (limit (max 0 magnus-review-max-stream-artifact-bytes)))
-    (if (<= (+ current (string-bytes encoded)) limit)
-        (progn
-          (write-region (concat line "\n") nil path t 'quiet)
-          (set-file-modes path #o600))
-      (let ((marker (concat path ".truncated")))
-        (when (or (file-symlink-p marker) (file-directory-p marker))
-          (magnus-review--signal
-           "Unsafe review truncation marker: %s" marker))
-        (unless (file-exists-p marker)
-          (magnus-review--atomic-write-string
-           marker
-           (format
-            (concat "Magnus stopped retaining this stream at %d bytes; "
-                    "the next complete record required %d bytes and the "
-                    "configured limit is %d bytes.\n")
-            current (string-bytes encoded) limit))))))
-  path)
-
-;;; Git scope inspection
+;;; Git scope and evidence
 
 (defun magnus-review--git-output (directory &rest arguments)
   "Run Git in DIRECTORY with ARGUMENTS and return trimmed output."
@@ -532,16 +410,15 @@ This is intended for raw JSONL and stderr streams; it never follows symlinks."
               (list (format "Git directory does not exist: %s" directory))))
     (with-temp-buffer
       (let ((status (apply #'process-file "git" nil t nil
-                           "-C" directory arguments))
-            (output nil))
-        (setq output (string-trim-right (buffer-string)))
-        (unless (and (integerp status) (zerop status))
-          (signal 'magnus-review-git-error
-                  (list (if (string-empty-p output)
-                            (format "Git failed (%s): git %s"
-                                    status (string-join arguments " "))
-                          output))))
-        output))))
+                           "-C" directory arguments)))
+        (let ((output (string-trim-right (buffer-string))))
+          (unless (and (integerp status) (zerop status))
+            (signal 'magnus-review-git-error
+                    (list (if (string-empty-p output)
+                              (format "Git failed (%s): git %s"
+                                      status (string-join arguments " "))
+                            output))))
+          output)))))
 
 (defun magnus-review--git-output-optional (directory &rest arguments)
   "Like `magnus-review--git-output', returning nil when Git fails."
@@ -550,7 +427,7 @@ This is intended for raw JSONL and stderr streams; it never follows symlinks."
     (magnus-review-git-error nil)))
 
 (defun magnus-review--git-output-raw (directory &rest arguments)
-  "Run Git in DIRECTORY and return its exact unibyte stdout."
+  "Run Git in DIRECTORY and return exact unibyte stdout."
   (unless (executable-find "git")
     (signal 'magnus-review-git-error (list "Git executable not found")))
   (let ((directory (magnus-review--canonical-directory directory))
@@ -568,9 +445,8 @@ This is intended for raw JSONL and stderr streams; it never follows symlinks."
 
 (defun magnus-review-git-root (directory)
   "Return the canonical Git worktree root containing DIRECTORY."
-  (let ((root (magnus-review--git-output
-               directory "rev-parse" "--show-toplevel")))
-    (magnus-review--canonical-directory root)))
+  (magnus-review--canonical-directory
+   (magnus-review--git-output directory "rev-parse" "--show-toplevel")))
 
 (defun magnus-review--git-common-directory (directory)
   "Return canonical common Git metadata directory for DIRECTORY."
@@ -599,7 +475,7 @@ This is intended for raw JSONL and stderr streams; it never follows symlinks."
                (concat revision "^{commit}")))))
     (unless (magnus-review--valid-oid-p oid)
       (signal 'magnus-review-git-error
-              (list (format "Git returned a non-full commit ID for %s: %S"
+              (list (format "Git returned an invalid commit ID for %s: %S"
                             revision oid))))
     oid))
 
@@ -618,11 +494,8 @@ This is intended for raw JSONL and stderr streams; it never follows symlinks."
 (defvar magnus-coord-instructions-file)
 
 (defun magnus-review--control-pathspecs (project-root)
-  "Return literal Git exclusions for Magnus control files in PROJECT-ROOT.
-Customized coordination paths outside the worktree are ignored: an exclusion
-must never broaden Git's scope or conceal an unrelated project path."
-  (let ((root (file-name-as-directory (expand-file-name project-root)))
-        paths)
+  "Return literal Git exclusions for Magnus control files in PROJECT-ROOT."
+  (let ((root (file-name-as-directory (expand-file-name project-root))) paths)
     (dolist (configured
              (list (if (boundp 'magnus-coord-file)
                        magnus-coord-file
@@ -642,9 +515,7 @@ must never broaden Git's scope or conceal an unrelated project path."
     (delete-dups (nreverse paths))))
 
 (defun magnus-review-worktree-dirty-status (project-root)
-  "Return reviewable porcelain status for PROJECT-ROOT, or nil when clean.
-Magnus's coordination file and generated instructions are control-plane state:
-publishing a checkpoint must not make its own committed-work gate fail."
+  "Return reviewable porcelain status for PROJECT-ROOT, or nil when clean."
   (let ((status
          (apply #'magnus-review--git-output
                 project-root "status" "--porcelain=v1"
@@ -653,7 +524,7 @@ publishing a checkpoint must not make its own committed-work gate fail."
     (unless (string-empty-p status) status)))
 
 (defun magnus-review--managed-worktree-dirty-status (checkout)
-  "Return every non-committed path in managed CHECKOUT, including ignored paths."
+  "Return every non-committed path in managed CHECKOUT, including ignored."
   (let ((status (magnus-review--git-output
                  checkout "status" "--porcelain=v1"
                  "--untracked-files=all" "--ignored")))
@@ -661,11 +532,10 @@ publishing a checkpoint must not make its own committed-work gate fail."
 
 (defconst magnus-review-uncommitted-message
   "work is uncommitted. Ask instance to commit first"
-  "Message shown when a committed review checkpoint cannot be accepted.")
+  "Message shown when exact committed review evidence cannot be captured.")
 
 (defun magnus-review-inspect-scope (project-root base-revision head-revision)
-  "Return validated Git evidence for BASE-REVISION..HEAD-REVISION.
-The result is a plist suitable for status/transient presentation."
+  "Return validated Git evidence for BASE-REVISION..HEAD-REVISION."
   (let* ((project-root (magnus-review-git-root project-root))
          (base (magnus-review-resolve-oid project-root base-revision))
          (head (magnus-review-resolve-oid project-root head-revision)))
@@ -674,242 +544,353 @@ The result is a plist suitable for status/transient presentation."
               (list (format "Review base %s is not an ancestor of head %s"
                             base head))))
     (let* ((dirty-status (magnus-review-worktree-dirty-status project-root))
-           (name-output (magnus-review--git-output
-                         project-root "diff" "--name-only" "-z"
-                         "--no-ext-diff" base head "--"))
-           (changed-files (split-string name-output "\0" t))
+           (name-output
+            (magnus-review--git-output-raw
+             project-root "diff" "--name-only" "-z" "--no-ext-diff"
+             base head "--"))
+           (changed-files
+            (mapcar (lambda (path)
+                      (decode-coding-string path 'utf-8-unix))
+                    (split-string name-output "\0" t)))
            (diffstat (magnus-review--git-output
                       project-root "diff" "--stat" "--no-color"
                       "--no-ext-diff" base head "--"))
            (shortstat (magnus-review--git-output
                        project-root "diff" "--shortstat" "--no-color"
                        "--no-ext-diff" base head "--"))
-           (commit-count-string
-            (magnus-review--git-output project-root "rev-list" "--count"
-                                       (concat base ".." head))))
+           (commit-count
+            (string-to-number
+             (magnus-review--git-output
+              project-root "rev-list" "--count" (concat base ".." head)))))
       (list :project-root project-root
             :base-oid base
             :head-oid head
             :ancestor-p t
-            :commit-count (string-to-number commit-count-string)
+            :commit-count commit-count
             :changed-file-count (length changed-files)
             :changed-files changed-files
             :diffstat diffstat
             :shortstat shortstat
             :dirty-p (and dirty-status t)
             :dirty-status dirty-status
-            :dirty-warning
-            (and dirty-status
-                 magnus-review-uncommitted-message)))))
-
-(defun magnus-review-suggest-upstream-scope (project-root &optional head-revision)
-  "Suggest an upstream merge-base scope for PROJECT-ROOT.
-Return nil when the current branch has no configured upstream.  Otherwise
-return `magnus-review-inspect-scope' data plus :upstream and :upstream-oid."
-  (let* ((project-root (magnus-review-git-root project-root))
-         (head (magnus-review-resolve-oid project-root
-                                          (or head-revision "HEAD")))
-         (upstream (magnus-review--git-output-optional
-                    project-root "rev-parse" "--abbrev-ref"
-                    "--symbolic-full-name" "@{upstream}")))
-    (when (and upstream (not (string-empty-p upstream)))
-      (let* ((upstream-oid (magnus-review-resolve-oid project-root upstream))
-             (base (downcase
-                    (magnus-review--git-output
-                     project-root "merge-base" head upstream-oid))))
-        (unless (magnus-review--valid-oid-p base)
-          (signal 'magnus-review-git-error
-                  (list (format "Invalid merge-base returned by Git: %S" base))))
-        (append (magnus-review-inspect-scope project-root base head)
-                (list :upstream upstream :upstream-oid upstream-oid))))))
+            :dirty-warning (and dirty-status
+                                magnus-review-uncommitted-message)))))
 
 (defun magnus-review-capture-round-evidence (review round)
-  "Persist immutable Git patch and path evidence for REVIEW ROUND.
-Evidence files are append-only, private, and remain after worktree cleanup."
+  "Persist immutable Git patch and changed-path evidence for REVIEW ROUND."
   (let* ((project-root (magnus-review-project-root review))
          (base (magnus-review-round-base-oid round))
          (head (magnus-review-round-head-oid round))
          (patch-path (magnus-review-round-patch-path review round))
          (name-status-path
-          (magnus-review-round-name-status-path review round)))
+          (magnus-review-round-name-status-path review round))
+         (patch (apply #'magnus-review--git-output-raw project-root
+                       (magnus-review-canonical-patch-arguments base head)))
+         (name-status
+          (magnus-review--git-output-raw
+           project-root "diff" "--name-status" "-z" "--find-renames"
+           "--no-ext-diff" base head "--")))
+    (when (> (length patch) magnus-review-max-evidence-bytes)
+      (magnus-review--signal
+       "Review patch is %d bytes; configured limit is %d"
+       (length patch) magnus-review-max-evidence-bytes))
     (magnus-review--ensure-review-directories review round)
-    ;; Compute both byte streams before publishing either path.  The atomic
-    ;; writers ensure readers never observe a partial Git stream.  Exact files
-    ;; left by a crash before manifest publication are adopted, never replaced.
-    (let ((patch (apply #'magnus-review--git-output-raw project-root
-                        (magnus-review-canonical-patch-arguments base head)))
-          (name-status
-           (magnus-review--git-output-raw
-            project-root "diff" "--name-status" "-z" "--find-renames"
-            "--no-ext-diff" base head "--")))
-      (when (> (length patch) magnus-review-max-evidence-bytes)
-        (magnus-review--signal
-         "Review patch is %d bytes; configured limit is %d"
-         (length patch) magnus-review-max-evidence-bytes))
-      (cl-mapc
-       (lambda (path contents)
-         (if (file-exists-p path)
-             (progn
-               (when (or (file-symlink-p path) (not (file-regular-p path)))
-                 (magnus-review--signal
-                  "Refusing unsafe existing review evidence: %s" path))
-               (with-temp-buffer
-                 (set-buffer-multibyte nil)
-                 (let ((coding-system-for-read 'no-conversion))
-                   (insert-file-contents-literally path))
-                 (unless (equal (buffer-string) contents)
-                   (magnus-review--signal
-                    "Existing round evidence does not match Git scope: %s"
-                    path))))
-           (magnus-review--atomic-write-string path contents 'no-conversion)))
-       (list patch-path name-status-path)
-       (list patch name-status)))
+    (cl-mapc
+     (lambda (path contents)
+       (if (file-exists-p path)
+           (unless (equal (magnus-review--read-artifact-bytes path) contents)
+             (magnus-review--signal
+              "Existing round evidence does not match Git scope: %s" path))
+         (magnus-review--atomic-write-string path contents 'no-conversion)))
+     (list patch-path name-status-path)
+     (list patch name-status))
     (list :patch patch-path :name-status name-status-path)))
 
-;;; Registry and append-only domain transitions
+;;; Detached candidate worktrees
+
+(defun magnus-review--verified-clean-checkout-head (review checkout)
+  "Return proven clean CHECKOUT head for REVIEW, or nil when absent."
+  (cond
+   ((file-symlink-p checkout)
+    (magnus-review--signal "Refusing symlinked review checkout: %s" checkout))
+   ((not (file-exists-p checkout)) nil)
+   ((not (file-directory-p checkout))
+    (magnus-review--signal "Review checkout is not a directory: %s" checkout))
+   (t
+    (condition-case error-data
+        (progn
+          (unless (string= (magnus-review-git-root checkout)
+                           (magnus-review--canonical-directory checkout))
+            (magnus-review--signal
+             "Review checkout is not its exact Git top-level: %s" checkout))
+          (unless (string=
+                   (magnus-review--git-common-directory checkout)
+                   (magnus-review--git-common-directory
+                    (magnus-review-project-root review)))
+            (magnus-review--signal
+             "Review checkout belongs to a different repository: %s" checkout))
+          (when (magnus-review--git-output-optional
+                 checkout "symbolic-ref" "--quiet" "HEAD")
+            (magnus-review--signal
+             "Review checkout is not detached: %s" checkout))
+          (when-let ((dirty
+                      (magnus-review--managed-worktree-dirty-status checkout)))
+            (magnus-review--signal
+             "Refusing modified review checkout %s:\n%s" checkout dirty))
+          (magnus-review-resolve-oid checkout "HEAD"))
+      (magnus-review-git-error
+       (magnus-review--signal
+        "Cannot prove review checkout ownership at %s: %s"
+        checkout (error-message-string error-data)))))))
+
+(defun magnus-review-ensure-checkout (review head-revision round)
+  "Ensure an isolated clean detached checkout for REVIEW ROUND at HEAD-REVISION."
+  (unless (magnus-review-round-p round)
+    (magnus-review--signal "A review round is required for isolated checkout"))
+  (let* ((project-root (magnus-review-project-root review))
+         (head (magnus-review-resolve-oid project-root head-revision))
+         (checkout (magnus-review-round-checkout-path review round)))
+    (unless (string= head (magnus-review-round-head-oid round))
+      (magnus-review--signal "Checkout HEAD does not match candidate round"))
+    (magnus-review--ensure-review-directories review)
+    (magnus-review--ensure-private-directory (file-name-directory checkout))
+    (let ((current (magnus-review--verified-clean-checkout-head
+                    review checkout)))
+      (cond
+       ((and current (not (string= current head)))
+        (magnus-review--signal
+         "Immutable review checkout has unexpected HEAD %s" current))
+       ((null current)
+        (condition-case error-data
+            (magnus-review--git-output
+             project-root "worktree" "add" "--detach" checkout head)
+          (error
+           (unless
+               (condition-case verification-error
+                   (string=
+                    (or (magnus-review--verified-clean-checkout-head
+                         review checkout)
+                        "")
+                    head)
+                 (error
+                  (message
+                   "Magnus: concurrent checkout validation failed: %s"
+                   (error-message-string verification-error))
+                  nil))
+             (signal (car error-data) (cdr error-data))))))))
+    (unless (string=
+             (or (magnus-review--verified-clean-checkout-head review checkout)
+                 "")
+             head)
+      (magnus-review--signal "Review checkout stopped at unexpected commit"))
+    (set-file-modes checkout #o700)
+    checkout))
+
+(defun magnus-review--round-storage-chain (review round kind)
+  "Return managed directory chain for REVIEW ROUND storage KIND.
+KIND is either `round' or `checkout'."
+  (let* ((root (directory-file-name
+                (expand-file-name magnus-review-directory-root)))
+         (project (magnus-review--child-path
+                   root (magnus-review-project-hash review)))
+         (directory (magnus-review-directory review))
+         (bucket
+          (expand-file-name
+           (pcase kind
+             ('round "rounds")
+             ('checkout "checkouts")
+             (_ (magnus-review--signal
+                 "Invalid review storage kind: %S" kind)))
+           directory))
+         (leaf
+          (pcase kind
+            ('round (magnus-review-round-directory review round))
+            ('checkout (magnus-review-round-checkout-path review round)))))
+    (list root project directory bucket leaf)))
+
+(defun magnus-review--assert-safe-directory-chain (paths)
+  "Refuse symlinks and non-directories among existing managed PATHS."
+  (dolist (path paths)
+    (when (file-symlink-p path)
+      (magnus-review--signal "Refusing symlinked review path: %s" path))
+    (when (and (file-exists-p path) (not (file-directory-p path)))
+      (magnus-review--signal "Review path is not a directory: %s" path))))
+
+(defun magnus-review--assert-unpublished-candidate (review round)
+  "Require ROUND to be an unpublished candidate belonging below REVIEW.
+Path identity is checked as well as object identity so a copied or forged
+round cannot target the artifacts of a completed lineage round."
+  (unless (magnus-review-p review)
+    (magnus-review--signal "Not a Magnus review: %S" review))
+  (unless (magnus-review-round-p round)
+    (magnus-review--signal "Not a Magnus review round: %S" round))
+  ;; Computing the directory validates every path-forming round field before
+  ;; any deletion is considered.
+  (let ((candidate-directory
+         (expand-file-name (magnus-review-round-directory review round))))
+    (when (or (magnus-review-round-completed-at round)
+              (magnus-review-round-verdict round)
+              (magnus-review-round-read-state round)
+              (cl-some
+               (lambda (completed)
+                 (string=
+                  candidate-directory
+                  (expand-file-name
+                   (magnus-review-round-directory review completed))))
+               (magnus-review-rounds review)))
+      (magnus-review--signal "Refusing to discard a completed review round")))
+  round)
+
+(defun magnus-review--preflight-round-directory (review round)
+  "Validate REVIEW ROUND's candidate artifact directory for safe deletion."
+  (let* ((chain (magnus-review--round-storage-chain review round 'round))
+         (directory (car (last chain))))
+    (magnus-review--assert-safe-directory-chain chain)
+    (when (file-directory-p directory)
+      ;; Candidate artifacts are deliberately flat.  Refusing anything other
+      ;; than ordinary files keeps recursive deletion from acquiring surprising
+      ;; semantics later.
+      (dolist (entry (directory-files directory t
+                                      directory-files-no-dot-files-regexp))
+        (when (file-symlink-p entry)
+          (magnus-review--signal
+           "Refusing symlinked candidate artifact: %s" entry))
+        (unless (file-regular-p entry)
+          (magnus-review--signal
+           "Refusing unexpected candidate artifact: %s" entry))))
+    directory))
+
+(defun magnus-review--preflight-round-checkout (review round)
+  "Validate REVIEW ROUND's detached checkout for safe removal."
+  (let* ((chain (magnus-review--round-storage-chain review round 'checkout))
+         (checkout (car (last chain))))
+    (magnus-review--assert-safe-directory-chain chain)
+    (when (file-directory-p checkout)
+      (let ((head
+             (magnus-review--verified-clean-checkout-head review checkout)))
+        (unless (string= head (magnus-review-round-head-oid round))
+          (magnus-review--signal
+           "Candidate checkout has unexpected HEAD %s" head))))
+    checkout))
+
+(defun magnus-review--remove-round-checkout (review round)
+  "Strictly and idempotently remove REVIEW ROUND's verified checkout."
+  (let ((checkout (magnus-review--preflight-round-checkout review round)))
+    (when (file-directory-p checkout)
+      (magnus-review--git-output
+       (magnus-review-project-root review) "worktree" "remove" checkout))
+    (when (or (file-symlink-p checkout) (file-exists-p checkout))
+      (magnus-review--signal
+       "Review checkout remains after removal: %s" checkout))
+    t))
+
+(defun magnus-review--remove-candidate-round-directory (review round)
+  "Strictly and idempotently remove REVIEW ROUND's candidate artifacts."
+  (let ((directory (magnus-review--preflight-round-directory review round)))
+    (when (file-directory-p directory)
+      (delete-directory directory t))
+    (when (or (file-symlink-p directory) (file-exists-p directory))
+      (magnus-review--signal
+       "Candidate artifact directory remains after removal: %s" directory))
+    t))
+
+(defun magnus-review-cleanup-round-checkout (review round)
+  "Best-effort removal of REVIEW ROUND's reproducible detached checkout.
+Return non-nil when the checkout is absent or was removed.  Unsafe or modified
+paths are preserved and reported rather than forced away."
+  (condition-case err
+      (magnus-review--remove-round-checkout review round)
+    (error
+     (message "Magnus: could not remove review checkout %s: %s"
+              (magnus-review-round-checkout-path review round)
+              (error-message-string err))
+     nil)))
+
+(defun magnus-review-discard-candidate (review round)
+  "Safely discard unpublished candidate ROUND and its checkout from REVIEW.
+Completed rounds, escaped managed paths, symlinks, modified checkouts, and
+unexpected candidate artifacts are refused.  Repeating a successful discard is
+safe and returns non-nil."
+  (magnus-review--assert-unpublished-candidate review round)
+  ;; Preflight both trees before mutating either.  This makes a refusal leave
+  ;; every candidate artifact available for inspection.
+  (magnus-review--preflight-round-checkout review round)
+  (magnus-review--preflight-round-directory review round)
+  (magnus-review--remove-round-checkout review round)
+  (magnus-review--remove-candidate-round-directory review round)
+  t)
+
+;;; Ephemeral preparation and successful publication
 
 (defun magnus-review-list ()
   "Return a copy of the loaded review list."
   (copy-sequence magnus-reviews))
 
+(defun magnus-review-get (id)
+  "Return the known review whose ID is ID."
+  (and (stringp id)
+       (cl-find id magnus-reviews :key #'magnus-review-id :test #'string=)))
+
+(defun magnus-review-latest-round (review)
+  "Return REVIEW's latest successfully completed round, or nil."
+  (car (last (magnus-review-rounds review))))
+
+(defun magnus-review-execution (review)
+  "Return REVIEW's ephemeral runtime state or durable fallback state."
+  (or (and (functionp magnus-review-runtime-state-function)
+           (funcall magnus-review-runtime-state-function review))
+      (if (magnus-review-rounds review) 'complete 'idle)))
+
+(defun magnus-review-read-state (review)
+  "Return aggregate read state for REVIEW's completed rounds."
+  (let ((rounds (magnus-review-rounds review)))
+    (cond ((null rounds) 'not-ready)
+          ((cl-some (lambda (round)
+                      (eq (magnus-review-round-read-state round) 'unread))
+                    rounds)
+           'unread)
+          (t 'read))))
+
 (defun magnus-review-reserved-instance-names (project-root)
-  "Return reviewer identities reserved by open reviews in PROJECT-ROOT."
+  "Return reviewer identities reserved by open lineages in PROJECT-ROOT."
   (let ((project (magnus-review--canonical-directory project-root)) names)
     (dolist (review magnus-reviews (delete-dups names))
       (when (and (eq (magnus-review-lifecycle review) 'open)
-                 (magnus-review-reviewer-name review)
-                 (string=
-                  project
-                  (magnus-review--canonical-directory
-                   (magnus-review-project-root review))))
+                 (stringp (magnus-review-reviewer-name review))
+                 (string= project
+                          (magnus-review--canonical-directory
+                           (magnus-review-project-root review))))
         (push (magnus-review-reviewer-name review) names)))))
 
 (add-hook 'magnus-instances-name-reservation-functions
           #'magnus-review-reserved-instance-names)
 
-(defun magnus-review-get (id)
-  "Return the loaded review whose ID is ID."
-  (cl-find id magnus-reviews :key #'magnus-review-id :test #'string=))
+(defun magnus-review--run-changed-hooks ()
+  "Run review registry observers without turning failures into transactions."
+  (run-hook-wrapped
+   'magnus-reviews-changed-hook
+   (lambda (function)
+     (condition-case err
+         (funcall function)
+       (error
+        (message "Magnus: review observer %S failed: %s"
+                 function (error-message-string err))))
+     nil)))
 
-(defun magnus-review-latest-round (review)
-  "Return REVIEW's latest round, or nil."
-  (car (last (magnus-review-rounds review))))
-
-(defun magnus-review-current-checkpoint-request (review)
-  "Return REVIEW's latest checkpoint request, resolved or pending."
-  (car (last (magnus-review-checkpoint-requests review))))
-
-(defun magnus-review-pending-checkpoint-request (review)
-  "Return REVIEW's structurally pending checkpoint request, or nil.
-This is deliberately a pure lookup: callers must never mutate durable state
-while asking whether a request is pending."
-  (let ((request (magnus-review-current-checkpoint-request review)))
-    (and request
-         (null (magnus-review-checkpoint-request-events request))
-         request)))
-
-(defun magnus-review-checkpoint-request-for-token (review token)
-  "Return REVIEW's checkpoint request identified by TOKEN, or nil."
-  (and (stringp token)
-       (cl-find token (magnus-review-checkpoint-requests review)
-                :key #'magnus-review-checkpoint-request-token
-                :test #'string=)))
-
-(defun magnus-review--checkpoint-event-round (review event)
-  "Return the immutable REVIEW round linked by checkpoint EVENT."
-  (when-let ((number (magnus-review-checkpoint-event-round-number event)))
-    (nth (1- number) (magnus-review-rounds review))))
-
-(defun magnus-review-latest-attempt (round)
-  "Return ROUND's latest attempt, or nil."
-  (car (last (magnus-review-round-attempts round))))
-
-(defun magnus-review-round-execution (round)
-  "Return ROUND's execution state derived from its attempt history."
-  (if-let ((attempt (magnus-review-latest-attempt round)))
-      (magnus-review-attempt-execution attempt)
-    'queued))
-
-(defun magnus-review-execution (review)
-  "Return REVIEW's execution state derived from canonical history."
-  (let ((latest (magnus-review-latest-round review)))
-    (cond ((magnus-review-pending-checkpoint-request review)
-           'waiting-for-checkpoint)
-          (latest (magnus-review-round-execution latest))
-          (t 'waiting-for-checkpoint))))
-
-(defun magnus-review--completed-state (review accessor pending failed complete)
-  "Aggregate ACCESSOR over REVIEW's completed rounds.
-PENDING and FAILED take precedence; COMPLETE is returned when every completed
-round has that state.  Return `not-ready' when no completed round exists."
-  (let ((states
-         (mapcar accessor
-                 (cl-remove-if-not
-                  (lambda (round)
-                    (eq (magnus-review-round-execution round) 'complete))
-                  (magnus-review-rounds review)))))
-    (cond ((memq pending states) pending)
-          ((and failed (memq failed states)) failed)
-          ((and states (cl-every (lambda (state) (eq state complete)) states))
-           complete)
-          (t 'not-ready))))
-
-(defun magnus-review-delivery-state (review)
-  "Return REVIEW's aggregate delivery state without hiding older rounds."
-  (magnus-review--completed-state
-   review #'magnus-review-round-delivery-state 'pending 'failed 'sent))
-
-(defun magnus-review-read-state (review)
-  "Return REVIEW's aggregate read state without hiding older rounds."
-  (magnus-review--completed-state
-   review #'magnus-review-round-read-state 'unread nil 'read))
-
-(defun magnus-review-checkpoint-token (review)
-  "Return REVIEW's latest durable checkpoint token, or nil."
-  (when-let ((request (magnus-review-current-checkpoint-request review)))
-    (magnus-review-checkpoint-request-token request)))
-
-(defun magnus-review--latest-round-value (review accessor)
-  "Return ACCESSOR's value for REVIEW's latest round, or nil."
-  (when-let ((round (magnus-review-latest-round review)))
-    (funcall accessor round)))
-
-(defun magnus-review-base-oid (review)
-  "Return REVIEW's immutable base OID, or nil before its first round."
-  (magnus-review--latest-round-value review #'magnus-review-round-base-oid))
-
-(defun magnus-review-head-oid (review)
-  "Return REVIEW's latest reviewed head OID, or nil."
-  (magnus-review--latest-round-value review #'magnus-review-round-head-oid))
-
-(defun magnus-review--append-checkpoint-request (review &optional token requested-at)
-  "Append and return a fresh pending checkpoint request for REVIEW."
-  (when (magnus-review-pending-checkpoint-request review)
-    (magnus-review--signal "Review already has a pending checkpoint request"))
-  (let ((request
-         (magnus-review-checkpoint-request--create
-          :number (1+ (length (magnus-review-checkpoint-requests review)))
-          :token (or token (magnus-review--random-token))
-          :requested-at (or requested-at (float-time))
-          :events nil)))
-    (setf (magnus-review-checkpoint-requests review)
-          (append (magnus-review-checkpoint-requests review) (list request)))
-    request))
-
-(defun magnus-review--random-token ()
-  "Return a locally unique opaque token."
+(defun magnus-review--random-id-source ()
+  "Return locally unique random material for a review identifier."
   (secure-hash
    'sha256
    (format "%s:%s:%s:%s:%s"
-           (float-time) (emacs-pid) (user-uid) (random most-positive-fixnum)
-           (current-time-string))))
+           (float-time) (emacs-pid) (user-uid)
+           (random most-positive-fixnum) (current-time-string))))
 
 (defun magnus-review--generate-id (project-hash)
-  "Generate an unused durable review ID below PROJECT-HASH."
+  "Generate an unused review ID below PROJECT-HASH."
   (let (candidate)
     (while
         (progn
-          (setq candidate (substring (magnus-review--random-token) 0 32))
+          (setq candidate (substring (magnus-review--random-id-source) 0 32))
           (or (magnus-review-get candidate)
               (file-exists-p
                (magnus-review--child-path
@@ -918,416 +899,240 @@ round has that state.  Return `not-ready' when no completed round exists."
                 candidate)))))
     candidate))
 
+(defun magnus-review--optional-symbol-value (value kind)
+  "Return VALUE as a bounded optional symbol, naming it KIND."
+  (cond
+   ((null value) nil)
+   ((symbolp value) value)
+   ((and (stringp value)
+         (<= 1 (length value) 100)
+         (string-match-p "\\`[[:alnum:]_.-]+\\'" value))
+    (intern value))
+   (t (magnus-review--signal "Invalid %s: %S" kind value))))
+
 (cl-defun magnus-review-create
     (project-root author-instance-id author-name
-                  &key id task reviewer-name reviewer-provider model effort metadata)
-  "Create and persist a review request for AUTHOR-NAME in PROJECT-ROOT.
-The initial request waits for an exact committed checkpoint."
+                  &key id task reviewer-name reviewer-provider model effort
+                  metadata)
+  "Register an unsaved review draft for AUTHOR-NAME in PROJECT-ROOT.
+The draft becomes durable only when `magnus-review-complete-round' publishes a
+successful first round."
   (let* ((project-root (magnus-review-git-root project-root))
          (project-hash (magnus-review-compute-project-hash project-root))
          (id (or id (magnus-review--generate-id project-hash)))
          (now (float-time)))
     (unless (magnus-review--valid-id-p id)
       (magnus-review--signal "Invalid review ID: %S" id))
-    (when (magnus-review-get id)
-      (magnus-review--signal "Review ID is already loaded: %s" id))
-    (let* ((checkpoint-token (magnus-review--random-token))
-           (review
-            (magnus-review--create
+    (when (or (magnus-review-get id)
+              (file-exists-p
+               (magnus-review--child-path
+                (magnus-review--child-path
+                 magnus-review-directory-root project-hash)
+                id)))
+      (magnus-review--signal "Review ID is already in use: %s" id))
+    (unless (and (stringp author-instance-id)
+                 (not (string-empty-p author-instance-id))
+                 (stringp author-name)
+                 (not (string-empty-p author-name)))
+      (magnus-review--signal "Review author identity is incomplete"))
+    (unless (and (stringp reviewer-name)
+                 (not (string-empty-p reviewer-name)))
+      (magnus-review--signal "Review reviewer identity is incomplete"))
+    (let ((review
+           (magnus-review--create
             :id id
             :project-root project-root
             :project-hash project-hash
             :author-instance-id author-instance-id
             :author-name author-name
             :reviewer-name reviewer-name
-            :reviewer-provider reviewer-provider
+            :reviewer-provider
+            (magnus-review--optional-symbol-value reviewer-provider "provider")
             :model model
-            :effort effort
+            :effort (magnus-review--optional-symbol-value effort "effort")
             :task task
+            :session-id nil
+            :metadata metadata
             :lifecycle 'open
             :created-at now
             :updated-at now
-            :rounds nil
-            :metadata metadata
-            :checkpoint-requests
-            (list
-             (magnus-review-checkpoint-request--create
-              :number 1 :token checkpoint-token
-              :requested-at now :events nil)))))
-      (magnus-review-save review)
+            :rounds nil)))
+      (push review magnus-reviews)
+      (magnus-review--run-changed-hooks)
       review)))
 
-(defun magnus-review-await-checkpoint (review)
-  "Put open REVIEW into checkpoint-waiting state with a fresh token."
-  (unless (eq (magnus-review-lifecycle review) 'open)
-    (magnus-review--signal "Closed review cannot await a checkpoint: %s"
-                           (magnus-review-id review)))
-  (when (memq (magnus-review-execution review) '(starting running))
-    (magnus-review--signal "Review already has a running attempt: %s"
-                           (magnus-review-id review)))
-  (if-let ((pending (magnus-review-pending-checkpoint-request review)))
-      ;; Re-requesting while already pending is an idempotent recovery action;
-      ;; never rotate away the token an author may still be holding.
-      (magnus-review-checkpoint-request-token pending)
-    (when-let ((latest (magnus-review-latest-round review)))
-      (unless (eq (magnus-review-round-execution latest) 'complete)
-        (magnus-review--signal
-         "Retry or finish the current round before requesting re-review")))
-    (let ((request (magnus-review--append-checkpoint-request review)))
-      (setf (magnus-review-updated-at review) (float-time))
-      (magnus-review-save review)
-      (magnus-review-checkpoint-request-token request))))
-
-(defun magnus-review--acknowledge-unchanged-checkpoint
-    (review checkpoint-token base head)
-  "Durably finish REVIEW's request that remained at exact BASE and HEAD.
-CHECKPOINT-TOKEN identifies the request whose author reported no new committed
-evidence.  The latest completed round and its verdict remain authoritative;
-a later re-review must allocate a fresh checkpoint token."
-  (let* ((latest (magnus-review-latest-round review))
-         (request
-          (magnus-review-checkpoint-request-for-token review checkpoint-token))
-         (pending (magnus-review-pending-checkpoint-request review))
-         (ack-event
-          (and request
-               (cl-find
-                'unchanged
-                (magnus-review-checkpoint-request-events request)
-                :key #'magnus-review-checkpoint-event-kind)))
-         (acknowledged
-          (and ack-event
-               (magnus-review--checkpoint-event-round review ack-event))))
-    (unless (and latest
-                 (eq (magnus-review-lifecycle review) 'open)
-                 (eq (magnus-review-round-execution latest) 'complete)
-                 (string= base (magnus-review-round-base-oid latest))
-                 (string= head (magnus-review-round-head-oid latest))
-                 (or (eq request pending)
-                     (eq acknowledged latest)))
-      (magnus-review--signal
-       "Unchanged checkpoint does not match the latest completed round"))
-    (let ((changed (null acknowledged)))
-      (unless acknowledged
-        (setf (magnus-review-checkpoint-request-events request)
-              (list
-               (magnus-review-checkpoint-event--create
-                :kind 'unchanged
-                :round-number (magnus-review-round-number latest)
-                :recorded-at (float-time)))))
-      (when changed
-        (setf (magnus-review-updated-at review) (float-time))
-        (magnus-review-save review)
-        (message
-         "Magnus: %s reported no new committed changes; round %d remains %s"
-         (magnus-review-author-name review)
-         (magnus-review-round-number latest)
-         (magnus-review-round-verdict latest)))
-      latest)))
-
-(cl-defun magnus-review-append-round
-    (review base-revision head-revision &key checkpoint-token metadata)
-  "Append an exact immutable Git round to REVIEW.
-BASE-REVISION must remain fixed across rounds and be an ancestor of
-HEAD-REVISION.  Older rounds and attempts are never removed or rewritten."
-  (unless (eq (magnus-review-lifecycle review) 'open)
-    (magnus-review--signal "Cannot append to non-open review: %s"
-                           (magnus-review-id review)))
-  (when (and checkpoint-token
-             (not (magnus-review--valid-token-p checkpoint-token)))
-    (magnus-review--signal "Invalid checkpoint token"))
-  (let* ((pending (magnus-review-pending-checkpoint-request review))
-         (checkpoint-token
-          (or checkpoint-token
-              (and pending
-                   (magnus-review-checkpoint-request-token pending)))))
-    (unless (and pending checkpoint-token
-                 (string= checkpoint-token
-                          (magnus-review-checkpoint-request-token pending)))
-      (magnus-review--signal "Review is not waiting for a checkpoint: %s"
-                             (magnus-review-id review)))
-    (let* ((scope (magnus-review-inspect-scope
-                   (magnus-review-project-root review)
-                   base-revision head-revision))
-           (base (plist-get scope :base-oid))
-           (head (plist-get scope :head-oid))
-           (latest (magnus-review-latest-round review))
-           (expected-base (magnus-review-base-oid review))
-           (scope-summary
-            (list :commit-count (plist-get scope :commit-count)
-                  :changed-file-count (plist-get scope :changed-file-count)
-                  :shortstat (plist-get scope :shortstat)
-                  :dirty-p (plist-get scope :dirty-p)
-                  :dirty-warning (plist-get scope :dirty-warning))))
-      (when (and (null latest) (string= base head))
-        (magnus-review--signal "Refusing an empty review scope at %s" head))
-      (when (and (null latest)
-                 (zerop (plist-get scope :changed-file-count)))
-        (magnus-review--signal "Review scope contains no changed files"))
-      (when (and latest
-                 (not (eq (magnus-review-round-execution latest) 'complete)))
-        (magnus-review--signal "Previous review round is not complete"))
-      (when (and expected-base (not (string= expected-base base)))
-        (magnus-review--signal
-         "Review base is immutable (%s, not %s)" expected-base base))
-      (when (and latest (string= (magnus-review-round-head-oid latest) head))
-        (magnus-review--signal "Head %s is already the latest review round" head))
-      (let* ((number (1+ (length (magnus-review-rounds review))))
-             (now (float-time))
-             (round
-              (magnus-review-round--create
-               :number number
-               :base-oid base
-               :head-oid head
-               :created-at now
-               :delivery-state 'not-ready
-               :read-state 'not-ready
-               :attempts nil
-               :metadata `((scope . ,scope-summary)
-                           (caller . ,metadata)))))
-        (magnus-review-capture-round-evidence review round)
-        (setf (magnus-review-rounds review)
-              (append (magnus-review-rounds review) (list round))
-              (magnus-review-checkpoint-request-events pending)
-              (list
-               (magnus-review-checkpoint-event--create
-                :kind 'round :round-number number :recorded-at now))
-              (magnus-review-updated-at review) now)
-        (magnus-review-save review)
-        round))))
-
-(cl-defun magnus-review-append-attempt (review round &key token)
-  "Append and persist a new starting provider attempt to ROUND of REVIEW."
-  (unless (eq (magnus-review-lifecycle review) 'open)
-    (magnus-review--signal "Cannot launch an attempt for a non-open review"))
-  (unless (eq round (magnus-review-latest-round review))
-    (magnus-review--signal "Attempts may only be appended to the latest round"))
-  (unless (memq (magnus-review-round-execution round)
-                '(queued failed interrupted))
+(cl-defun magnus-review-prepare-round
+    (review base-oid head-oid &key metadata)
+  "Prepare and return an unpersisted candidate for REVIEW at BASE-OID..HEAD-OID.
+Both arguments must be full commit IDs supplied by the author agent.  Git
+validates the claim; Magnus requires a clean source worktree, captures immutable
+evidence, and creates an isolated detached checkout.  The lineage is unchanged
+until `magnus-review-complete-round' succeeds."
+  (unless (and (magnus-review-p review)
+               (eq (magnus-review-lifecycle review) 'open))
+    (magnus-review--signal "Cannot prepare a round for a closed review"))
+  (unless (and (magnus-review--valid-oid-p base-oid)
+               (magnus-review--valid-oid-p head-oid))
     (magnus-review--signal
-     "Attempts cannot be appended to a round in %s state"
-     (magnus-review-round-execution round)))
-  (when (and token (not (magnus-review--valid-token-p token)))
-    (magnus-review--signal "Invalid review attempt token"))
-  (when-let ((latest (magnus-review-latest-attempt round)))
-    (unless (memq (magnus-review-attempt-execution latest)
-                  magnus-review--terminal-attempt-states)
-      (magnus-review--signal "Latest attempt is still active")))
-  (let* ((number (1+ (length (magnus-review-round-attempts round))))
-         (now (float-time))
-         (attempt
-          (magnus-review-attempt--create
-           :number number
-           :token (or token (magnus-review--random-token))
-           :started-at now
-           :execution 'starting)))
-    (setf (magnus-review-round-attempts round)
-          (append (magnus-review-round-attempts round) (list attempt))
-          (magnus-review-updated-at review) now)
-    (magnus-review--ensure-review-directories review round)
-    (magnus-review-save review)
-    attempt))
+     "Review scope requires exact full base and head commit IDs"))
+  (let* ((base-oid (downcase base-oid))
+         (head-oid (downcase head-oid))
+         (scope (magnus-review-inspect-scope
+                 (magnus-review-project-root review) base-oid head-oid))
+         (base (plist-get scope :base-oid))
+         (head (plist-get scope :head-oid))
+         (latest (magnus-review-latest-round review)))
+    (unless (and (string= base base-oid) (string= head head-oid))
+      (magnus-review--signal "Review scope must use exact commit object IDs"))
+    (when (plist-get scope :dirty-p)
+      (magnus-review--signal "%s" magnus-review-uncommitted-message))
+    (when (or (string= base head)
+              (zerop (plist-get scope :changed-file-count)))
+      (magnus-review--signal "Review scope contains no committed changes"))
+    (when (and latest
+               (string= base (magnus-review-round-base-oid latest))
+               (string= head (magnus-review-round-head-oid latest)))
+      (magnus-review--signal
+       "Scope %s..%s is already the latest review round" base head))
+    (let* ((summary
+            `((commit_count . ,(plist-get scope :commit-count))
+              (changed_file_count . ,(plist-get scope :changed-file-count))
+              (shortstat . ,(plist-get scope :shortstat))))
+           (round
+            (magnus-review-round--create
+             :number (1+ (length (magnus-review-rounds review)))
+             :base-oid base
+             :head-oid head
+             :created-at (float-time)
+             :completed-at nil
+             :verdict nil
+             :read-state nil
+             :metadata `((scope . ,summary) (request . ,metadata)))))
+      (condition-case original-error
+          (progn
+            (magnus-review-capture-round-evidence review round)
+            (magnus-review-ensure-checkout review head round)
+            round)
+        (error
+         ;; Preparation is not durable.  Remove each safely removable half of
+         ;; the candidate independently, but never replace the useful original
+         ;; failure with a cleanup failure.
+         (dolist (remover '(magnus-review--remove-round-checkout
+                            magnus-review--remove-candidate-round-directory))
+           (condition-case cleanup-error
+               (funcall remover review round)
+             (error
+              (message "Magnus: candidate cleanup after preparation failure: %s"
+                       (error-message-string cleanup-error)))))
+         (signal (car original-error) (cdr original-error)))))))
 
-(defun magnus-review--verify-current-attempt
-    (review round attempt &optional token allowed-states)
-  "Verify current REVIEW ROUND ATTEMPT identity and optional TOKEN.
-When ALLOWED-STATES is non-nil, ATTEMPT must be in one of them."
-  (unless (and (eq round (magnus-review-latest-round review))
-               (eq attempt (magnus-review-latest-attempt round)))
-    (magnus-review--signal "Review callback belongs to an obsolete attempt"))
-  (when (and token
-             (not (and (magnus-review--valid-token-p token)
-                       (string= token (magnus-review-attempt-token attempt)))))
-    (magnus-review--signal "Review callback attempt token does not match"))
-  (when (and allowed-states
-             (not (memq (magnus-review-attempt-execution attempt)
-                        allowed-states)))
-    (magnus-review--signal "Attempt is in unexpected %s state"
-                           (magnus-review-attempt-execution attempt)))
-  attempt)
+(defun magnus-review--safe-regular-file-p (path)
+  "Return non-nil when PATH is a regular, non-symlink file."
+  (and (file-regular-p path) (not (file-symlink-p path))))
 
-(defun magnus-review-mark-attempt-running (review round attempt &optional token)
-  "Mark the latest starting ATTEMPT in ROUND of REVIEW as running."
-  (unless (eq (magnus-review-lifecycle review) 'open)
-    (magnus-review--signal "Cannot run an attempt for a non-open review"))
-  (magnus-review--verify-current-attempt
-   review round attempt token '(starting))
-  (setf (magnus-review-attempt-execution attempt) 'running
-        (magnus-review-updated-at review) (float-time))
-  (magnus-review-save review)
-  attempt)
-
-(defun magnus-review--finish-attempt
-    (review round attempt state
-            &optional error defer-save token interruption-kind)
-  "Finish ATTEMPT in ROUND of REVIEW with STATE and optional ERROR.
-When DEFER-SAVE is non-nil, the caller must finish one larger atomic state
-transition and call `magnus-review-save'."
-  (unless (memq state magnus-review--terminal-attempt-states)
-    (magnus-review--signal "Not a terminal attempt state: %S" state))
-  (magnus-review--verify-current-attempt
-   review round attempt token '(starting running))
-  (unless (or (null interruption-kind)
-              (and (eq state 'interrupted)
-                   (memq interruption-kind
-                         magnus-review--interruption-kinds)))
-    (magnus-review--signal "Invalid review interruption kind: %S"
-                           interruption-kind))
-  (let ((now (float-time)))
-    (setf (magnus-review-attempt-execution attempt) state
-          (magnus-review-attempt-finished-at attempt) now
-          (magnus-review-attempt-error attempt)
-          (magnus-review--error-string error)
-          (magnus-review-attempt-interruption-kind attempt) interruption-kind
-          (magnus-review-updated-at review) now)
-    (unless (eq state 'complete)
-      ;; A failed retry does not erase the last valid verdict/report.
-      (setf (magnus-review-round-completed-at round) nil))
-    (unless defer-save
-      (magnus-review-save review))
-    attempt))
-
-(defun magnus-review--completion-artifacts-ready-p (review round)
-  "Return non-nil when ROUND's canonical result and report are private files."
-  (let ((result (magnus-review-round-result-path review round))
-        (report (magnus-review-round-report-path review round)))
-    (and (file-regular-p result) (not (file-symlink-p result))
-         (file-regular-p report) (not (file-symlink-p report)))))
-
-(defun magnus-review--publish-completed-attempt
-    (review round attempt verdict allowed-states &optional token)
-  "Atomically publish ATTEMPT with VERDICT from ALLOWED-STATES."
+(cl-defun magnus-review-complete-round
+    (review round verdict &key session-id metadata)
+  "Publish successful candidate ROUND with VERDICT into REVIEW.
+SESSION-ID, when non-nil, becomes the lineage's last successful provider
+session.  This single transition is the only way a prepared round becomes
+durable.  METADATA replaces the candidate metadata when supplied."
+  (unless (and (magnus-review-p review)
+               (eq (magnus-review-lifecycle review) 'open))
+    (magnus-review--signal "Cannot complete a round for a closed review"))
+  (unless (magnus-review-round-p round)
+    (magnus-review--signal "Not a Magnus review round: %S" round))
   (unless (memq verdict magnus-review--verdict-states)
     (magnus-review--signal "Invalid review verdict: %S" verdict))
-  (unless (eq (magnus-review-lifecycle review) 'open)
-    (magnus-review--signal "Cannot publish a non-open review"))
-  (magnus-review--verify-current-attempt
-   review round attempt token allowed-states)
-  (unless (magnus-review--completion-artifacts-ready-p review round)
-    (magnus-review--signal
-     "Canonical result and report must be durable before completion"))
-  (let ((now (float-time)))
-    (dolist (artifact (list (magnus-review-round-result-path review round)
-                            (magnus-review-round-report-path review round)))
-      (set-file-modes artifact #o600))
-    ;; This is intentionally one manifest replacement: no terminal state is
-    ;; observable before verdict/delivery/read publication is also durable.
-    (setf (magnus-review-attempt-execution attempt) 'complete
-          (magnus-review-attempt-finished-at attempt)
-          (or (magnus-review-attempt-finished-at attempt) now)
-          (magnus-review-attempt-error attempt) nil
-          (magnus-review-attempt-interruption-kind attempt) nil
-          (magnus-review-round-verdict round) verdict
-          (magnus-review-round-completed-at round) now
-          (magnus-review-round-delivery-state round) 'pending
-          (magnus-review-round-delivery-error round) nil
-          (magnus-review-round-read-state round) 'unread
-          (magnus-review-updated-at review) now)
-    (magnus-review-save review)
+  (unless (= (magnus-review-round-number round)
+             (1+ (length (magnus-review-rounds review))))
+    (magnus-review--signal "Review candidate is obsolete"))
+  (when (or (magnus-review-round-completed-at round)
+            (magnus-review-round-verdict round)
+            (magnus-review-round-read-state round)
+            (memq round (magnus-review-rounds review)))
+    (magnus-review--signal "Review candidate is already published"))
+  (when-let ((latest (magnus-review-latest-round review)))
+    (when (and (string= (magnus-review-round-base-oid latest)
+                        (magnus-review-round-base-oid round))
+               (string= (magnus-review-round-head-oid latest)
+                        (magnus-review-round-head-oid round)))
+      (magnus-review--signal "Review candidate duplicates the latest round")))
+  (dolist (path (list (magnus-review-round-patch-path review round)
+                      (magnus-review-round-name-status-path review round)
+                      (magnus-review-round-result-path review round)
+                      (magnus-review-round-report-path review round)))
+    (unless (magnus-review--safe-regular-file-p path)
+      (magnus-review--signal
+       "Successful review artifact is missing or unsafe: %s" path))
+    (set-file-modes path #o600))
+  (when (and session-id
+             (not (and (stringp session-id)
+                       (not (string-empty-p session-id)))))
+    (magnus-review--signal "Provider returned an invalid session ID"))
+  (let ((now (float-time))
+        (old-rounds (magnus-review-rounds review))
+        (old-updated-at (magnus-review-updated-at review))
+        (old-session-id (magnus-review-session-id review))
+        (old-completed-at (magnus-review-round-completed-at round))
+        (old-verdict (magnus-review-round-verdict round))
+        (old-read-state (magnus-review-round-read-state round))
+        (old-metadata (magnus-review-round-metadata round)))
+    (condition-case err
+        (progn
+          (when metadata
+            (setf (magnus-review-round-metadata round) metadata))
+          (setf (magnus-review-round-completed-at round) now
+                (magnus-review-round-verdict round) verdict
+                (magnus-review-round-read-state round) 'unread
+                (magnus-review-rounds review) (append old-rounds (list round))
+                (magnus-review-updated-at review) now)
+          (when session-id
+            (setf (magnus-review-session-id review) session-id))
+          (magnus-review-save review))
+      (error
+       ;; Publication has one local rollback boundary.  An I/O failure restores
+       ;; the in-memory lineage and leaves the exact candidate retryable.
+       (setf (magnus-review-rounds review) old-rounds
+             (magnus-review-updated-at review) old-updated-at
+             (magnus-review-session-id review) old-session-id
+             (magnus-review-round-completed-at round) old-completed-at
+             (magnus-review-round-verdict round) old-verdict
+             (magnus-review-round-read-state round) old-read-state
+             (magnus-review-round-metadata round) old-metadata)
+       (signal (car err) (cdr err))))
     round))
 
-(defun magnus-review-complete-attempt
-    (review round attempt verdict &optional token)
-  "Complete active ATTEMPT and publish VERDICT for ROUND of REVIEW."
-  (magnus-review--publish-completed-attempt
-   review round attempt verdict '(starting running) token))
-
-(defun magnus-review-adopt-completed-attempt
-    (review round attempt verdict attempt-token)
-  "Publish recovered ATTEMPT whose validated artifacts survived interruption.
-ATTEMPT-TOKEN is mandatory because this transition is normally initiated by
-startup reconciliation rather than the original process callback."
-  (unless (magnus-review--valid-token-p attempt-token)
-    (magnus-review--signal "A valid attempt token is required for adoption"))
-  (magnus-review--publish-completed-attempt
-   review round attempt verdict '(failed interrupted) attempt-token))
-
-(defun magnus-review-fail-attempt (review round attempt error &optional token)
-  "Mark ATTEMPT in ROUND of REVIEW failed with ERROR."
-  (magnus-review--finish-attempt review round attempt 'failed error nil token))
-
-(defun magnus-review-interrupt-attempt
-    (review round attempt &optional reason token interruption-kind)
-  "Mark ATTEMPT in ROUND of REVIEW interrupted.
-REASON is a durable diagnostic.  INTERRUPTION-KIND may be `manual',
-`shutdown', or `crash'; a manual interruption is never auto-retried."
-  (magnus-review--finish-attempt
-   review round attempt 'interrupted
-   (or reason "Review attempt was interrupted") nil token interruption-kind))
-
-(defun magnus-review-record-session-id
-    (review round attempt attempt-token session-id)
-  "Persist SESSION-ID for the current token-guarded provider ATTEMPT."
-  (unless (and (stringp session-id) (not (string-empty-p session-id)))
-    (magnus-review--signal "Provider returned an invalid session ID"))
-  (magnus-review--verify-current-attempt
-   review round attempt attempt-token '(starting running))
-  (when (and (magnus-review-session-id review)
-             (not (string= (magnus-review-session-id review) session-id)))
-    (magnus-review--signal "Provider changed review session identity"))
-  (setf (magnus-review-session-id review) session-id
-        (magnus-review-updated-at review) (float-time))
-  (magnus-review-save review)
-  session-id)
-
-(defun magnus-review-mark-delivered (review &optional round)
-  "Mark latest or supplied ROUND of REVIEW delivered to its author."
+(defun magnus-review-mark-read (review &optional round)
+  "Mark latest or supplied completed ROUND of REVIEW read."
   (setq round (or round (magnus-review-latest-round review)))
-  (unless (and round (eq (magnus-review-round-execution round) 'complete))
-    (magnus-review--signal "Only a completed review round can be delivered"))
-  (unless (eq (magnus-review-round-delivery-state round) 'sent)
-    (let ((now (float-time)))
-      (setf (magnus-review-round-delivery-state round) 'sent
-            (magnus-review-round-delivery-attempts round)
-            (1+ (magnus-review-round-delivery-attempts round))
-            (magnus-review-round-delivery-error round) nil
-            (magnus-review-round-delivered-at round) now
-            (magnus-review-updated-at review) now))
-    (magnus-review-save review))
-  round)
-
-(defun magnus-review-mark-delivery-failed (review error &optional round)
-  "Record a failed author delivery for REVIEW ROUND with ERROR."
-  (setq round (or round (magnus-review-latest-round review)))
-  (unless (and round (eq (magnus-review-round-execution round) 'complete))
-    (magnus-review--signal "Only a completed review round can be delivered"))
-  (unless (eq (magnus-review-round-delivery-state round) 'sent)
-    (setf (magnus-review-round-delivery-state round) 'failed
-          (magnus-review-round-delivery-attempts round)
-          (1+ (magnus-review-round-delivery-attempts round))
-          (magnus-review-round-delivery-error round)
-          (magnus-review--error-string error)
+  (unless (and round (memq round (magnus-review-rounds review)))
+    (magnus-review--signal "Only a completed review round can be read"))
+  (unless (eq (magnus-review-round-read-state round) 'read)
+    (setf (magnus-review-round-read-state round) 'read
           (magnus-review-updated-at review) (float-time))
     (magnus-review-save review))
   round)
 
-(defun magnus-review-mark-read (review &optional round)
-  "Mark latest or supplied completed ROUND of REVIEW read by the user."
-  (setq round (or round (magnus-review-latest-round review)))
-  (unless (and round (eq (magnus-review-round-execution round) 'complete))
-    (magnus-review--signal "Only a completed review round can be read"))
-  (unless (eq (magnus-review-round-read-state round) 'read)
-    (let ((now (float-time)))
-      (setf (magnus-review-round-read-state round) 'read
-            (magnus-review-round-read-at round) now
-            (magnus-review-updated-at review) now))
-    (magnus-review-save review))
-  round)
-
 (defun magnus-review-archive (review)
-  "Archive REVIEW without deleting its durable reports."
-  (when (memq (magnus-review-execution review) '(starting running))
-    (magnus-review--signal "Cannot archive a running review"))
+  "Archive REVIEW without deleting its completed reports."
+  (let ((state (and (functionp magnus-review-runtime-state-function)
+                    (funcall magnus-review-runtime-state-function review))))
+    (when (memq state '(asking-scope queued running))
+      (magnus-review--signal "Cannot archive a running review")))
   (let ((now (float-time)))
     (setf (magnus-review-lifecycle review) 'archived
           (magnus-review-archived-at review) now
           (magnus-review-updated-at review) now)
-    (magnus-review-save review)
-    (when (fboundp 'magnus-coord--maybe-stop-watching)
-      (magnus-coord--maybe-stop-watching
-       (magnus-review-project-root review)))
+    ;; A failed first run has no report to archive.  Removing that unsaved
+    ;; draft avoids an archived status row which cannot be opened or resumed.
+    (if (null (magnus-review-rounds review))
+        (progn
+          (setq magnus-reviews (delq review magnus-reviews))
+          (magnus-review--run-changed-hooks))
+      (magnus-review-save review))
     review))
 
-;;; JSON persistence
+;;; Strict completed-lineage persistence
 
 (defun magnus-review--symbol-name (value)
   "Return VALUE's symbol name, preserve strings, or nil."
@@ -1336,9 +1141,7 @@ REASON is a durable diagnostic.  INTERRUPTION-KIND may be `manual',
         (t nil)))
 
 (defun magnus-review--json-safe-value (value)
-  "Return a recursively JSON-serializable representation of VALUE.
-Metadata may use plists, alists, vectors, or ordinary lists.  Ordinary lists
-become arrays, while object keys remain strings, symbols, or keywords."
+  "Return a recursively JSON-serializable representation of VALUE."
   (cond
    ((or (null value) (stringp value) (numberp value)
         (eq value t) (eq value :json-false))
@@ -1355,8 +1158,7 @@ become arrays, while object keys remain strings, symbols, or keywords."
        value)
       entries))
    ((and (consp value) (keywordp (car value)))
-    (let ((remaining value)
-          result)
+    (let ((remaining value) result)
       (while remaining
         (let ((key (pop remaining)))
           (unless (and (keywordp key) remaining)
@@ -1379,38 +1181,8 @@ become arrays, while object keys remain strings, symbols, or keywords."
    ((symbolp value) (symbol-name value))
    (t (magnus-review--signal "Metadata value is not JSON-safe: %S" value))))
 
-(defun magnus-review--attempt-to-json (attempt)
-  "Return JSON-ready alist for ATTEMPT."
-  `((number . ,(magnus-review-attempt-number attempt))
-    (token . ,(magnus-review-attempt-token attempt))
-    (started_at . ,(magnus-review-attempt-started-at attempt))
-    (finished_at . ,(magnus-review-attempt-finished-at attempt))
-    (execution . ,(magnus-review--symbol-name
-                   (magnus-review-attempt-execution attempt)))
-    (error . ,(magnus-review--error-string
-               (magnus-review-attempt-error attempt)))
-    (interruption_kind . ,(magnus-review--symbol-name
-                           (magnus-review-attempt-interruption-kind attempt)))))
-
-(defun magnus-review--checkpoint-event-to-json (event)
-  "Return JSON-ready alist for checkpoint EVENT."
-  `((kind . ,(magnus-review--symbol-name
-              (magnus-review-checkpoint-event-kind event)))
-    (round_number . ,(magnus-review-checkpoint-event-round-number event))
-    (recorded_at . ,(magnus-review-checkpoint-event-recorded-at event))))
-
-(defun magnus-review--checkpoint-request-to-json (request)
-  "Return JSON-ready alist for checkpoint REQUEST."
-  `((number . ,(magnus-review-checkpoint-request-number request))
-    (token . ,(magnus-review-checkpoint-request-token request))
-    (requested_at . ,(magnus-review-checkpoint-request-requested-at request))
-    (events
-     . ,(vconcat
-         (mapcar #'magnus-review--checkpoint-event-to-json
-                 (magnus-review-checkpoint-request-events request))))))
-
 (defun magnus-review--round-to-json (round)
-  "Return JSON-ready alist for ROUND."
+  "Return strict JSON-ready data for completed ROUND."
   `((number . ,(magnus-review-round-number round))
     (base_oid . ,(magnus-review-round-base-oid round))
     (head_oid . ,(magnus-review-round-head-oid round))
@@ -1418,23 +1190,13 @@ become arrays, while object keys remain strings, symbols, or keywords."
     (completed_at . ,(magnus-review-round-completed-at round))
     (verdict . ,(magnus-review--symbol-name
                  (magnus-review-round-verdict round)))
-    (delivery_state . ,(magnus-review--symbol-name
-                        (magnus-review-round-delivery-state round)))
-    (delivery_attempts . ,(magnus-review-round-delivery-attempts round))
-    (delivery_error . ,(magnus-review--error-string
-                        (magnus-review-round-delivery-error round)))
-    (delivered_at . ,(magnus-review-round-delivered-at round))
     (read_state . ,(magnus-review--symbol-name
                     (magnus-review-round-read-state round)))
-    (read_at . ,(magnus-review-round-read-at round))
-    (attempts . ,(vconcat
-                  (mapcar #'magnus-review--attempt-to-json
-                          (magnus-review-round-attempts round))))
     (metadata . ,(magnus-review--json-safe-value
                   (magnus-review-round-metadata round)))))
 
 (defun magnus-review--to-json (review)
-  "Return JSON-ready manifest alist for REVIEW."
+  "Return strict JSON-ready completed-lineage data for REVIEW."
   `((schema_version . ,magnus-review-schema-version)
     (id . ,(magnus-review-id review))
     (project_root . ,(magnus-review-project-root review))
@@ -1444,45 +1206,45 @@ become arrays, while object keys remain strings, symbols, or keywords."
     (reviewer_name . ,(magnus-review-reviewer-name review))
     (reviewer_provider . ,(magnus-review--symbol-name
                            (magnus-review-reviewer-provider review)))
-    (model . ,(let ((model (magnus-review-model review)))
-                (if (symbolp model)
-                    (and model (symbol-name model))
-                  model)))
+    (model . ,(magnus-review--symbol-name (magnus-review-model review)))
     (effort . ,(magnus-review--symbol-name (magnus-review-effort review)))
     (task . ,(magnus-review-task review))
+    (session_id . ,(magnus-review-session-id review))
+    (metadata . ,(magnus-review--json-safe-value
+                  (magnus-review-metadata review)))
     (lifecycle . ,(magnus-review--symbol-name
                    (magnus-review-lifecycle review)))
-    (session_id . ,(magnus-review-session-id review))
-    (checkpoint_requests
-     . ,(vconcat
-         (mapcar #'magnus-review--checkpoint-request-to-json
-                 (magnus-review-checkpoint-requests review))))
     (created_at . ,(magnus-review-created-at review))
     (updated_at . ,(magnus-review-updated-at review))
     (archived_at . ,(magnus-review-archived-at review))
     (rounds . ,(vconcat
                 (mapcar #'magnus-review--round-to-json
-                        (magnus-review-rounds review))))
-    (metadata . ,(magnus-review--json-safe-value
-                  (magnus-review-metadata review)))))
+                        (magnus-review-rounds review))))))
 
-(defun magnus-review--validate-state (value states kind &optional allow-nil)
-  "Parse string VALUE as one of STATES, naming it KIND."
-  (if (and allow-nil (null value))
-      nil
-    (let ((symbol (and (stringp value) (intern-soft value))))
-      (unless (memq symbol states)
-        (magnus-review--signal "Invalid %s state in manifest: %S" kind value))
-      symbol)))
+(defun magnus-review--require-object-shape (object expected kind)
+  "Require OBJECT to contain exactly EXPECTED symbol keys, naming it KIND."
+  (unless (and (listp object)
+               (cl-every (lambda (entry)
+                           (and (consp entry) (symbolp (car entry))))
+                         object))
+    (magnus-review--signal "Invalid %s object in manifest" kind))
+  (let* ((actual (mapcar #'car object))
+         (actual-names (sort (mapcar #'symbol-name actual) #'string<))
+         (expected-names
+          (sort (mapcar #'symbol-name (copy-sequence expected)) #'string<)))
+    (unless (and (= (length actual) (length (delete-dups actual)))
+                 (equal actual-names expected-names))
+      (magnus-review--signal "Unexpected %s fields in manifest: %S"
+                             kind actual)))
+  object)
 
-(defun magnus-review--optional-symbol (value kind)
-  "Parse bounded symbol string VALUE, naming it KIND."
-  (when value
-    (unless (and (stringp value)
-                 (<= 1 (length value) 100)
-                 (string-match-p "\\`[[:alnum:]_.-]+\\'" value))
-      (magnus-review--signal "Invalid %s in manifest: %S" kind value))
-    (intern value)))
+(defun magnus-review--require-string (value kind &optional allow-nil)
+  "Return string VALUE or signal, naming it KIND.
+When ALLOW-NIL is non-nil, nil is accepted."
+  (unless (or (and (stringp value) (not (string-empty-p value)))
+              (and allow-nil (null value)))
+    (magnus-review--signal "Invalid %s in manifest: %S" kind value))
+  value)
 
 (defun magnus-review--require-number (value kind &optional allow-nil)
   "Return numeric VALUE or signal, naming it KIND."
@@ -1490,121 +1252,77 @@ become arrays, while object keys remain strings, symbols, or keywords."
     (magnus-review--signal "Invalid %s in manifest: %S" kind value))
   value)
 
-(defun magnus-review--require-oid (value kind &optional allow-nil)
-  "Return full OID VALUE or signal, naming it KIND."
-  (unless (or (magnus-review--valid-oid-p value)
-              (and allow-nil (null value)))
+(defun magnus-review--require-oid (value kind)
+  "Return lowercase full OID VALUE or signal, naming it KIND."
+  (unless (magnus-review--valid-oid-p value)
     (magnus-review--signal "Invalid %s in manifest: %S" kind value))
-  (and value (downcase value)))
+  (downcase value))
 
-(defun magnus-review--checkpoint-event-from-json (object)
-  "Deserialize one schema-2 checkpoint event OBJECT."
-  (magnus-review-checkpoint-event--create
-   :kind (magnus-review--validate-state
-          (alist-get 'kind object)
-          magnus-review--checkpoint-event-kinds "checkpoint event")
-   :round-number (let ((number (alist-get 'round_number object)))
-                   (unless (and (integerp number) (> number 0))
-                     (magnus-review--signal
-                      "Invalid checkpoint event round: %S" number))
-                   number)
-   :recorded-at (magnus-review--require-number
-                 (alist-get 'recorded_at object)
-                 "checkpoint event time" t)))
+(defun magnus-review--validate-state (value states kind)
+  "Parse string VALUE as one of STATES, naming it KIND."
+  (let ((symbol (and (stringp value) (intern-soft value))))
+    (unless (memq symbol states)
+      (magnus-review--signal "Invalid %s in manifest: %S" kind value))
+    symbol))
 
-(defun magnus-review--checkpoint-request-from-json (object expected-number)
-  "Deserialize checkpoint request OBJECT, requiring EXPECTED-NUMBER."
-  (let ((number (alist-get 'number object)))
-    (unless (eql number expected-number)
-      (magnus-review--signal
-       "Non-append-only checkpoint request sequence at %S" number))
-    (magnus-review-checkpoint-request--create
-     :number number
-     :token (alist-get 'token object)
-     :requested-at (magnus-review--require-number
-                    (alist-get 'requested_at object)
-                    "checkpoint request time" t)
-     :events
-     (mapcar #'magnus-review--checkpoint-event-from-json
-             (append (alist-get 'events object) nil)))))
-
-(defun magnus-review--attempt-from-json (object expected-number)
-  "Deserialize attempt OBJECT, requiring EXPECTED-NUMBER."
-  (let ((number (alist-get 'number object)))
-    (unless (eql number expected-number)
-      (magnus-review--signal "Non-append-only attempt sequence at %S" number))
-    (magnus-review-attempt--create
-     :number number
-     :token (alist-get 'token object)
-     :started-at (magnus-review--require-number
-                  (alist-get 'started_at object) "attempt start time")
-     :finished-at (magnus-review--require-number
-                   (alist-get 'finished_at object) "attempt finish time" t)
-     :execution (magnus-review--validate-state
-                 (alist-get 'execution object)
-                 magnus-review--attempt-execution-states
-                 "attempt execution")
-     :error (alist-get 'error object)
-     :interruption-kind
-     (magnus-review--validate-state
-      (alist-get 'interruption_kind object)
-      magnus-review--interruption-kinds "attempt interruption kind" t))))
+(defun magnus-review--optional-symbol (value kind)
+  "Parse bounded optional symbol string VALUE, naming it KIND."
+  (when value
+    (magnus-review--require-string value kind)
+    (unless (and (<= (length value) 100)
+                 (string-match-p "\\`[[:alnum:]_.-]+\\'" value))
+      (magnus-review--signal "Invalid %s in manifest: %S" kind value))
+    (intern value)))
 
 (defun magnus-review--round-from-json (object expected-number)
-  "Deserialize round OBJECT, requiring EXPECTED-NUMBER."
+  "Deserialize completed round OBJECT, requiring EXPECTED-NUMBER."
+  (magnus-review--require-object-shape
+   object
+   '(number base_oid head_oid created_at completed_at verdict read_state
+            metadata)
+   "round")
   (let ((number (alist-get 'number object)))
     (unless (eql number expected-number)
-      (magnus-review--signal "Non-append-only round sequence at %S" number))
-    (let ((attempt-number 0))
-      (magnus-review-round--create
-       :number number
-       :base-oid (magnus-review--require-oid
-                  (alist-get 'base_oid object) "round base OID")
-       :head-oid (magnus-review--require-oid
-                  (alist-get 'head_oid object) "round head OID")
-       :created-at (magnus-review--require-number
-                    (alist-get 'created_at object) "round creation time")
-       :completed-at (magnus-review--require-number
-                      (alist-get 'completed_at object)
-                      "round completion time" t)
-       :verdict (magnus-review--validate-state
-                 (alist-get 'verdict object)
-                 magnus-review--verdict-states "round verdict" t)
-       :delivery-state (magnus-review--validate-state
-                        (alist-get 'delivery_state object)
-                        magnus-review--delivery-states "round delivery")
-       :delivery-attempts
-       (let ((attempts (or (alist-get 'delivery_attempts object) 0)))
-         (unless (and (integerp attempts) (>= attempts 0))
-           (magnus-review--signal
-            "Invalid delivery attempt count in manifest: %S" attempts))
-         attempts)
-       :delivery-error (alist-get 'delivery_error object)
-       :delivered-at (magnus-review--require-number
-                      (alist-get 'delivered_at object)
-                      "delivery time" t)
-       :read-state (magnus-review--validate-state
-                    (alist-get 'read_state object)
-                    magnus-review--read-states "round read")
-       :read-at (magnus-review--require-number
-                 (alist-get 'read_at object) "read time" t)
-       :attempts
-       (mapcar (lambda (attempt)
-                 (magnus-review--attempt-from-json
-                  attempt (cl-incf attempt-number)))
-               (append (alist-get 'attempts object) nil))
-       :metadata (alist-get 'metadata object)))))
+      (magnus-review--signal "Review rounds are not sequential at %S" number))
+    (magnus-review-round--create
+     :number number
+     :base-oid (magnus-review--require-oid
+                (alist-get 'base_oid object) "round base OID")
+     :head-oid (magnus-review--require-oid
+                (alist-get 'head_oid object) "round head OID")
+     :created-at (magnus-review--require-number
+                  (alist-get 'created_at object) "round creation time")
+     :completed-at (magnus-review--require-number
+                    (alist-get 'completed_at object) "round completion time")
+     :verdict (magnus-review--validate-state
+               (alist-get 'verdict object)
+               magnus-review--verdict-states "round verdict")
+     :read-state (magnus-review--validate-state
+                  (alist-get 'read_state object)
+                  magnus-review--read-states "round read state")
+     :metadata (alist-get 'metadata object))))
 
-(defun magnus-review--review-from-json
-    (object &optional expected-id expected-hash)
-  "Deserialize schema-2 review OBJECT fields."
+(defun magnus-review--from-json (object &optional expected-id expected-hash)
+  "Deserialize strict completed-lineage OBJECT.
+EXPECTED-ID and EXPECTED-HASH validate its managed storage identity."
+  (magnus-review--require-object-shape
+   object
+   '(schema_version id project_root project_hash author_instance_id author_name
+                    reviewer_name reviewer_provider model effort task session_id
+                    metadata lifecycle created_at updated_at archived_at rounds)
+   "review")
+  (unless (eql (alist-get 'schema_version object)
+               magnus-review-schema-version)
+    (magnus-review--signal
+     "Unsupported review schema version: %S"
+     (alist-get 'schema_version object)))
   (let* ((id (alist-get 'id object))
          (project-root (alist-get 'project_root object))
          (project-hash (alist-get 'project_hash object))
-         (round-number 0)
-         (request-number 0))
+         (number 0))
     (unless (magnus-review--valid-id-p id)
       (magnus-review--signal "Invalid review ID in manifest: %S" id))
+    (magnus-review--require-string project-root "project root")
     (unless (and (magnus-review--valid-hash-p project-hash)
                  (string= project-hash
                           (magnus-review-compute-project-hash project-root)))
@@ -1612,318 +1330,132 @@ become arrays, while object keys remain strings, symbols, or keywords."
     (when (and expected-id (not (string= expected-id id)))
       (magnus-review--signal "Manifest ID does not match its directory"))
     (when (and expected-hash (not (string= expected-hash project-hash)))
-      (magnus-review--signal "Manifest project hash does not match its directory"))
-    (let ((review
-           (magnus-review--create
-     :id id
-     :project-root (magnus-review--canonical-directory project-root)
-     :project-hash project-hash
-     :author-instance-id (alist-get 'author_instance_id object)
-     :author-name (alist-get 'author_name object)
-     :reviewer-name (alist-get 'reviewer_name object)
-     :reviewer-provider (magnus-review--optional-symbol
-                         (alist-get 'reviewer_provider object) "provider")
-     :model (alist-get 'model object)
-     :effort (magnus-review--optional-symbol
-              (alist-get 'effort object) "effort")
-     :task (alist-get 'task object)
-     :lifecycle (magnus-review--validate-state
-                 (alist-get 'lifecycle object)
-                 magnus-review--lifecycle-states "lifecycle")
-     :session-id (alist-get 'session_id object)
-     :checkpoint-requests
-     (mapcar
-      (lambda (request)
-        (magnus-review--checkpoint-request-from-json
-         request (cl-incf request-number)))
-      (append (alist-get 'checkpoint_requests object) nil))
-     :created-at (magnus-review--require-number
-                  (alist-get 'created_at object) "creation time")
-     :updated-at (magnus-review--require-number
-                  (alist-get 'updated_at object) "update time")
-     :archived-at (magnus-review--require-number
-                   (alist-get 'archived_at object) "archive time" t)
-     :rounds
-     (mapcar (lambda (round)
-               (magnus-review--round-from-json
-                round (cl-incf round-number)))
-             (append (alist-get 'rounds object) nil))
-            :metadata (alist-get 'metadata object))))
-      review)))
-
-(defun magnus-review--from-json (object &optional expected-id expected-hash)
-  "Deserialize review OBJECT, validating optional storage identity."
-  (unless (eql (alist-get 'schema_version object)
-               magnus-review-schema-version)
-    (magnus-review--signal
-     "Unsupported review schema version: %S"
-     (alist-get 'schema_version object)))
-  (let ((review
-         (magnus-review--review-from-json object expected-id expected-hash)))
-    (magnus-review--validate-invariants review)))
-
-(defun magnus-review--validate-checkpoint-timeline (review)
-  "Validate REVIEW's schema-2 checkpoint request and event timeline."
-  (let ((requests (magnus-review-checkpoint-requests review))
-        (rounds (magnus-review-rounds review))
-        (request-number 0)
-        (visible-round 0)
-        tokens
-        pending)
-    (unless requests
-      (magnus-review--signal "Review has no checkpoint request history"))
-    (dolist (request requests)
-      (unless (= (magnus-review-checkpoint-request-number request)
-                 (cl-incf request-number))
-        (magnus-review--signal "Checkpoint requests are not append-only"))
-      (let ((token (magnus-review-checkpoint-request-token request))
-            (requested-at
-             (magnus-review-checkpoint-request-requested-at request))
-            (events (magnus-review-checkpoint-request-events request)))
-        (unless (magnus-review--valid-token-p token)
-          (magnus-review--signal "Checkpoint request %d has an invalid token"
-                                 request-number))
-        (when (member token tokens)
-          (magnus-review--signal "Checkpoint request token is not unique"))
-        (push token tokens)
-        (unless (or (null requested-at) (numberp requested-at))
-          (magnus-review--signal
-           "Checkpoint request %d has an invalid timestamp" request-number))
-        (if (null events)
-            (progn
-              (unless (= request-number (length requests))
-                (magnus-review--signal
-                 "Only the latest checkpoint request may be pending"))
-              (when pending
-                (magnus-review--signal
-                 "Review has more than one pending checkpoint request"))
-              (when (and (> visible-round 0)
-                         (not
-                          (eq
-                           (magnus-review-round-execution
-                            (nth (1- visible-round) rounds))
-                           'complete)))
-                (magnus-review--signal
-                 "Pending checkpoint follows an incomplete round"))
-              (setq pending request))
-          (unless (member (mapcar #'magnus-review-checkpoint-event-kind events)
-                          '((round) (unchanged) (unchanged round)))
-            (magnus-review--signal
-             "Checkpoint request %d has an invalid event sequence"
-             request-number))
-          (dolist (event events)
-            (let* ((kind (magnus-review-checkpoint-event-kind event))
-                   (number (magnus-review-checkpoint-event-round-number event))
-                   (recorded-at
-                    (magnus-review-checkpoint-event-recorded-at event))
-                   (round (and (integerp number) (> number 0)
-                               (nth (1- number) rounds))))
-              (unless (and (memq kind magnus-review--checkpoint-event-kinds)
-                           round
-                           (= number (magnus-review-round-number round))
-                           (or (null recorded-at) (numberp recorded-at))
-                           (or (null requested-at) (null recorded-at)
-                               (<= requested-at recorded-at)))
-                (magnus-review--signal
-                 "Checkpoint request %d has an invalid event"
-                 request-number))
-              (pcase kind
-                ('unchanged
-                 (unless (and (> visible-round 0)
-                              (= number visible-round)
-                              (eq (magnus-review-round-execution round)
-                                  'complete))
-                   (magnus-review--signal
-                    "Unchanged checkpoint does not name the current completed round")))
-                ('round
-                 (unless (= number (1+ visible-round))
-                   (magnus-review--signal
-                    "Checkpoint round events are not append-only"))
-                 (when (and (> visible-round 0)
-                            (not
-                             (eq
-                              (magnus-review-round-execution
-                               (nth (1- visible-round) rounds))
-                              'complete)))
-                   (magnus-review--signal
-                    "Checkpoint advanced from an incomplete round"))
-                 (setq visible-round number))))))))
-    (unless (= visible-round (length rounds))
       (magnus-review--signal
-       "Every review round must have one producing checkpoint event"))
-    (unless (eq (magnus-review-pending-checkpoint-request review) pending)
-      (magnus-review--signal "Checkpoint pending-request cache is inconsistent"))))
+       "Manifest project hash does not match its directory"))
+    (magnus-review--validate-invariants
+     (magnus-review--create
+      :id id
+      :project-root (magnus-review--canonical-directory project-root)
+      :project-hash project-hash
+      :author-instance-id
+      (magnus-review--require-string
+       (alist-get 'author_instance_id object) "author instance ID")
+      :author-name
+      (magnus-review--require-string
+       (alist-get 'author_name object) "author name")
+      :reviewer-name
+      (magnus-review--require-string
+       (alist-get 'reviewer_name object) "reviewer name")
+      :reviewer-provider
+      (magnus-review--optional-symbol
+       (alist-get 'reviewer_provider object) "reviewer provider")
+      :model (magnus-review--require-string
+              (alist-get 'model object) "model" t)
+      :effort (magnus-review--optional-symbol
+               (alist-get 'effort object) "effort")
+      :task (magnus-review--require-string
+             (alist-get 'task object) "task" t)
+      :session-id (magnus-review--require-string
+                   (alist-get 'session_id object) "session ID" t)
+      :metadata (alist-get 'metadata object)
+      :lifecycle (magnus-review--validate-state
+                  (alist-get 'lifecycle object)
+                  magnus-review--lifecycle-states "lifecycle")
+      :created-at (magnus-review--require-number
+                   (alist-get 'created_at object) "creation time")
+      :updated-at (magnus-review--require-number
+                   (alist-get 'updated_at object) "update time")
+      :archived-at (magnus-review--require-number
+                    (alist-get 'archived_at object) "archive time" t)
+      :rounds
+      (mapcar (lambda (round)
+                (magnus-review--round-from-json round (cl-incf number)))
+              (append (alist-get 'rounds object) nil))))))
 
 (defun magnus-review--validate-invariants (review)
-  "Validate cross-field and append-only invariants for REVIEW."
-  (unless (and (magnus-review--valid-id-p (magnus-review-id review))
+  "Validate completed lineage invariants for REVIEW."
+  (unless (and (magnus-review-p review)
+               (magnus-review--valid-id-p (magnus-review-id review))
                (magnus-review--valid-hash-p
                 (magnus-review-project-hash review))
                (string= (magnus-review-project-hash review)
                         (magnus-review-compute-project-hash
                          (magnus-review-project-root review))))
     (magnus-review--signal "Review storage identity is inconsistent"))
-  (unless (and (stringp (magnus-review-author-instance-id review))
-               (stringp (magnus-review-author-name review)))
-    (magnus-review--signal "Review author identity is incomplete"))
+  (dolist (value (list (magnus-review-author-instance-id review)
+                       (magnus-review-author-name review)
+                       (magnus-review-reviewer-name review)))
+    (unless (and (stringp value) (not (string-empty-p value)))
+      (magnus-review--signal "Review participant identity is incomplete")))
+  (unless (memq (magnus-review-lifecycle review)
+                magnus-review--lifecycle-states)
+    (magnus-review--signal "Invalid review lifecycle"))
+  (unless (and (numberp (magnus-review-created-at review))
+               (numberp (magnus-review-updated-at review))
+               (<= (magnus-review-created-at review)
+                   (magnus-review-updated-at review)))
+    (magnus-review--signal "Invalid review timestamps"))
+  (if (eq (magnus-review-lifecycle review) 'archived)
+      (unless (numberp (magnus-review-archived-at review))
+        (magnus-review--signal "Archived review lacks archive timestamp"))
+    (when (magnus-review-archived-at review)
+      (magnus-review--signal "Open review has archive timestamp")))
   (when (and (magnus-review-session-id review)
-             (not (stringp (magnus-review-session-id review))))
-    (magnus-review--signal "Review provider session ID is invalid"))
-  (let ((round-number 0))
+             (not (and (stringp (magnus-review-session-id review))
+                       (not (string-empty-p
+                             (magnus-review-session-id review))))))
+    (magnus-review--signal "Invalid successful provider session ID"))
+  (let ((number 0))
     (dolist (round (magnus-review-rounds review))
-      (unless (= (magnus-review-round-number round) (cl-incf round-number))
-        (magnus-review--signal "Review rounds are not append-only"))
+      (unless (= (magnus-review-round-number round) (cl-incf number))
+        (magnus-review--signal "Review rounds are not sequential"))
       (unless (and (magnus-review--valid-oid-p
                     (magnus-review-round-base-oid round))
                    (magnus-review--valid-oid-p
                     (magnus-review-round-head-oid round))
-                   (or (> round-number 1)
-                       (not (string= (magnus-review-round-base-oid round)
-                                     (magnus-review-round-head-oid round)))))
-        (magnus-review--signal "Review round %d has invalid Git evidence"
-                               round-number))
-      (unless (or (null (magnus-review-base-oid review))
-                  (string= (magnus-review-base-oid review)
-                           (magnus-review-round-base-oid round)))
-        (magnus-review--signal "Review base changed between rounds"))
-      (let ((attempt-number 0))
-        (dolist (attempt (magnus-review-round-attempts round))
-          (unless (= (magnus-review-attempt-number attempt)
-                     (cl-incf attempt-number))
-            (magnus-review--signal "Round %d attempts are not append-only"
-                                   round-number))
-          (unless (magnus-review--valid-token-p
-                   (magnus-review-attempt-token attempt))
-            (magnus-review--signal "Round %d has an invalid attempt token"
-                                   round-number))
-          (unless (memq (magnus-review-attempt-execution attempt)
-                        magnus-review--attempt-execution-states)
-            (magnus-review--signal
-             "Round %d attempt %d has an invalid execution state"
-             round-number attempt-number))
-          (unless
-              (or (null (magnus-review-attempt-interruption-kind attempt))
-                  (and
-                   (eq (magnus-review-attempt-execution attempt) 'interrupted)
-                   (memq (magnus-review-attempt-interruption-kind attempt)
-                         magnus-review--interruption-kinds)))
-            (magnus-review--signal
-             "Round %d attempt %d has invalid interruption metadata"
-             round-number attempt-number))))
-      (if (eq (magnus-review-round-execution round) 'complete)
-          (unless (and (memq (magnus-review-round-verdict round)
-                             magnus-review--verdict-states)
-                       (numberp (magnus-review-round-completed-at round))
-                       (memq (magnus-review-round-delivery-state round)
-                             '(pending sent failed))
-                       (memq (magnus-review-round-read-state round)
-                             '(unread read)))
-            (magnus-review--signal
-             "Completed round %d is only partially published" round-number))
-        (when (or (magnus-review-round-verdict round)
-                  (magnus-review-round-completed-at round)
-                  (not (eq (magnus-review-round-delivery-state round)
-                           'not-ready))
-                  (not (eq (magnus-review-round-read-state round) 'not-ready)))
-          (magnus-review--signal
-           "Non-complete round %d contains published result state"
-           round-number))))
-    (magnus-review--validate-checkpoint-timeline review))
-  review)
-
-(defun magnus-review--run-changed-hooks ()
-  "Run review observers independently after a durable state transition.
-Observer failures are diagnostics, never transaction failures: by the time
-this runs the manifest has already been atomically replaced on disk."
-  (run-hook-wrapped
-   'magnus-reviews-changed-hook
-   (lambda (function)
-     (condition-case err
-         (funcall function)
-       (error
-        (message "Magnus: review state observer %S failed: %s"
-                 function (error-message-string err))))
-     ;; `run-hook-wrapped' stops at the first non-nil wrapper result.
-     nil)))
-
-(defvar magnus-review--durable-snapshots
-  (make-hash-table :test #'eq :weakness 'key)
-  "Last successfully loaded or saved object graph for each live review.")
-
-(defun magnus-review--graph-objects (review)
-  "Return REVIEW and every mutable durable record it currently owns."
-  (let ((objects (list review)))
-    (dolist (request (magnus-review-checkpoint-requests review))
-      (setq objects (append objects (list request)))
-      (dolist (event (magnus-review-checkpoint-request-events request))
-        (setq objects (append objects (list event)))))
-    (dolist (round (magnus-review-rounds review))
-      (setq objects (append objects (list round)))
-      (dolist (attempt (magnus-review-round-attempts round))
-        (setq objects (append objects (list attempt)))))
-    objects))
-
-(defun magnus-review--snapshot-graph (review)
-  "Return a shallow slot snapshot of REVIEW's complete durable graph."
-  (mapcar (lambda (object) (cons object (copy-sequence object)))
-          (magnus-review--graph-objects review)))
-
-(defun magnus-review--restore-graph (snapshot)
-  "Restore every pre-existing object in graph SNAPSHOT in place."
-  (dolist (entry snapshot)
-    (let ((object (car entry))
-          (saved (cdr entry)))
-      (dotimes (index (length saved))
-        (aset object index (aref saved index))))))
-
-(defun magnus-review--remember-durable-state (review)
-  "Remember REVIEW's current graph as its last durable state."
-  (puthash review (magnus-review--snapshot-graph review)
-           magnus-review--durable-snapshots)
+                   (not (string= (magnus-review-round-base-oid round)
+                                 (magnus-review-round-head-oid round))))
+        (magnus-review--signal "Round %d has invalid Git scope" number))
+      (unless (and (numberp (magnus-review-round-created-at round))
+                   (numberp (magnus-review-round-completed-at round))
+                   (<= (magnus-review-round-created-at round)
+                       (magnus-review-round-completed-at round)))
+        (magnus-review--signal "Round %d has invalid timestamps" number))
+      (unless (and (memq (magnus-review-round-verdict round)
+                         magnus-review--verdict-states)
+                   (memq (magnus-review-round-read-state round)
+                         magnus-review--read-states))
+        (magnus-review--signal "Round %d is not successfully published"
+                               number))))
   review)
 
 (defun magnus-review-save (review)
-  "Persist REVIEW atomically and privately."
-  (unless (magnus-review-p review)
-    (magnus-review--signal "Not a Magnus review: %S" review))
-  (let ((durable-snapshot
-         (gethash review magnus-review--durable-snapshots))
-        next-snapshot)
-    (condition-case err
-        (progn
-          (setf (magnus-review-updated-at review) (float-time))
-          (magnus-review--validate-invariants review)
-          (magnus-review--ensure-review-directories review)
-          ;; Allocate the next rollback image before the atomic commit point.
-          ;; After rename, only installation of this already-built snapshot and
-          ;; independently isolated observers remain.
-          (setq next-snapshot (magnus-review--snapshot-graph review))
-          (let ((json-encoding-pretty-print nil))
-            (magnus-review--atomic-write-string
-             (magnus-review-manifest-path review)
-             (concat (json-serialize
-                      (magnus-review--to-json review)
-                      :null-object nil :false-object :json-false)
-                     "\n"))))
-      (error
-       (when durable-snapshot
-         (magnus-review--restore-graph durable-snapshot))
-       (signal (car err) (cdr err))))
-    (puthash review next-snapshot magnus-review--durable-snapshots))
+  "Persist completed REVIEW atomically and privately.
+Empty drafts are intentionally not persistable."
+  (unless (magnus-review-rounds review)
+    (magnus-review--signal "Cannot persist a review without a completed round"))
+  (magnus-review--validate-invariants review)
+  (magnus-review--ensure-review-directories review)
+  (let ((json-encoding-pretty-print nil))
+    (magnus-review--atomic-write-string
+     (magnus-review-manifest-path review)
+     (concat (json-serialize (magnus-review--to-json review)
+                             :null-object nil
+                             :false-object :json-false)
+             "\n")))
   (unless (memq review magnus-reviews)
     (push review magnus-reviews))
   (magnus-review--run-changed-hooks)
   review)
 
 (defun magnus-review--read-json-file (file)
-  "Read bounded JSON object from FILE without following a symlink."
+  "Read a bounded JSON object from regular, non-symlink FILE."
   (when (file-symlink-p file)
     (magnus-review--signal "Refusing symlinked review manifest: %s" file))
   (unless (file-regular-p file)
     (magnus-review--signal "Review manifest is not a regular file: %s" file))
-  (let ((size (file-attribute-size (file-attributes file))))
-    (when (> size (* 10 1024 1024))
-      (magnus-review--signal "Review manifest is unexpectedly large: %s" file)))
+  (when (> (file-attribute-size (file-attributes file)) (* 10 1024 1024))
+    (magnus-review--signal "Review manifest is unexpectedly large: %s" file))
   (set-file-modes file #o600)
   (with-temp-buffer
     (let ((coding-system-for-read 'utf-8-unix))
@@ -1932,50 +1464,25 @@ this runs the manifest has already been atomically replaced on disk."
                        :null-object nil :false-object :json-false)))
 
 (defun magnus-review-load-file (file &optional expected-id expected-hash)
-  "Load one review manifest FILE and register it.
-EXPECTED-ID and EXPECTED-HASH validate its managed storage path."
+  "Load one strict completed-lineage manifest FILE and register it."
   (let ((review
-         (magnus-review--validate-invariants
-          (magnus-review--from-json
-           (magnus-review--read-json-file file)
-           expected-id expected-hash))))
+         (magnus-review--from-json
+          (magnus-review--read-json-file file) expected-id expected-hash)))
+    (unless (magnus-review-rounds review)
+      (magnus-review--signal "Durable review has no completed rounds"))
     (when-let ((existing (magnus-review-get (magnus-review-id review))))
       (unless (string= (magnus-review-project-hash existing)
                        (magnus-review-project-hash review))
-        (magnus-review--signal "Duplicate review ID across project archives"))
+        (magnus-review--signal "Duplicate review ID across projects"))
       (setq magnus-reviews (delq existing magnus-reviews)))
-    (magnus-review--remember-durable-state review)
     (push review magnus-reviews)
     review))
 
-(defun magnus-review--recover-one (review)
-  "Recover stale active or already-acknowledged state in REVIEW."
-  (let ((changed nil)
-        (now (float-time)))
-    (dolist (round (magnus-review-rounds review))
-      (dolist (attempt (magnus-review-round-attempts round))
-        (when (memq (magnus-review-attempt-execution attempt)
-                    '(starting running))
-          (setf (magnus-review-attempt-execution attempt) 'interrupted
-                (magnus-review-attempt-finished-at attempt) now
-                (magnus-review-attempt-error attempt)
-                (or (magnus-review-attempt-error attempt)
-                    "Emacs exited while this review attempt was active")
-                (magnus-review-attempt-interruption-kind attempt) 'crash)
-          (setq changed t))))
-    (when changed
-      (setf (magnus-review-updated-at review) now)
-      (magnus-review-save review))
-    changed))
-
 (defun magnus-review-load-all ()
-  "Load all durable reviews and recover abandoned active attempts.
-Malformed records are skipped with a warning; valid records remain available."
+  "Load strict completed review lineages.
+Malformed or unsupported manifests are ignored with a warning.  Unfinished
+execution is never restored."
   (interactive)
-  (when (and (fboundp 'magnus-review-controller-active-p)
-             (magnus-review-controller-active-p))
-    (user-error
-     "Cannot reload reviews while the review controller owns a live attempt"))
   (setq magnus-reviews nil)
   (let ((root (expand-file-name magnus-review-directory-root))
         (loaded 0))
@@ -1989,23 +1496,25 @@ Malformed records are skipped with a warning; valid records remain available."
                      (not (file-symlink-p project-entry))
                      (magnus-review--valid-hash-p project-hash))
             (set-file-modes project-entry #o700)
-            (dolist (review-entry (directory-files project-entry t "\\`[^.]" t))
+            (dolist (review-entry
+                     (directory-files project-entry t "\\`[^.]" t))
               (let* ((review-id (file-name-nondirectory review-entry))
-                     (manifest (expand-file-name "manifest.json" review-entry)))
+                     (manifest
+                      (expand-file-name "manifest.json" review-entry)))
                 (when (and (file-directory-p review-entry)
                            (not (file-symlink-p review-entry))
                            (magnus-review--valid-id-p review-id)
                            (file-exists-p manifest))
                   (set-file-modes review-entry #o700)
                   (condition-case error-data
-                      (let ((review (magnus-review-load-file
-                                     manifest review-id project-hash)))
-                        (cl-incf loaded)
-                        (magnus-review--recover-one review))
+                      (progn
+                        (magnus-review-load-file
+                         manifest review-id project-hash)
+                        (cl-incf loaded))
                     (error
                      (display-warning
                       'magnus-review
-                      (format "Skipping review manifest %s: %s"
+                      (format "Ignoring review manifest %s: %s"
                               manifest (error-message-string error-data))
                       :warning))))))))))
     (setq magnus-reviews
@@ -2015,261 +1524,6 @@ Malformed records are skipped with a warning; valid records remain available."
                      (or (magnus-review-created-at right) 0)))))
     (magnus-review--run-changed-hooks)
     loaded))
-
-;;; Managed immutable review worktree
-
-(defun magnus-review--verified-clean-checkout-head (review &optional checkout)
-  "Return REVIEW's proven clean checkout HEAD, or nil when it is absent.
-A present checkout must be the real derived path, the exact Git top-level, and
-a worktree of REVIEW's source repository.  Any ambiguous state signals rather
-than being repaired, removed, or overwritten."
-  (let ((checkout (or checkout (magnus-review-checkout-path review))))
-    (cond
-     ((file-symlink-p checkout)
-      (magnus-review--signal
-       "Refusing symlinked review checkout: %s" checkout))
-     ((not (file-exists-p checkout)) nil)
-     ((not (file-directory-p checkout))
-      (magnus-review--signal
-       "Review checkout is not a real directory: %s" checkout))
-     (t
-      (condition-case error-data
-          (progn
-            (unless (string=
-                     (magnus-review-git-root checkout)
-                     (magnus-review--canonical-directory checkout))
-              (magnus-review--signal
-               "Review checkout is not its exact Git top-level: %s" checkout))
-            (unless (string=
-                     (magnus-review--git-common-directory checkout)
-                     (magnus-review--git-common-directory
-                      (magnus-review-project-root review)))
-              (magnus-review--signal
-               "Review checkout belongs to a different repository: %s"
-               checkout))
-            (when (magnus-review--git-output-optional
-                   checkout "symbolic-ref" "--quiet" "HEAD")
-              (magnus-review--signal
-               "Review checkout is not detached: %s" checkout))
-            (when-let ((dirty
-                        (magnus-review--managed-worktree-dirty-status checkout)))
-              (magnus-review--signal
-               "Refusing to overwrite modified review worktree %s:\n%s"
-               checkout dirty))
-            (magnus-review-resolve-oid checkout "HEAD"))
-        (magnus-review-git-error
-         (magnus-review--signal
-          "Cannot prove review checkout ownership at %s: %s"
-          checkout (error-message-string error-data))))))))
-
-(defun magnus-review-ensure-checkout (review head-revision &optional round)
-  "Ensure REVIEW has a proven clean detached checkout at HEAD-REVISION.
-The immutable requested HEAD and Git's own worktree metadata are the only
-sources of truth.  Legacy Magnus marker files are deliberately ignored.
-Foreign, dirty, symlinked, or otherwise ambiguous paths are never deleted or
-pruned.  If an identical concurrent operation wins a Git race, its fully
-verified result is accepted.  With ROUND, require its immutable HEAD and use a
-round-specific path; without it, use the legacy shared path."
-  (let* ((project-root (magnus-review-project-root review))
-         (head (magnus-review-resolve-oid
-                project-root head-revision))
-         (checkout (if round
-                       (magnus-review-round-checkout-path review round)
-                     (magnus-review-checkout-path review))))
-    (when (and round
-               (not (string= head (magnus-review-round-head-oid round))))
-      (magnus-review--signal
-       "Checkout HEAD does not match immutable round %d"
-       (magnus-review-round-number round)))
-    (magnus-review--ensure-review-directories review)
-    (magnus-review--ensure-private-directory (file-name-directory checkout))
-    (let ((current
-           (magnus-review--verified-clean-checkout-head review checkout)))
-      (unless (and current (string= current head))
-        (condition-case error-data
-            (if current
-                (magnus-review--git-output
-                 checkout "checkout" "--detach" head)
-              (magnus-review--git-output
-               project-root "worktree" "add" "--detach" checkout head))
-          (error
-           ;; Git may report a lock or path collision after another Emacs has
-           ;; already completed this same transition.  Accept only the exact,
-           ;; clean, fully proven target; otherwise preserve the original error.
-           (unless
-               (condition-case verification-error
-                   (string=
-                    (or (magnus-review--verified-clean-checkout-head
-                         review checkout)
-                        "")
-                    head)
-                 (error
-                  (message
-                   "Magnus: concurrent checkout revalidation failed: %s"
-                   (error-message-string verification-error))
-                  nil))
-             (signal (car error-data) (cdr error-data)))))))
-    (let ((actual
-           (magnus-review--verified-clean-checkout-head review checkout)))
-      (unless (and actual (string= actual head))
-        (magnus-review--signal
-         "Review worktree stopped at unexpected commit %s"
-         (or actual "<absent>"))))
-    (set-file-modes checkout #o700)
-    checkout))
-
-;;; Coordination checkpoint integration
-
-(defun magnus-review-handle-ready-marker (directory marker)
-  "Validate a coordination review-ready MARKER emitted in DIRECTORY.
-MARKER is a plist with :request-id, :checkpoint-token, :base, and :head strings.
-A new valid marker appends an immutable round and runs
-`magnus-review-ready-hook'.  An unchanged re-review checkpoint is acknowledged
-without duplicating the round or launching a model, and finishes that pending
-request.  A known request with a non-current token never changes Git scope and
-triggers `magnus-review-checkpoint-mismatch-hook' for recovery.  A token that
-is already bound to a round can only replay that round's exact scope; a
-conflicting replay signals `magnus-review-checkpoint-rejected', a permanent
-protocol rejection that coordination consumers must not retry.  Replayed
-markers never append a duplicate round, but a queued round re-runs the hook so
-startup recovery can continue launching it idempotently."
-  (let* ((request-id (plist-get marker :request-id))
-         (token (plist-get marker :checkpoint-token))
-         (base (plist-get marker :base))
-         (head (plist-get marker :head))
-         (review (and request-id (magnus-review-get request-id))))
-    ;; Coordination markers have historically treated unknown requests as
-    ;; no-ops.  A marker can outlive an archived or otherwise absent manifest,
-    ;; so consuming the shared Markdown must not turn that into a project-wide
-    ;; watcher failure.
-    (when review
-      (unless (stringp token)
-        (magnus-review--signal "Review-ready checkpoint token is missing"))
-      (unless (and (magnus-review--valid-oid-p base)
-                   (magnus-review--valid-oid-p head))
-        (magnus-review--signal
-         "Review-ready checkpoints require full 40- or 64-hex object IDs"))
-      (unless (string= (magnus-review-git-root directory)
-                       (magnus-review-project-root review))
-        (magnus-review--signal "Review-ready marker came from the wrong project"))
-      (setq base (downcase base)
-            head (downcase head))
-      (let* ((latest (magnus-review-latest-round review))
-             (request
-              (magnus-review-checkpoint-request-for-token review token))
-             (events
-              (and request
-                   (magnus-review-checkpoint-request-events request)))
-             (pending (magnus-review-pending-checkpoint-request review))
-             (matching-event
-              (and
-               request
-               (seq-find
-                (lambda (event)
-                  (when-let ((round
-                              (magnus-review--checkpoint-event-round
-                               review event)))
-                    (and
-                     (string= base (magnus-review-round-base-oid round))
-                     (string= head (magnus-review-round-head-oid round)))))
-                events)))
-             (matching-round
-              (and matching-event
-                   (magnus-review--checkpoint-event-round
-                    review matching-event)))
-             (bound-round
-              (and events
-                   (magnus-review--checkpoint-event-round
-                    review (car (last events))))))
-        (cond
-         ;; The checkpoint ledger is replay authority.  Historical Git objects
-         ;; need not still resolve in the source repository once their exact
-         ;; scope is linked to an immutable round.
-         (matching-event
-          (when (and (eq (magnus-review-checkpoint-event-kind matching-event)
-                         'round)
-                     (eq matching-round latest)
-                     (eq (magnus-review-round-execution matching-round)
-                         'queued))
-            (run-hook-with-args
-             'magnus-review-ready-hook review matching-round))
-          matching-round)
-         ;; Once a token binds to a real round or an acknowledged no-progress
-         ;; scope, it can never identify another Git scope.  This is a permanent
-         ;; protocol rejection rather than a transient handler failure: retrying
-         ;; the same marker cannot repair it and used to create a noisy
-         ;; timer loop on every startup.
-         ;; If a newer request is genuinely waiting, redeliver that canonical
-         ;; token so an author recovering from compaction can still proceed.
-         (events
-          (let ((recover-current
-                 (and pending (not (eq request pending)))))
-            (when recover-current
-              (run-hook-with-args
-               'magnus-review-checkpoint-mismatch-hook review marker))
-            (signal
-             'magnus-review-checkpoint-rejected
-             (list
-              (format
-               (concat
-                "checkpoint token is already bound to round %d (%s..%s); "
-                "ignored conflicting marker for %s..%s%s")
-               (magnus-review-round-number bound-round)
-               (substring (magnus-review-round-base-oid bound-round) 0 8)
-               (substring (magnus-review-round-head-oid bound-round) 0 8)
-               (substring base 0 8)
-               (substring head 0 8)
-               (if recover-current
-                   "; retained the current checkpoint request"
-                 (concat
-                  "; request a fresh re-review if that committed work should "
-                  "be reviewed")))))))
-         ((or (null request) (not (eq request pending)))
-          ;; Context compaction can make an otherwise healthy author invent or
-          ;; replay the wrong token.  Never trust that marker's Git scope, but
-          ;; consume it as a no-op for this watcher session and let the controller
-          ;; redeliver the canonical request.  Startup replay is still safe and
-          ;; may reissue that request once more if the bad marker remains.
-          (when pending
-            (run-hook-with-args
-             'magnus-review-checkpoint-mismatch-hook review marker))
-          (message
-           "Magnus: ignored non-current checkpoint token from %s%s"
-           (magnus-review-author-name review)
-           (if pending
-               "; retained the canonical request"
-             ""))
-          review)
-         (t
-          (when (magnus-review-worktree-dirty-status directory)
-            (magnus-review--signal "%s" magnus-review-uncommitted-message))
-          (let ((resolved-base (magnus-review-resolve-oid directory base))
-                (resolved-head (magnus-review-resolve-oid directory head))
-                (current-head (magnus-review-resolve-oid directory "HEAD")))
-            (unless (and (string= resolved-base base)
-                         (string= resolved-head head))
-              (magnus-review--signal
-               "Review-ready values must be exact commit object IDs"))
-            (unless (string= resolved-head current-head)
-              (magnus-review--signal
-               "Review-ready HEAD is no longer current; publish a fresh checkpoint"))
-            (if (and latest
-                     (string= resolved-base
-                              (magnus-review-round-base-oid latest))
-                     (string= resolved-head
-                              (magnus-review-round-head-oid latest)))
-                (magnus-review--acknowledge-unchanged-checkpoint
-                 review token resolved-base resolved-head)
-              (let ((round (magnus-review-append-round
-                            review resolved-base resolved-head
-                            :checkpoint-token token)))
-                (run-hook-with-args 'magnus-review-ready-hook review round)
-                round)))))))))
-
-(defun magnus-review-setup-coordination ()
-  "Register review-ready marker handling when coordination is available."
-  (add-hook 'magnus-coord-review-ready-hook
-            #'magnus-review-handle-ready-marker))
 
 (provide 'magnus-review)
 ;;; magnus-review.el ends here

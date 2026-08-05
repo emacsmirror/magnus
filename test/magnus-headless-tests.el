@@ -43,15 +43,16 @@
 
 (magnus-provider-register
  'magnus-test-headless
- '((headless-review-spec . magnus-test-headless--spec)))
-
-(magnus-provider-register
- 'magnus-test-headless-generic
  '((headless-spec . magnus-test-headless--spec)))
 
-(defun magnus-test-headless--request (command)
-  "Return a fake provider request executing shell COMMAND."
-  (list :directory default-directory
+(magnus-provider-register
+ 'magnus-test-headless-unsupported
+ nil)
+
+(defun magnus-test-headless--request (command &optional purpose)
+  "Return a fake provider request executing shell COMMAND for PURPOSE."
+  (list :purpose (or purpose 'review)
+        :directory default-directory
         :prompt "Exercise the fake provider"
         :fixture-command command))
 
@@ -75,26 +76,32 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
     (unless (funcall predicate)
       (ert-fail "Timed out waiting for fake headless provider"))))
 
-(ert-deftest magnus-headless-agent-never-uses-legacy-review-adapter ()
-  (let ((request (magnus-test-headless--request "exit 0")))
-    (setq request (plist-put request :purpose 'agent))
+(ert-deftest magnus-headless-provider-requires-generic-capability ()
+  (let ((request (magnus-test-headless--request "exit 0" 'agent)))
     (should-error
-     (magnus-headless-start 'magnus-test-headless request)
+     (magnus-headless-start 'magnus-test-headless-unsupported request)
      :type 'user-error)))
+
+(ert-deftest magnus-headless-requires-explicit-purpose ()
+  (should-error
+   (magnus-headless-start
+    'magnus-test-headless
+    (list :directory default-directory :prompt "Missing purpose"))
+   :type 'user-error))
 
 (ert-deftest magnus-headless-agent-can-require-terminal-only ()
   (let* ((terminal "{\"type\":\"terminal\"}")
          (request
           (append
            (magnus-test-headless--request
-            (magnus-test-headless--emit terminal))
-           '(:purpose agent :fixture-success-requires (terminal))))
+            (magnus-test-headless--emit terminal) 'agent)
+           '(:fixture-success-requires (terminal))))
          completion process)
     (unwind-protect
         (progn
           (setq process
                 (magnus-headless-start
-                 'magnus-test-headless-generic request
+                 'magnus-test-headless request
                  (list :on-complete
                        (lambda (_process result)
                          (setq completion result)))))
@@ -110,18 +117,16 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
 (ert-deftest magnus-headless-review-cannot-weaken-success-requirements ()
   (let ((request
          (append (magnus-test-headless--request "exit 0")
-                 '(:purpose review
-                   :fixture-success-requires (terminal)))))
+                 '(:fixture-success-requires (terminal)))))
     (should-error
-     (magnus-headless-start 'magnus-test-headless-generic request))))
+     (magnus-headless-start 'magnus-test-headless request))))
 
 (ert-deftest magnus-headless-rejects-unknown-success-requirement ()
   (let ((request
-         (append (magnus-test-headless--request "exit 0")
-                 '(:purpose agent
-                   :fixture-success-requires (terminal magic)))))
+         (append (magnus-test-headless--request "exit 0" 'agent)
+                 '(:fixture-success-requires (terminal magic)))))
     (should-error
-     (magnus-headless-start 'magnus-test-headless-generic request))))
+     (magnus-headless-start 'magnus-test-headless request))))
 
 (ert-deftest magnus-headless-associates-optional-display-buffer ()
   (let* ((line "{\"type\":\"result\",\"value\":{\"ok\":true}}")
@@ -136,7 +141,7 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
         (progn
           (setq process
                 (magnus-headless-start
-                 'magnus-test-headless-generic request
+                 'magnus-test-headless request
                  (list :on-complete
                        (lambda (_process result)
                          (setq completion result)))))
@@ -189,9 +194,8 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
            "\"$MAGNUS_TEST_NAME\""))
          (request
           (append
-           (magnus-test-headless--request command)
-           (list :purpose 'agent
-                 :fixture-environment provider-environment
+           (magnus-test-headless--request command 'agent)
+           (list :fixture-environment provider-environment
                  :environment-bindings
                  '("MAGNUS_TEST_ID=new-value"
                    "MAGNUS_TEST_NAME=fixture"))))
@@ -201,7 +205,7 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
         (progn
           (setq process
                 (magnus-headless-start
-                 'magnus-test-headless-generic request
+                 'magnus-test-headless request
                  (list :on-complete
                        (lambda (_process result)
                          (setq completion result)))))

@@ -672,7 +672,7 @@ DATE defaults to the original deterministic test fixture date."
            (process-get process 'magnus-terminal-delivery-queue)))
       (magnus-test--delete-terminal terminal))))
 
-(ert-deftest magnus-codex-durable-receipt-waits-for-tui-submission ()
+(ert-deftest magnus-codex-accepted-callback-waits-for-tui-submission ()
   (let* ((instance (magnus-instances-create "/tmp" "receipt-codex" 'codex))
          (terminal (magnus-test--codex-tui instance))
          (process (cdr terminal))
@@ -688,16 +688,56 @@ DATE defaults to the original deterministic test fixture date."
                    (lambda () (setq sent t))))
           (should
            (eq (magnus-codex-send
-                instance "durable result"
+                instance "accepted result"
                 (lambda () (cl-incf accepted)))
                'queued))
           (should (= accepted 0))
           (should-not sent)
           (should (process-get process 'magnus-terminal-delivery-queue))
-          ;; Stopping before readiness loses only the process-local queue; the
-          ;; absent receipt leaves the review manifest pending for resurrection.
+          ;; Stopping before readiness discards the process-local queue without
+          ;; falsely acknowledging a delivery which never reached the TUI.
           (delete-process process)
           (should (= accepted 0)))
+      (magnus-test--delete-terminal terminal))))
+
+(ert-deftest magnus-codex-supplied-delivery-scope-is-cancellable ()
+  (let* ((instance (magnus-instances-create "/tmp" "scoped-codex" 'codex))
+         (terminal (magnus-test--codex-tui instance))
+         (process (cdr terminal))
+         (scope (list 'review-controller "review-1"))
+         (cancelled-accepted 0)
+         (ordinary-accepted 0)
+         sent)
+    (process-put process 'magnus-codex-ready nil)
+    (unwind-protect
+        (cl-letf (((symbol-function 'vterm-send-string)
+                   (lambda (text &optional _paste-p) (push text sent)))
+                  ((symbol-function 'vterm-send-return)
+                   (lambda () (push 'return sent)))
+                  ((symbol-function 'run-with-timer)
+                   (lambda (&rest _arguments) 'test-timer)))
+          (should
+           (eq (magnus-codex-send
+                instance "cancel me"
+                (lambda () (cl-incf cancelled-accepted))
+                scope)
+               'queued))
+          (should
+           (eq (magnus-codex-send
+                instance "keep me"
+                (lambda () (cl-incf ordinary-accepted)))
+               'queued))
+          (let ((queue
+                 (process-get process 'magnus-terminal-delivery-queue)))
+            (should (eq (plist-get (car queue) :scope) scope))
+            (should (eq (plist-get (cadr queue) :scope) 'codex)))
+          (magnus-terminal-cancel-scope scope)
+          (should (= cancelled-accepted 0))
+          (process-put process 'magnus-codex-ready t)
+          (should (eq (magnus-terminal-drain process) 'submitted))
+          (should (= cancelled-accepted 0))
+          (should (= ordinary-accepted 1))
+          (should (equal (nreverse sent) '("keep me" return))))
       (magnus-test--delete-terminal terminal))))
 
 (ert-deftest magnus-codex-tui-send-error-retains-and-retries-entry ()

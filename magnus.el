@@ -627,9 +627,8 @@ them now; new agents populate once their memory file exists."
             (magnus-persistence-load)
             (magnus--agents-index-load)
             (magnus-background-setup)
-            ;; Reviews must be reconstructed before the controller attaches its
-            ;; hooks.  Controller setup then rebuilds the durable queue and
-            ;; synchronously replays checkpoints before the general watcher.
+            ;; Completed review lineages load before the controller attaches
+            ;; its entirely in-memory scope and execution machinery.
             (magnus-review-load-all)
             (magnus-persistence--setup-autosave)
             (add-hook 'kill-emacs-hook #'magnus--shutdown)

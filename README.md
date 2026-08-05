@@ -22,7 +22,7 @@ review the result. Magnus makes that workflow feel native to Emacs:
 - switch, message, suspend, archive, and resurrect named agents;
 - see health, attention, active work, and reviews in one `*magnus*` buffer;
 - coordinate agents through a shared project journal;
-- run durable, headless, cross-provider reviews of exact Git evidence;
+- run headless, cross-provider reviews whose completed rounds are durable;
 - read findings in a folding Magit-style diff rather than a raw model transcript;
 - retain agent memory, provider sessions, reviews, and shared project context.
 
@@ -140,38 +140,56 @@ Put point on an author agent in `*magnus*` and press `v RET`. Magnus then:
 
 1. requires a clean author worktree, otherwise telling you to ask the instance
    to commit first;
-2. asks the author to publish a `REVIEW-READY` checkpoint marker in
-   `.magnus-coord.md`, then records the exact base and head Git object IDs;
+2. asks the author, through its ordinary terminal conversation, which exact
+   committed `base..head` range represents its work;
 3. assigns a durable reviewer identity, reusing existing expertise matching
    when possible;
 4. chooses the provider opposite the author by default;
 5. runs the reviewer headlessly and stores a structured, line-addressed report;
-6. notifies the author where the durable notes live.
+6. tells the author where to read and address the completed findings.
 
-The clean-worktree gate excludes only Magnus's configured coordination journal
-and generated instruction file, because publishing a checkpoint must not reject
-itself. Any tracked or untracked project work still blocks the review.
+The author's reply is read from that exact provider session's local transcript;
+Magnus neither guesses a Git range nor asks the agent to write a protocol file.
+It accepts only canonical full object IDs, proves the base is an ancestor of the
+head, and proves the head is reachable from the current branch. The configured
+coordination journal and generated instructions are excluded from the clean
+gate; any other tracked or untracked project work blocks review creation.
 
 The request popup offers optional provider (`p`), model (`m`), and reasoning
-effort (`e`) overrides. Reviews run one at a time by default, keeping laptop
-load predictable; customize `magnus-review-max-concurrent` if desired.
+effort (`e`) overrides. Reviews share Magnus's single background-model FIFO
+with indexing and retrospectives, so at most one non-interactive provider
+process runs at a time.
 
 Reviewers run in private detached checkouts derived from the immutable round
 number and HEAD. Different rounds never share a mutable worktree, and Magnus
 rejects tracked, untracked, or ignored residue in a managed checkout.
 
-Each raw JSONL or stderr artifact is capped by
-`magnus-review-max-stream-artifact-bytes` (8 MiB by default); a sibling
-`.truncated` diagnostic records overflow. A review attempt also has a watchdog,
-controlled by `magnus-review-attempt-timeout` (one hour by default), so a lost
-provider process cannot hold the review queue forever.
+Magnus deliberately makes pending work disposable. The author query, queue
+entry, provider process, failures, and retries live only in the current Emacs
+session. Queued terminal delivery, the author's response, and the provider run
+are bounded independently by `magnus-review-delivery-timeout`,
+`magnus-review-scope-timeout`, and `magnus-review-timeout`. If execution fails,
+use the review menu to retry while that Emacs session is still open. If resuming
+the provider session itself is the problem, `f` repeats the same candidate with
+the same named reviewer, exact evidence, and lineage context in a fresh
+provider session. Restarting Emacs discards unfinished execution instead of
+replaying it.
 
-Reviews are durable work objects, not disposable output buffers. Their
-checkpoint requests, immutable rounds, attempts, provider session ID,
-findings, delivery state, and read state survive Emacs restarts under
-`~/.magnus/reviews/`. A later round keeps the same reviewer identity and
-provider session, so the reviewer can verify fixes against its earlier
-findings. Archive the review when that body of work is finished.
+Successful rounds are the durable boundary. Their exact Git evidence,
+structured findings, Markdown report, read state, reviewer identity, and last
+successful provider session survive under `~/.magnus/reviews/`. Asking for the
+next round reuses that reviewer name and provider session. Magnus validates and
+supplies the complete successful lineage: every historical finding ID remains
+reserved, every finding from the immediately preceding round needs a
+disposition, and an older resolved finding can retain its identity if it later
+resurfaces. Missing or corrupt prior evidence blocks the next round rather than
+silently starting over; each result's digest, verdict, and finding count are
+bound into the durable round manifest. Archive the lineage when that body of
+work is finished.
+
+Review storage has one writer: do not mutate the same review lineage from two
+live Emacs processes at once. This matches Magnus's existing single-session
+ownership model for its other durable registries.
 
 While a reviewer is executing, the author row shows an animated review badge.
 Completed reviews appear in a separate section with an unread marker. The
@@ -189,9 +207,9 @@ reader presents the exact `base..head` diff using `magit-section`:
 | `g` | Refresh |
 | `q` | Close |
 
-The review actions popup can request another round, resend a checkpoint request,
-retry a failed round, interrupt a running reviewer, retry delivery, or archive
-the review. Manual interruption remains durable until you explicitly retry.
+The review actions popup can request another committed round, retry failed
+ephemeral work, retry a retained candidate with a fresh reviewer session,
+interrupt the current query or reviewer, or archive the completed lineage.
 
 ## Shared coordination journal
 
@@ -202,8 +220,7 @@ human-readable sections:
 - **Active Work** records each agent's current area, status, and files;
 - **Discoveries** preserves project facts and gotchas worth sharing;
 - **Decisions** records choices that should outlive a conversation;
-- **Log** carries announcements, mentions, direct messages, and review
-  checkpoints.
+- **Log** carries announcements, mentions, and direct messages.
 
 The Log has one ordering invariant: newest first. Agents insert each new entry
 immediately below the Log heading's comments and blank preamble; they do not
@@ -220,18 +237,8 @@ messages, and summons are delivered to the addressed live agent. Periodic
 reminders ask agents to check the journal, update Active Work, and share useful
 discoveries; bounded housekeeping keeps the Log readable.
 
-Review checkpoints use an exact marker inserted at the top of the Log:
-
-```text
-[REVIEW-READY request=REQUEST-ID checkpoint=TOKEN base=BASE-OID head=HEAD-OID]
-```
-
-Magnus accepts the marker only for the pending review request and its exact
-committed Git scope. Unresolved markers are retried after transient failures
-and survive an Emacs restart through the journal itself.
-
 Press `C` to open `.magnus-coord.md`. A manual `g` in `*magnus*` polls every
-active or watched project and re-arms exhausted checkpoint delivery. Automatic
+active or watched project for ordinary coordination messages. Automatic
 presentation refreshes deliberately avoid that filesystem work.
 
 ## Status-buffer commands
@@ -343,9 +350,7 @@ Magnus keeps durable user data under `~/.magnus/` by default:
 
 Run `M-x magnus-doctor`, or press `? D`, for read-only checks of the Emacs
 version, required libraries, provider CLIs, Git, durable storage paths, and
-registered agent directories. It also reports bounded review-checkpoint
-retries. If a checkpoint retry is exhausted, fix the reported cause and press
-`g` in `*magnus*` to re-arm the exact durable marker.
+registered agent directories.
 
 ## Useful customization
 
@@ -357,13 +362,12 @@ retries. If a checkpoint retry is exhausted, fix the reported cause and press
 ;; Default project for new agents.
 (setq magnus-default-directory "~/workspace")
 
-;; Durable review defaults.
+;; Independent review defaults.
 (setq magnus-review-default-provider nil) ; opposite the author
 (setq magnus-review-default-effort 'high)
-(setq magnus-review-max-concurrent 1)
 (setq magnus-review-directory-root "~/.magnus/reviews")
-(setq magnus-review-max-stream-artifact-bytes (* 8 1024 1024))
-(setq magnus-review-attempt-timeout 3600)
+(setq magnus-review-scope-timeout 180)
+(setq magnus-review-timeout 3600)
 
 ;; Shared low-priority model work.
 (setq magnus-background-queue-limit 32)
@@ -408,8 +412,9 @@ CI installs package dependencies and runs all four checks on Emacs 28.1, 29.4,
 and 30.2.
 
 The implementation keeps provider transport, terminal setup, headless
-execution, durable reviews, coordination, and UI in separate modules. See the
-Commentary section at the top of each `.el` file for that module's boundary.
+execution, completed review lineages, coordination, and UI in separate
+modules. See the Commentary section at the top of each `.el` file for that
+module's boundary.
 
 ## License
 

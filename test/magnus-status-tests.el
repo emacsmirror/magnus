@@ -9,51 +9,71 @@
 (require 'magnus-status)
 (require 'magnus-transient)
 
-(defun magnus-test-status--attempts-for-state (state)
-  "Return canonical attempt history deriving review round STATE."
-  (unless (eq state 'queued)
-    (list
-     (magnus-review-attempt--create
-      :number 1 :token (format "status-fixture-%s" state)
-      :started-at 1
-      :finished-at (and (memq state '(complete failed interrupted)) 2)
-      :execution state))))
+(defconst magnus-test-status--base-oid
+  "1111111111111111111111111111111111111111")
+
+(defconst magnus-test-status--head-oid
+  "2222222222222222222222222222222222222222")
+
+(defun magnus-test-status--completed-round
+    (&optional number verdict read-state finding-count)
+  "Return one completed review round for presentation tests."
+  (magnus-review-round--create
+   :number (or number 1)
+   :base-oid magnus-test-status--base-oid
+   :head-oid magnus-test-status--head-oid
+   :created-at 1
+   :completed-at 2
+   :verdict (or verdict 'comment)
+   :read-state (or read-state 'read)
+   :metadata `((finding_count . ,(or finding-count 0)))))
+
+(defun magnus-test-status--candidate-round (&optional number)
+  "Return one prepared, not-yet-completed review round numbered NUMBER."
+  (magnus-review-round--create
+   :number (or number 2)
+   :base-oid magnus-test-status--base-oid
+   :head-oid magnus-test-status--head-oid
+   :created-at 3
+   :read-state 'not-ready))
+
+(defun magnus-test-status--runtime-state (review)
+  "Return REVIEW's fixture-only ephemeral execution state."
+  (alist-get 'test_execution (magnus-review-metadata review)))
 
 (defun magnus-test-status--render-instance (instance reviews)
   "Render INSTANCE with REVIEWS and return its text plus slot position."
-  (with-temp-buffer
-    (cl-letf (((symbol-function 'magnus-review-list) (lambda () reviews))
-              ((symbol-function 'magnus-process-running-p) (lambda (_instance) t))
-              ((symbol-function 'magnus-coord-agent-busy-p) (lambda (_instance) nil))
-              ((symbol-function 'magnus-coord--neglected-p) (lambda (_instance) nil))
-              ((symbol-function 'magnus-health-indicator) (lambda (_instance) "+"))
-              ((symbol-function 'magnus--agents-index-get)
-               (lambda (_directory _name) nil)))
-      (magnus-status--insert-instance instance)
-      (list (buffer-string)
-            (text-property-any (point-min) (point-max)
-                               'magnus-review-animation-slot t)))))
+  (let ((magnus-review-runtime-state-function
+         #'magnus-test-status--runtime-state))
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'magnus-review-list) (lambda () reviews))
+                ((symbol-function 'magnus-process-running-p)
+                 (lambda (_instance) t))
+                ((symbol-function 'magnus-coord-agent-busy-p)
+                 (lambda (_instance) nil))
+                ((symbol-function 'magnus-coord--neglected-p)
+                 (lambda (_instance) nil))
+                ((symbol-function 'magnus-health-indicator)
+                 (lambda (_instance) "+"))
+                ((symbol-function 'magnus--agents-index-get)
+                 (lambda (_directory _name) nil)))
+        (magnus-status--insert-instance instance)
+        (list (buffer-string)
+              (text-property-any (point-min) (point-max)
+                                 'magnus-review-animation-slot t))))))
 
 (defun magnus-test-status--review-in-state (execution &rest arguments)
-  "Return a review whose canonical history derives EXECUTION.
+  "Return a completed-lineage fixture with ephemeral EXECUTION.
 ARGUMENTS are passed to `magnus-review--create'."
   (apply
    #'magnus-review--create
    (append
     arguments
-    (if (eq execution 'waiting-for-checkpoint)
-        (list
-         :checkpoint-requests
-         (list
-          (magnus-review-checkpoint-request--create
-           :number 1 :token "status-fixture-checkpoint"
-           :requested-at 1 :events nil)))
-      (list
-       :rounds
-       (list
-        (magnus-review-round--create
-         :number 1
-         :attempts (magnus-test-status--attempts-for-state execution))))))))
+    (list
+     :metadata `((test_execution . ,execution))
+     :rounds
+     (unless (eq execution 'asking-scope)
+       (list (magnus-test-status--completed-round)))))))
 
 (ert-deftest magnus-status-review-keys-are-directly-discoverable ()
   (should (eq (lookup-key magnus-status-mode-map (kbd "v"))
@@ -207,20 +227,17 @@ ARGUMENTS are passed to `magnus-review--create'."
 
 (ert-deftest magnus-status-context-hints-follow-review-lines-and-bindings ()
   (let* ((round
-          (magnus-review-round--create
-           :number 1 :verdict 'approve
-           :attempts (magnus-test-status--attempts-for-state 'complete)
-           :read-state 'unread))
+          (magnus-test-status--completed-round 1 'approve 'unread 2))
          (review
           (magnus-review--create
            :id "review-hint" :reviewer-name "keen-owl"
            :author-name "quick-wren" :lifecycle 'open
            :created-at (float-time)
            :updated-at (float-time) :rounds (list round)))
-         (waiting
+         (asking
           (magnus-test-status--review-in-state
-           'waiting-for-checkpoint
-           :id "review-waiting" :reviewer-name "swift-hare"
+           'asking-scope
+           :id "review-asking" :reviewer-name "swift-hare"
            :author-name "bright-crow" :lifecycle 'open
            :created-at (float-time)
            :updated-at (float-time))))
@@ -258,11 +275,11 @@ ARGUMENTS are passed to `magnus-review--create'."
           (use-local-map magnus-status-mode-map)))
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (insert (propertize "waiting" 'magnus-review-id "review-waiting")))
+        (insert (propertize "asking" 'magnus-review-id "review-asking")))
       (goto-char (point-min))
       (cl-letf (((symbol-function 'magnus-review-get)
                  (lambda (id)
-                   (and (string= id "review-waiting") waiting))))
+                   (and (string= id "review-asking") asking))))
         (let ((hint (substring-no-properties
                      (magnus-status--context-hint nil))))
           (should (string-match-p "v review actions" hint))
@@ -441,301 +458,121 @@ ARGUMENTS are passed to `magnus-review--create'."
       (magnus-instances-create default-directory "implementation-agent"
                                'codex)))))
 
-(ert-deftest magnus-review-transient-names-the-selected-operation ()
-  (let* ((author
-          (magnus-instance--create
-           :id "author" :name "quick-wren" :directory "/tmp/project"))
-         (review
-          (magnus-test-status--review-in-state
-           'running
-           :id "active" :author-instance-id "author"
-           :author-name "quick-wren" :reviewer-name "keen-owl"
-           :lifecycle 'open)))
-    (unwind-protect
-        (progn
-          (setq magnus-transient--review-request-context
-                (list :author author :action 'new))
-          (should (equal (magnus-transient--review-request-heading)
-                         "Independent review of quick-wren"))
-          (should (equal (magnus-transient--review-request-action-description)
-                         "Start independent review"))
-          (should (magnus-transient--review-request-new-p))
-          (should-not (magnus-transient--review-request-busy-p))
-          (setq magnus-transient--review-request-context
-                (list :author author :review review :action 'running))
-          (should (equal (magnus-transient--review-request-heading)
-                         "keen-owl is reviewing quick-wren now"))
-          (should (equal (magnus-transient--review-request-action-description)
-                         "Review is in progress"))
-          (should-not (magnus-transient--review-request-new-p))
-          (should (magnus-transient--review-request-busy-p))
-          (setf (magnus-review-checkpoint-requests review)
-                (list
-                 (magnus-review-checkpoint-request--create
-                  :number 1 :token "waiting-token" :requested-at 1
-                  :events nil)))
-          (setq magnus-transient--review-request-context
-                (list :author author :review review :action 'waiting))
-          (should
-           (equal (magnus-transient--review-request-action-description)
-                  "Resend current checkpoint request"))
-          (should-not (magnus-transient--review-request-busy-p))
-          (setq magnus-transient--review-action-context
-                (magnus-transient--make-review-action-context review))
-          (should
-           (equal (magnus-transient--review-rereview-description)
-                  "Resend checkpoint request")))
-      (setq magnus-transient--review-request-context nil
-            magnus-transient--review-action-context nil))))
+(ert-deftest magnus-status-review-state-labels-span-runtime-and-lineage ()
+  (let ((magnus-review-runtime-state-function
+         #'magnus-test-status--runtime-state))
+    (dolist (case '((asking-scope . "asking author")
+                    (queued . "queued")
+                    (running . "running")
+                    (failed . "failed")
+                    (interrupted . "interrupted")))
+      (let* ((state (car case))
+             (review
+              (magnus-test-status--review-in-state
+               state :id (symbol-name state) :lifecycle 'open))
+             (round (magnus-review-latest-round review)))
+        (should (equal (magnus-status--review-state-label review round)
+                       (cdr case)))))
+    (let* ((round
+            (magnus-test-status--completed-round
+             1 'changes-requested 'unread 3))
+           (review
+            (magnus-review--create
+             :id "complete" :lifecycle 'open :rounds (list round))))
+      (should (equal (magnus-status--review-state-label review round)
+                     "changes requested")))
+    (let ((review
+           (magnus-test-status--review-in-state
+            'running :id "archived" :lifecycle 'archived)))
+      (should (equal
+               (magnus-status--review-state-label
+                review (magnus-review-latest-round review))
+               "archived")))))
 
-(ert-deftest magnus-review-transient-wires-the-direct-action ()
-  (let ((main (transient-get-suffix 'magnus-dispatch "v"))
-        (request (transient-get-suffix 'magnus-review-request-menu "RET")))
-    (should (eq (plist-get (nth 2 main) :command)
-                'magnus-review-request-dispatch))
-    (should (eq (plist-get (nth 2 request) :command)
-                'magnus-transient-request-review))))
+(ert-deftest magnus-status-review-rows-show-round-findings-and-read-state ()
+  (let* ((unread-round
+          (magnus-test-status--completed-round 1 'approve 'unread 12))
+         (read-round
+          (magnus-test-status--completed-round 2 'comment 'read 0))
+         (unread
+          (magnus-review--create
+           :id "unread" :reviewer-name "keen-owl" :reviewer-provider 'codex
+           :effort 'high :author-name "quick-wren" :task "Review API changes"
+           :lifecycle 'open :created-at 1 :updated-at 2
+           :rounds (list unread-round)))
+         (read
+          (magnus-review--create
+           :id "read" :reviewer-name "swift-hare" :reviewer-provider 'claude
+           :effort 'medium :author-name "bright-crow" :lifecycle 'open
+           :created-at 1 :updated-at 2 :rounds (list read-round))))
+    (let ((magnus-review-runtime-state-function nil))
+      (with-temp-buffer
+        (magnus-status--insert-review unread)
+        (let ((text (buffer-string)))
+          (should (string-match-p "● keen-owl \\[codex/high\\]" text))
+          (should (string-match-p "round 1 · approve · 12 findings" text)))
+        (erase-buffer)
+        (magnus-status--insert-review read)
+        (let ((text (buffer-string)))
+          (should (string-match-p "· swift-hare \\[claude/medium\\]" text))
+          (should (string-match-p "round 2 · comment · 0 findings" text))))
+      (with-temp-buffer
+        (cl-letf (((symbol-function 'magnus-review-list)
+                   (lambda () (list unread read))))
+          (magnus-status--insert-header))
+        (should (string-match-p "\\[1 unread review\\]"
+                                (buffer-string)))))))
 
-(ert-deftest magnus-review-direct-key-is-contextual-on-review-rows ()
-  (let ((review (magnus-review--create
-                 :id "contextual-review" :reviewer-name "keen-owl"))
-        (author (magnus-instance--create :id "author" :name "quick-wren"))
-        selected opened)
-    (cl-letf (((symbol-function 'magnus-status--get-review-at-point)
-               (lambda () review))
-              ((symbol-function 'magnus-review-actions)
-               (lambda (&optional candidate _round)
-                 (setq selected candidate))))
-      (magnus-review-request-dispatch))
-    (should (eq selected review))
-    (let ((magnus-transient--review-request-context nil))
-      (cl-letf (((symbol-function 'magnus-status--get-review-at-point)
-                 (lambda () nil))
-                ((symbol-function 'magnus-status--get-instance-at-point)
-                 (lambda () author))
-                ((symbol-function 'magnus-review-request-context)
-                 (lambda (candidate)
-                   (list :author candidate :action 'new)))
-                ((symbol-function 'transient-setup)
-                 (lambda (prefix &rest _args) (setq opened prefix))))
-        (magnus-review-request-dispatch))
-      (should (eq opened #'magnus-review-request-menu))
-      (should (eq (plist-get magnus-transient--review-request-context :author)
-                  author)))))
-
-(ert-deftest magnus-review-transient-setup-renders-the-request-menu ()
-  (let* ((author
-          (magnus-instance--create
-           :id "author" :name "quick-wren" :directory "/tmp/project"))
-         (magnus-transient--review-request-context
-          (list :author author :action 'new)))
-    (unwind-protect
-        (progn
-          ;; Construct the real popup so unsupported Transient group properties
-          ;; fail here instead of only on a user's older installation.
-          (transient-setup #'magnus-review-request-menu)
-          (let ((rendered
-                 (with-current-buffer " *transient*"
-                   (buffer-substring-no-properties (point-min) (point-max)))))
-            (should (string-match-p "Independent review of quick-wren"
-                                    rendered))
-            (should (string-match-p "RET Start independent review" rendered))
-            (should (string-match-p "defaults: opposite provider" rendered))))
-      (when transient--prefix
-        (transient-quit-one)))))
-
-(ert-deftest magnus-review-transient-rejects-a-stale-request-context ()
-  (let* ((author
-          (magnus-instance--create
-           :id "author" :name "quick-wren" :directory "/tmp/project"))
-         (review
-          (magnus-test-status--review-in-state
-           'running
-           :id "now-running" :author-instance-id "author"
-           :reviewer-name "keen-owl" :lifecycle 'open))
-         (cached (list :author author :root "/tmp/project" :task "Task"
-                       :review nil :action 'new))
-         (fresh (list :author author :root "/tmp/project" :task "Task"
-                      :review review :action 'running)))
-    (cl-letf (((symbol-function 'magnus-review-request-context)
-               (lambda (_author) fresh)))
-      (should-error
-       (magnus-transient--validated-review-request-context cached)
-       :type 'user-error)
-      (should (eq magnus-transient--review-request-context fresh)))
-    (setq magnus-transient--review-request-context nil)))
-
-(ert-deftest magnus-review-transient-rejects-same-action-checkpoint-aba ()
-  (let* ((author
-          (magnus-instance--create
-           :id "author" :name "quick-wren" :directory "/tmp/project"))
-         (first
-          (magnus-review-checkpoint-request--create
-           :number 1 :token "checkpoint-one" :requested-at 1 :events nil))
+(ert-deftest magnus-status-review-runtime-row-describes-candidate-not-completed-round ()
+  (let* ((completed
+          (magnus-test-status--completed-round 1 'comment 'read 12))
+         (candidate (magnus-test-status--candidate-round 2))
          (review
           (magnus-review--create
-           :id "waiting-review" :author-instance-id "author"
-           :lifecycle 'open
-           :checkpoint-requests (list first)))
-         cached fresh)
-    (cl-letf (((symbol-function 'magnus-review-git-root)
-               (lambda (_directory) "/tmp/project"))
-              ((symbol-function 'magnus-review-controller--task)
-               (lambda (_author _root) "Task"))
-              ((symbol-function
-                'magnus-review-controller--matching-open-review)
-               (lambda (_author _root _task) review)))
-      (setq cached (magnus-review-request-context author))
-      ;; Request one resolves and request two replaces it.  The broad action
-      ;; remains `waiting', so only the immutable operation key exposes ABA.
-      (setf (magnus-review-checkpoint-request-events first)
-            (list
-             (magnus-review-checkpoint-event--create
-              :kind 'round :round-number 1 :recorded-at 2))
-            (magnus-review-checkpoint-requests review)
-            (append
-             (magnus-review-checkpoint-requests review)
-             (list
-              (magnus-review-checkpoint-request--create
-               :number 2 :token "checkpoint-two"
-               :requested-at 3 :events nil))))
-      (setq fresh (magnus-review-request-context author)))
-    (should (eq (plist-get cached :action) 'waiting))
-    (should (eq (plist-get fresh :action) 'waiting))
-    (let ((magnus-transient--review-request-context cached))
-      (cl-letf (((symbol-function 'magnus-review-request-context)
-                 (lambda (_author) fresh)))
-        (should-error
-         (magnus-transient--validated-review-request-context cached)
-         :type 'user-error)
-        (should (eq magnus-transient--review-request-context fresh))))))
+           :id "runtime" :reviewer-name "keen-owl"
+           :reviewer-provider 'codex :effort 'high
+           :author-name "quick-wren" :lifecycle 'open
+           :created-at (float-time) :updated-at (float-time)
+           :metadata '((test_execution . failed))
+           :rounds (list completed)))
+         (magnus-review-runtime-state-function
+          #'magnus-test-status--runtime-state))
+    (with-temp-buffer
+      (cl-letf (((symbol-function
+                  'magnus-review-controller-candidate-round)
+                 (lambda (_review) candidate))
+                ((symbol-function 'magnus-review-controller-error)
+                 (lambda (_review)
+                   "provider exited 1\n  after its session disappeared")))
+        (magnus-status--insert-review review))
+      (let ((text (buffer-string)))
+        (should (string-match-p
+                 "round 2 · failed · provider exited 1 after its session disappeared"
+                 text))
+        (should-not (string-match-p "round 1" text))
+        (should-not (string-match-p "12 findings" text))))))
 
-(ert-deftest magnus-review-action-transient-rejects-resolved-checkpoint ()
-  (let* ((request
-          (magnus-review-checkpoint-request--create
-           :number 1 :token "checkpoint-one" :requested-at 1 :events nil))
+(ert-deftest magnus-status-scope-query-names-next-round-without-stale-findings ()
+  (let* ((completed
+          (magnus-test-status--completed-round 3 'approve 'read 4))
          (review
           (magnus-review--create
-           :id "review-a" :lifecycle 'open
-           :checkpoint-requests (list request)))
-         (magnus-transient--review-action-context
-          (magnus-transient--make-review-action-context review))
-         (transient-current-command 'magnus-review-actions-menu)
-         called)
-    (setf (magnus-review-checkpoint-request-events request)
-          (list
-           (magnus-review-checkpoint-event--create
-            :kind 'round :round-number 1 :recorded-at 2))
-          (magnus-review-rounds review)
-          (list
-           (magnus-review-round--create
-            :number 1 :head-oid "head-one"
-            :attempts (magnus-test-status--attempts-for-state 'complete))))
-    (cl-letf (((symbol-function 'magnus-review-get)
-               (lambda (_id) review))
-              ((symbol-function 'magnus-review-rereview)
-               (lambda (_review) (setq called t)))
-              ((symbol-function 'magnus-status-refresh) #'ignore))
-      (should-error (magnus-transient-review-rereview) :type 'user-error))
-    (should-not called)))
-
-(ert-deftest magnus-review-action-transient-rejects-checkpoint-aba ()
-  (let* ((first
-          (magnus-review-checkpoint-request--create
-           :number 1 :token "checkpoint-one" :requested-at 1 :events nil))
-         (review
-          (magnus-review--create
-           :id "review-a" :lifecycle 'open
-           :checkpoint-requests (list first)))
-         (magnus-transient--review-action-context
-          (magnus-transient--make-review-action-context review))
-         (transient-current-command 'magnus-review-actions-menu)
-         called)
-    (setf (magnus-review-checkpoint-request-events first)
-          (list
-           (magnus-review-checkpoint-event--create
-            :kind 'round :round-number 1 :recorded-at 2))
-          (magnus-review-checkpoint-requests review)
-          (append
-           (magnus-review-checkpoint-requests review)
-           (list
-            (magnus-review-checkpoint-request--create
-             :number 2 :token "checkpoint-two"
-             :requested-at 3 :events nil))))
-    (cl-letf (((symbol-function 'magnus-review-get)
-               (lambda (_id) review))
-              ((symbol-function 'magnus-review-rereview)
-               (lambda (_review) (setq called t)))
-              ((symbol-function 'magnus-status-refresh) #'ignore))
-      (should-error (magnus-transient-review-rereview) :type 'user-error))
-    (should-not called)))
-
-(ert-deftest magnus-review-action-transient-does-not-retarget-at-point ()
-  (let* ((old-round
-          (magnus-review-round--create
-           :number 1 :head-oid "head-a"
-           :attempts (magnus-test-status--attempts-for-state 'complete)))
-         (old-a
-          (magnus-review--create
-           :id "review-a" :lifecycle 'open :rounds (list old-round)))
-         (fresh-round
-          (magnus-review-round--create
-           :number 1 :head-oid "head-a"
-           :attempts (magnus-test-status--attempts-for-state 'complete)))
-         (fresh-a
-          (magnus-review--create
-           :id "review-a" :lifecycle 'open :rounds (list fresh-round)))
-         (review-b
-          (magnus-review--create
-           :id "review-b" :lifecycle 'open
-           :rounds
-           (list
-            (magnus-review-round--create
-             :number 1 :head-oid "head-b"
-             :attempts
-             (magnus-test-status--attempts-for-state 'complete)))))
-         (magnus-transient--review-action-context
-          (magnus-transient--make-review-action-context old-a))
-         (transient-current-command 'magnus-review-actions-menu)
-         targeted)
-    (cl-letf (((symbol-function 'magnus-review-get)
-               (lambda (id) (and (string= id "review-a") fresh-a)))
-              ((symbol-function 'magnus-status--get-review-at-point)
-               (lambda () review-b))
-              ((symbol-function 'magnus-review-rereview)
-               (lambda (review) (setq targeted review)))
-              ((symbol-function 'magnus-status-refresh) #'ignore))
-      (magnus-transient-review-rereview))
-    (should (eq targeted fresh-a))
-    (should-not (eq targeted review-b))))
-
-(ert-deftest magnus-review-action-transient-resolves-fresh-historical-round ()
-  (let* ((old-round
-          (magnus-review-round--create
-           :number 1 :head-oid "head-a"
-           :attempts (magnus-test-status--attempts-for-state 'complete)))
-         (old-review
-          (magnus-review--create
-           :id "review-a" :lifecycle 'open :rounds (list old-round)))
-         (fresh-round
-          (magnus-review-round--create
-           :number 1 :head-oid "head-a"
-           :attempts (magnus-test-status--attempts-for-state 'complete)))
-         (fresh-review
-          (magnus-review--create
-           :id "review-a" :lifecycle 'open :rounds (list fresh-round)))
-         (magnus-transient--review-action-context
-          (magnus-transient--make-review-action-context old-review old-round))
-         (transient-current-command 'magnus-review-actions-menu)
-         delivered)
-    (cl-letf (((symbol-function 'magnus-review-get)
-               (lambda (_id) fresh-review))
-              ((symbol-function 'magnus-review-retry-delivery)
-               (lambda (review round)
-                 (setq delivered (list review round))))
-              ((symbol-function 'magnus-status-refresh) #'ignore))
-      (magnus-transient-review-delivery))
-    (should (equal delivered (list fresh-review fresh-round)))))
+           :id "asking" :reviewer-name "keen-owl"
+           :reviewer-provider 'codex :effort 'high
+           :author-name "quick-wren" :lifecycle 'open
+           :created-at (float-time) :updated-at (float-time)
+           :metadata '((test_execution . asking-scope))
+           :rounds (list completed)))
+         (magnus-review-runtime-state-function
+          #'magnus-test-status--runtime-state))
+    (with-temp-buffer
+      (cl-letf (((symbol-function
+                  'magnus-review-controller-candidate-round)
+                 (lambda (_review) nil)))
+        (magnus-status--insert-review review))
+      (let ((text (buffer-string)))
+        (should (string-match-p "round 4 · asking author" text))
+        (should-not (string-match-p "4 findings" text))))))
 
 (ert-deftest magnus-status-animates-only-active-review-execution ()
   (let* ((instance
@@ -743,7 +580,7 @@ ARGUMENTS are passed to `magnus-review--create'."
            :id "author" :name "quick-wren" :directory "/tmp/project"
            :created-at (current-time) :status 'running))
          (magnus-status-review-animation-interval 0.4))
-    (dolist (state '(starting running))
+    (dolist (state '(asking-scope queued running))
       (let* ((review
               (magnus-test-status--review-in-state
                state
@@ -753,7 +590,7 @@ ARGUMENTS are passed to `magnus-review--create'."
                         instance (list review))))
         (should (string-match-p (regexp-quote "[review |]") (car rendered)))
         (should (number-or-marker-p (cadr rendered)))))
-    (dolist (state '(waiting-for-checkpoint queued complete failed interrupted))
+    (dolist (state '(complete failed interrupted idle))
       (let* ((review
               (magnus-test-status--review-in-state
                state
@@ -797,7 +634,7 @@ ARGUMENTS are passed to `magnus-review--create'."
             :id "first" :author-instance-id "author"
             :reviewer-name "keen-owl" :lifecycle 'open)
            (magnus-test-status--review-in-state
-            'starting
+            'queued
             :id "second" :author-instance-id "author"
             :reviewer-name "swift-hare" :lifecycle 'open))))
     (let* ((magnus-status-review-animation-interval 0.4)

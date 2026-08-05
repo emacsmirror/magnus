@@ -148,17 +148,11 @@
          (second (magnus-instance--create
                   :id "second" :name "keen-owl" :directory "/project/"))
          (third (magnus-instance--create
-                 :id "third" :name "swift-hare" :directory "/other"))
-         calls)
+                 :id "third" :name "swift-hare" :directory "/other")))
     (cl-letf (((symbol-function 'magnus-instances-active-list)
                (lambda () (list first second third)))
               ((symbol-function 'magnus-coord-watched-directories)
-               (lambda () '("/project/" "/review-only/")))
-              ((symbol-function 'magnus-coord-review-retry-diagnostics)
-               (lambda (directory)
-                 (push directory calls)
-                 '(:pending-review-retry-count 0
-                   :exhausted-review-count 0))))
+               (lambda () '("/project/" "/watch-only/"))))
       (let ((checks (magnus-doctor--coordination-checks)))
         (should (= (length checks) 3))
         (should (= (cl-count 'ok checks
@@ -166,93 +160,28 @@
                    2))
         (should (= (cl-count 'warning checks
                              :key #'magnus-doctor-check-severity)
-                   1))))
-    (should (equal (sort calls #'string<)
-                   '("/other/" "/project/" "/review-only/")))))
+                   1))))))
 
-(ert-deftest magnus-doctor-finds-pending-review-without-a-watcher ()
-  "A missing watcher cannot hide the pending review that needs diagnosis."
-  (let* ((directory (make-temp-file "magnus-doctor-pending-review-" t))
-         (canonical (file-name-as-directory (file-truename directory)))
-         (review 'pending-review))
-    (unwind-protect
-        (cl-letf (((symbol-function 'magnus-instances-active-list)
-                   (lambda () nil))
-                  ((symbol-function 'magnus-review-list)
-                   (lambda () (list review)))
-                  ((symbol-function 'magnus-review-lifecycle)
-                   (lambda (candidate)
-                     (and (eq candidate review) 'open)))
-                  ((symbol-function 'magnus-review-pending-checkpoint-request)
-                   (lambda (candidate)
-                     (and (eq candidate review) 'pending-request)))
-                  ((symbol-function 'magnus-review-project-root)
-                   (lambda (candidate)
-                     (and (eq candidate review) directory)))
-                  ((symbol-function 'magnus-coord-watched-directories)
-                   (lambda () nil))
-                  ((symbol-function 'magnus-coord-review-retry-diagnostics)
-                   (lambda (_root)
-                     '(:pending-review-retry-count 0
-                       :exhausted-review-count 0))))
-          (let ((checks (magnus-doctor--coordination-checks)))
-            (should (= (length checks) 1))
-            (let ((check (car checks)))
-              (should (eq (magnus-doctor-check-severity check) 'warning))
-              (should (string-match-p "watcher is idle"
-                                      (magnus-doctor-check-summary check)))
-              (should (string-match-p (regexp-quote canonical)
-                                      (magnus-doctor-check-summary check))))))
-      (delete-directory directory t))))
+(ert-deftest magnus-doctor-coordination-empty-without-owned-projects ()
+  "Only live agent and watcher ownership creates coordination diagnostics."
+  (cl-letf (((symbol-function 'magnus-instances-active-list) (lambda () nil))
+            ((symbol-function 'magnus-coord-watched-directories)
+             (lambda () nil)))
+    (should-not (magnus-doctor--coordination-checks))))
 
-(ert-deftest magnus-doctor-classifies-watcher-and-retry-diagnostics ()
+(ert-deftest magnus-doctor-classifies-watcher-state ()
   (cl-letf (((symbol-function 'magnus-coord-watched-directories)
-             (lambda () '("/project/")))
-            ((symbol-function 'magnus-coord-review-retry-diagnostics)
-             (lambda (_directory)
-               '(:pending-review-retry-count 0
-                 :exhausted-review-count 0))))
+             (lambda () '("/project/"))))
     (let ((check (magnus-doctor--coordination-check "/project/")))
       (should (eq (magnus-doctor-check-severity check) 'ok))
-      (should (string-match-p "No review checkpoint retries"
-                              (magnus-doctor-check-detail check)))))
+      (should (string-match-p "watcher is active"
+                              (magnus-doctor-check-summary check)))
+      (should-not (magnus-doctor-check-detail check))))
   (cl-letf (((symbol-function 'magnus-coord-watched-directories)
-             (lambda () '("/project/")))
-            ((symbol-function 'magnus-coord-review-retry-diagnostics)
-             (lambda (_directory)
-               '(:pending-review-retry-count 2
-                 :exhausted-review-count 0))))
-    (let ((check (magnus-doctor--coordination-check "/project/")))
-      (should (eq (magnus-doctor-check-severity check) 'warning))
-      (should (string-match-p "2 review checkpoint retries pending"
-                              (magnus-doctor-check-detail check)))))
-  (cl-letf (((symbol-function 'magnus-coord-watched-directories)
-             (lambda () nil))
-            ((symbol-function 'magnus-coord-review-retry-diagnostics)
-             (lambda (_directory)
-               '(:pending-review-retry-count 0
-                 :exhausted-review-count 0))))
+             (lambda () nil)))
     (let ((check (magnus-doctor--coordination-check "/project/")))
       (should (eq (magnus-doctor-check-severity check) 'warning))
       (should (string-match-p "No watcher"
-                              (magnus-doctor-check-detail check))))))
-
-(ert-deftest magnus-doctor-exposes-exhausted-review-evidence ()
-  (cl-letf (((symbol-function 'magnus-coord-watched-directories)
-             (lambda () '("/project/")))
-            ((symbol-function 'magnus-coord-review-retry-diagnostics)
-             (lambda (_directory)
-               '(:pending-review-retry-count 0
-                 :exhausted-review-count 1
-                 :exhausted-review-marker-hashes ("marker-1")
-                 :exhausted-review-details
-                 ((:marker-hash "marker-1"
-                   :last-error "manifest unreadable"))))))
-    (let ((check (magnus-doctor--coordination-check "/project/")))
-      (should (eq (magnus-doctor-check-severity check) 'error))
-      (should (string-match-p "manifest unreadable"
-                              (magnus-doctor-check-detail check)))
-      (should (string-match-p "press g"
                               (magnus-doctor-check-detail check))))))
 
 (provide 'magnus-doctor-tests)

@@ -20,10 +20,7 @@
 (require 'subr-x)
 (require 'magnus-instances)
 
-(declare-function magnus-coord-review-retry-diagnostics
-                  "magnus-coord" (directory))
 (declare-function magnus-coord-watched-directories "magnus-coord" ())
-(declare-function magnus-coord-pending-review-directories "magnus-coord" ())
 
 (defvar magnus-state-file)
 (defvar magnus-review-directory-root)
@@ -152,7 +149,7 @@ its parent is the location Magnus needs to create or replace a file in."
    (magnus-instances-list)))
 
 (defun magnus-doctor--active-project-directories ()
-  "Return roots owned by active agents, pending reviews, or live watchers."
+  "Return roots owned by active agents or live watchers."
   (let (directories)
     (cl-labels
         ((add-directory
@@ -163,79 +160,29 @@ its parent is the location Magnus needs to create or replace a file in."
                         directories :test #'equal))))
       (dolist (instance (magnus-instances-active-list))
         (add-directory (magnus-instance-directory instance)))
-      ;; Discover pending reviews independently of their watcher. Otherwise a
-      ;; failed watcher startup erases the very project Doctor must diagnose.
-      (when (fboundp 'magnus-coord-pending-review-directories)
-        (dolist (directory (magnus-coord-pending-review-directories))
-          (add-directory directory)))
       (when (fboundp 'magnus-coord-watched-directories)
         (dolist (directory (magnus-coord-watched-directories))
           (add-directory directory))))
     (nreverse directories)))
 
-(defun magnus-doctor--coordination-detail (diagnostics)
-  "Summarize review checkpoint retry DIAGNOSTICS."
-  (let (parts)
-    (let ((pending (or (plist-get diagnostics :pending-review-retry-count) 0))
-          (exhausted (or (plist-get diagnostics :exhausted-review-count) 0)))
-      (when (> pending 0)
-        (push (format "%d review checkpoint retr%s pending"
-                      pending (if (= pending 1) "y" "ies"))
-              parts))
-      (when (> exhausted 0)
-        (let* ((details (plist-get diagnostics :exhausted-review-details))
-               (last-error (plist-get (car details) :last-error)))
-          (push
-           (concat
-            (format "%d review checkpoint retr%s exhausted"
-                    exhausted (if (= exhausted 1) "y" "ies"))
-            (when last-error (format " (%s)" last-error))
-            "; press g in *magnus* to re-arm")
-           parts))))
-    (if parts
-        (string-join (nreverse parts) "; ")
-      "No review checkpoint retries are pending.")))
-
 (defun magnus-doctor--coordination-check (directory)
   "Return a read-only coordination watcher check for DIRECTORY."
   (condition-case error-data
-      (let* ((retry
-              (and (fboundp 'magnus-coord-review-retry-diagnostics)
-                   (magnus-coord-review-retry-diagnostics directory)))
-             (diagnostics (or retry '()))
-             (watched
+      (let* ((watched
               (and (fboundp 'magnus-coord-watched-directories)
                    (member (directory-file-name directory)
                            (mapcar #'directory-file-name
                                    (magnus-coord-watched-directories)))))
-             (pending
-              (or (plist-get diagnostics :pending-review-retry-count) 0))
-             (exhausted
-              (or (plist-get diagnostics :exhausted-review-count) 0))
              (label (abbreviate-file-name directory))
              (id (intern (concat "coordination-"
                                  (secure-hash 'sha1 directory)))))
-        (cond
-         ((> exhausted 0)
-          (magnus-doctor--check
-           id 'error
-           (format "Coordination checkpoint retries exhausted for %s" label)
-           (magnus-doctor--coordination-detail diagnostics)))
-         ((> pending 0)
-          (magnus-doctor--check
-           id 'warning
-           (format "Coordination checkpoint retries pending for %s" label)
-           (magnus-doctor--coordination-detail diagnostics)))
-         (watched
-          (magnus-doctor--check
-           id 'ok (format "Coordination watcher is active for %s" label)
-           (magnus-doctor--coordination-detail diagnostics)))
-         (t
+        (if watched
+            (magnus-doctor--check
+             id 'ok (format "Coordination watcher is active for %s" label))
           (magnus-doctor--check
            id 'warning (format "Coordination watcher is idle for %s" label)
-           (concat "No watcher is serving this active agent or review. "
-                   "Magnus Doctor does not start one because diagnostics "
-                   "are read-only.")))))
+           (concat "No watcher is serving this active agent. Magnus Doctor "
+                   "does not start one because diagnostics are read-only."))))
     (error
      (magnus-doctor--check
       (intern (concat "coordination-" (secure-hash 'sha1 directory)))
@@ -245,7 +192,7 @@ its parent is the location Magnus needs to create or replace a file in."
       (error-message-string error-data)))))
 
 (defun magnus-doctor--coordination-checks ()
-  "Return read-only diagnostics for agent- and review-owned projects."
+  "Return read-only diagnostics for agent-owned or watched projects."
   (mapcar #'magnus-doctor--coordination-check
           (magnus-doctor--active-project-directories)))
 

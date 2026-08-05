@@ -3,7 +3,6 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'magnus-coord)
-(require 'magnus-review)
 
 (ert-deftest magnus-coord-integration-poll-reads-once-per-change ()
   "One Markdown revision is read once and shared by every consumer."
@@ -32,13 +31,10 @@
                        (push (list 'dms root content) consumed)))
                     ((symbol-function 'magnus-coord--check-new-summons)
                      (lambda (root content)
-                       (push (list 'summons root content) consumed)))
-                    ((symbol-function 'magnus-coord--check-new-review-ready)
-                     (lambda (root content)
-                       (push (list 'reviews root content) consumed))))
+                       (push (list 'summons root content) consumed))))
             (magnus-coord--poll-all)
             (should (= reads 1))
-            (should (= (length consumed) 4))
+            (should (= (length consumed) 3))
             (dolist (entry consumed)
               (should (equal (nth 1 entry) directory))
               (should (equal (nth 2 entry) "one shared Markdown read")))
@@ -86,70 +82,6 @@
                    '("Wise Deer" "sender" "check this")))
     (should (equal (car (magnus-coord--extract-summons content))
                    '("Wise Deer" "sender" "review UI")))))
-
-(ert-deftest magnus-coord-integration-review-evidence-waits-for-a-handler ()
-  "A temporarily detached review controller cannot consume checkpoint data."
-  (let ((magnus-coord-review-ready-hook nil))
-    (should-not
-     (magnus-coord--dispatch-review-ready
-      default-directory '(:request-id "review")))))
-
-(ert-deftest magnus-coord-integration-refresh-acquires-orphan-review-once ()
-  "Manual refresh consumes an unwatched review marker exactly once."
-  (let* ((directory (make-temp-file "magnus-coord-orphan-review-" t))
-         (canonical (magnus-coord--normalized-directory directory))
-         (file (magnus-coord-file-path directory))
-         (review 'pending-review)
-         (pending t)
-         (base "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-         (head "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-         (marker
-          (format (concat "[REVIEW-READY request=orphan-review "
-                          "checkpoint=orphan-token base=%s head=%s]")
-                  base head))
-         (magnus-instances nil)
-         (magnus-coord--watched-dirs nil)
-         (magnus-coord--file-mtimes nil)
-         (magnus-coord--states nil)
-         (magnus-coord--processed-mentions nil)
-         (magnus-coord--processed-dms nil)
-         (magnus-coord--processed-summons nil)
-         (magnus-coord--processed-review-ready nil)
-         (magnus-coord--poll-timer nil)
-         calls)
-    (unwind-protect
-        (progn
-          (with-temp-file file
-            (insert "# Agent Coordination\n\n## Log\n\n" marker "\n"))
-          (let ((magnus-coord-review-ready-hook
-                 (list
-                  (lambda (root parsed-marker)
-                    (push (list root parsed-marker) calls)
-                    ;; Resolving the sole marker relinquishes the final owner
-                    ;; while watcher acquisition is still on the stack.
-                    (setq pending nil)))))
-            (cl-letf (((symbol-function 'magnus-review-list)
-                       (lambda () (list review)))
-                      ((symbol-function 'magnus-review-lifecycle)
-                       (lambda (_review) 'open))
-                      ((symbol-function 'magnus-review-project-root)
-                       (lambda (_review) directory))
-                      ((symbol-function
-                        'magnus-review-pending-checkpoint-request)
-                       (lambda (_review) (and pending 'pending-request)))
-                      ((symbol-function 'magnus-coord--start-poll-timer)
-                       #'ignore))
-              (magnus-coord-refresh-all)))
-          (should (= (length calls) 1))
-          (should (equal (caar calls) canonical))
-          (should
-           (equal (plist-get (cadar calls) :request-id) "orphan-review"))
-          (should-not magnus-coord--watched-dirs)
-          (should-not (assoc canonical magnus-coord--file-mtimes))
-          (should-not (assoc canonical magnus-coord--states))
-          (should-not
-           (assoc canonical magnus-coord--processed-review-ready)))
-      (delete-directory directory t))))
 
 (ert-deftest magnus-coord-integration-registration-and-unregistration-log ()
   "Agent lifecycle is represented in the shared Markdown file."
@@ -222,31 +154,6 @@
              (equal names '("running-agent" "suspended-agent")))))
       (delete-directory directory t))))
 
-(ert-deftest magnus-coord-integration-pending-review-retains-last-watcher ()
-  "Archiving the last agent cannot strand an unresolved review checkpoint."
-  (let* ((directory (magnus-coord--normalized-directory default-directory))
-         (instance (magnus-instances-create directory "author" 'codex))
-         (magnus-instances (list instance))
-         (magnus-coord--watched-dirs (list directory))
-         pending
-         stopped)
-    (setf (magnus-instance-status instance) 'purged)
-    (cl-letf (((symbol-function 'magnus-coord--pending-review-p)
-               (lambda (_root) pending))
-              ((symbol-function 'magnus-coord-stop-watching)
-               (lambda (root) (setq stopped root)))
-              ((symbol-function 'magnus-coord-clear-agent) #'ignore)
-              ((symbol-function 'magnus-coord-add-log) #'ignore)
-              ((symbol-function 'magnus-coord-refresh) #'ignore)
-              ((symbol-function 'magnus-coord-generate-retro) #'ignore)
-              ((symbol-function 'magnus-coord-mark-session-end) #'ignore))
-      (setq pending t)
-      (magnus-coord-unregister-agent directory instance)
-      (should-not stopped)
-      (setq pending nil)
-      (magnus-coord--maybe-stop-watching directory)
-      (should (equal stopped directory)))))
-
 (ert-deftest magnus-coord-integration-undelivered-nudge-is-durable-markdown ()
   "A failed nudge is discoverable after the transient echo-area message."
   (let* ((directory (make-temp-file "magnus-coord-undelivered-" t))
@@ -302,8 +209,6 @@
          (magnus-coord--poll-timer nil)
          (magnus-coord--file-mtimes nil)
          (magnus-coord--states nil)
-         (magnus-coord--review-ready-retries
-          (make-hash-table :test #'equal))
          started cancelled)
     (unwind-protect
         (cl-letf (((symbol-function 'run-with-timer)
@@ -324,7 +229,7 @@
       (delete-directory directory t))))
 
 (ert-deftest magnus-coord-integration-restored-stopped-agent-upgrades-guidance ()
-  "Watcher recovery replaces stale event guidance for a stopped instance."
+  "Watcher recovery replaces stale guidance for a stopped instance."
   (let* ((directory (make-temp-file "magnus-coord-stale-guidance-" t))
          (canonical (magnus-coord--normalized-directory directory))
          (instructions (magnus-coord-instructions-path directory))
@@ -333,22 +238,19 @@
            :id "restored-stopped" :name "restored-agent"
            :directory directory :status 'stopped))
          (magnus-instances (list instance))
-         (magnus-reviews nil)
          (magnus-coord--watched-dirs nil)
          (magnus-coord--file-mtimes nil)
          (magnus-coord--states nil)
          (magnus-coord--processed-mentions nil)
          (magnus-coord--processed-dms nil)
          (magnus-coord--processed-summons nil)
-         (magnus-coord--processed-review-ready nil)
          (magnus-coord--poll-timer nil))
     (unwind-protect
         (progn
           (make-directory (file-name-directory instructions) t)
           (with-temp-file instructions
-            (insert "Publish immutable events under .magnus-coord/writers/.\n"
-                    "Read .magnus-coord/current.md.\n"
-                    "<!-- magnus-instructions-version: 4 -->\n"))
+            (insert "Obsolete Magnus coordination guidance.\n"
+                    "<!-- magnus-instructions-version: 3 -->\n"))
           (cl-letf (((symbol-function 'magnus-coord--start-poll-timer)
                      #'ignore))
             (magnus-coord-ensure-watchers))
@@ -356,39 +258,12 @@
                  (with-temp-buffer
                    (insert-file-contents instructions)
                    (buffer-string))))
-            (should (string-match-p "magnus-instructions-version: 8" content))
+            (should (string-match-p "magnus-instructions-version: 9" content))
             (should (string-match-p "shared \"\\.magnus-coord\\.md\" file"
                                     content))
-            (should-not (string-match-p "immutable events" content))
-            (should-not (string-match-p "\\.magnus-coord/current\\.md"
-                                        content))
-            (should-not (string-match-p "\\.magnus-coord/writers/" content)))
+            (should-not (string-match-p "Obsolete Magnus" content)))
           (should (equal magnus-coord--watched-dirs (list canonical))))
       (delete-directory directory t))))
-
-(ert-deftest magnus-coord-integration-review-retries-are-diagnosable ()
-  "Markdown checkpoint exhaustion is visible and manually re-armable."
-  (let* ((directory (magnus-coord--normalized-directory default-directory))
-         (magnus-coord--review-ready-retries
-          (make-hash-table :test #'equal))
-         (magnus-coord-review-ready-retry-count 0)
-         (magnus-coord--last-review-handler-error "manifest unreadable"))
-    (cl-letf (((symbol-function 'message) #'ignore))
-      (magnus-coord--schedule-review-ready-retry directory "marker-hash"))
-    (let ((diagnostics (magnus-coord-review-retry-diagnostics directory)))
-      (should (= (plist-get diagnostics :exhausted-review-count) 1))
-      (should
-       (equal (plist-get diagnostics :exhausted-review-marker-hashes)
-              '("marker-hash")))
-      (should
-       (equal (plist-get (car (plist-get diagnostics
-                                          :exhausted-review-details))
-                         :last-error)
-              "manifest unreadable")))
-    (should
-     (equal (magnus-coord--reset-exhausted-review-retries directory)
-            '("marker-hash")))
-    (should (= (hash-table-count magnus-coord--review-ready-retries) 0))))
 
 (ert-deftest magnus-coord-integration-agent-log-has-chronological-contract ()
   "Agent-written newest-first Markdown is normalized for presentation."
@@ -438,7 +313,7 @@
           (should
            (string-match-p (regexp-quote (prin1-to-string instructions-file))
                            content))
-          (should (string-match-p "magnus-instructions-version: 8" content))
+          (should (string-match-p "magnus-instructions-version: 9" content))
           (should-not (string-match-p (regexp-quote ".magnus-coord.md")
                                       content))
           (should-not
@@ -446,31 +321,19 @@
             (regexp-quote ".claude/magnus-instructions.md") content)))
       (delete-directory directory t))))
 
-(ert-deftest magnus-coord-integration-trim-preserves-review-checkpoints ()
-  "Log bounds remove only old ordinary entries, never review evidence."
+(ert-deftest magnus-coord-integration-trim-bounds-ordinary-log-entries ()
+  "Log bounds retain the newest ordinary coordination entries."
   (let* ((directory (make-temp-file "magnus-coord-trim-" t))
          (file (expand-file-name magnus-coord-file directory))
-         (magnus-coord-log-max-entries 2)
-         (bare
-          (concat
-           "[REVIEW-READY request=bare checkpoint=one "
-           "base=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
-           "head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb]"))
-         (timestamped
-          (concat
-           "[12:04] agent: [REVIEW-READY request=timestamped checkpoint=two "
-           "base=cccccccccccccccccccccccccccccccccccccccc "
-           "head=dddddddddddddddddddddddddddddddddddddddd]")))
+         (magnus-coord-log-max-entries 2))
     (unwind-protect
         (progn
           (with-temp-file file
             (insert "# Agent Coordination\n\n## Log\n\n"
                     "[12:05] agent: ordinary-newest\n\n"
-                    bare "\n\n"
-                    timestamped "\n\n"
-                    "[12:03] agent: ordinary-second\n\n"
-                    "[12:02] agent: ordinary-old\n\n"
-                    "[12:01] agent: ordinary-oldest\n\n"))
+                    "[12:04] agent: ordinary-second\n\n"
+                    "[12:03] agent: ordinary-old\n\n"
+                    "[12:02] agent: ordinary-oldest\n\n"))
           (magnus-coord-trim-log directory)
           (let ((content
                  (with-temp-buffer
@@ -478,9 +341,7 @@
                    (buffer-string))))
             (should (string-match-p "ordinary-newest" content))
             (should (string-match-p "ordinary-second" content))
-            (should-not (string-match-p "ordinary-old\\(?:est\\)?" content))
-            (should (string-match-p (regexp-quote bare) content))
-            (should (string-match-p (regexp-quote timestamped) content))))
+            (should-not (string-match-p "ordinary-old\\(?:est\\)?" content))))
       (delete-directory directory t))))
 
 (ert-deftest magnus-coord-integration-reminders-run-housekeeping-while-idle ()

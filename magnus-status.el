@@ -10,7 +10,7 @@
 ;;; Commentary:
 
 ;; This module provides the main status buffer showing interactive agents and
-;; durable reviews with magit-style keybindings.
+;; completed review lineages with magit-style keybindings.
 
 ;;; Code:
 
@@ -30,6 +30,10 @@
 (declare-function magnus-review-request-dispatch "magnus-transient")
 (declare-function magnus-review-actions "magnus-transient")
 (declare-function magnus-review-ui-open "magnus-review-ui")
+(declare-function magnus-review-controller-candidate-round
+                  "magnus-review-controller" (review))
+(declare-function magnus-review-controller-error
+                  "magnus-review-controller" (review))
 (declare-function magnus-coord-agent-busy-p "magnus-coord")
 (declare-function magnus-coord--neglected-p "magnus-coord")
 (declare-function magnus-coord-has-state-p "magnus-coord" (directory))
@@ -480,7 +484,7 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
   (insert (propertize "  Press 'c' to create one.\n" 'face 'magnus-status-empty-hint)))
 
 (defun magnus-status--insert-reviews ()
-  "Insert durable review work after the instance list."
+  "Insert review lineages after the instance list."
   (let* ((all (magnus-review-list))
          (reviews
           (cl-remove-if
@@ -518,7 +522,10 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
      "-" " "
      (symbol-name (if (eq lifecycle 'archived)
                       'archived
-                    (or verdict execution 'pending))))))
+                    (or verdict
+                        (and (eq execution 'asking-scope) 'asking-author)
+                        execution
+                        'pending))))))
 
 (defun magnus-status--review-state-face (review round)
   "Return the status face for REVIEW and its latest ROUND."
@@ -532,13 +539,57 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
      ((eq verdict 'changes-requested) 'magnus-status-suspended)
      ((memq execution '(failed interrupted)) 'magnus-status-errored)
      ((eq execution 'complete) 'magnus-status-finished)
-     ((memq execution '(starting running)) 'magnus-status-running)
+     ((memq execution '(asking-scope queued running))
+      'magnus-status-running)
      (t 'magnus-status-instance-dir))))
 
+(defun magnus-status--review-runtime-p (execution)
+  "Return non-nil when EXECUTION describes disposable review work."
+  (memq execution
+        '(asking-scope queued running failed interrupted)))
+
+(defun magnus-status--review-runtime-round (review execution)
+  "Return REVIEW's prepared candidate round while EXECUTION is disposable."
+  (when (and (magnus-status--review-runtime-p execution)
+             (fboundp 'magnus-review-controller-candidate-round))
+    (magnus-review-controller-candidate-round review)))
+
+(defun magnus-status--review-runtime-round-number
+    (execution candidate completed)
+  "Return the round number STATUS should show.
+EXECUTION selects disposable versus completed work.  CANDIDATE is the prepared
+ephemeral round and COMPLETED is the latest successful round."
+  (cond
+   (candidate (magnus-review-round-number candidate))
+   ((magnus-status--review-runtime-p execution)
+    ;; Scope discovery precedes candidate preparation, but it is already work
+    ;; on the next round.  Name that round without pretending a candidate has
+    ;; been frozen yet.
+    (1+ (if completed (magnus-review-round-number completed) 0)))
+   (completed (magnus-review-round-number completed))))
+
+(defun magnus-status--review-error-summary (review execution)
+  "Return REVIEW's bounded one-line diagnostic for failed EXECUTION."
+  (when (and (eq execution 'failed)
+             (fboundp 'magnus-review-controller-error))
+    (when-let* ((value (magnus-review-controller-error review))
+                (one-line
+                 (string-trim
+                  (replace-regexp-in-string
+                   "[[:space:]]+" " " (format "%s" value)))))
+      (unless (string-empty-p one-line)
+        (if (> (length one-line) 96)
+            (concat (substring one-line 0 93) "...")
+          one-line)))))
+
 (defun magnus-status--insert-review (review)
-  "Insert a two-line status row for durable REVIEW."
+  "Insert a two-line status row for REVIEW's lineage and runtime state."
   (let* ((start (point))
-         (round (magnus-review-latest-round review))
+         (completed-round (magnus-review-latest-round review))
+         (execution (magnus-review-execution review))
+         (runtime-p (magnus-status--review-runtime-p execution))
+         (candidate-round
+          (magnus-status--review-runtime-round review execution))
          (unread (eq (magnus-review-read-state review) 'unread))
          (provider (or (magnus-review-reviewer-provider review) 'unknown))
          (effort (or (magnus-review-effort review) 'default))
@@ -546,18 +597,22 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
           (replace-regexp-in-string
            "[\n\r]+" " "
            (string-trim (or (magnus-review-task review) ""))))
-         (round-number (and round (magnus-review-round-number round)))
-         ;; Aggregate state intentionally keeps an older undelivered round
-         ;; visible after a newer round succeeds.
-         (delivery (magnus-review-delivery-state review))
+         (round-number
+          (magnus-status--review-runtime-round-number
+           execution candidate-round completed-round))
          (finding-count
-          (and round
+          (and (not runtime-p)
+               completed-round
                (alist-get 'finding_count
-                          (magnus-review-round-metadata round))))
-         (age (magnus-status--format-age
-               (or (magnus-review-updated-at review)
-                   (magnus-review-created-at review))))
-         (state (magnus-status--review-state-label review round)))
+                          (magnus-review-round-metadata completed-round))))
+         (diagnostic
+          (magnus-status--review-error-summary review execution))
+         (age
+          (unless runtime-p
+            (magnus-status--format-age
+             (or (magnus-review-updated-at review)
+                 (magnus-review-created-at review)))))
+         (state (magnus-status--review-state-label review completed-round)))
     (insert "  ")
     (insert (propertize (if unread "●" "·")
                         'face (if unread
@@ -583,32 +638,31 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
     (when round-number
       (insert (format "round %d · " round-number)))
     (insert (propertize state
-                        'face (magnus-status--review-state-face review round)))
+                        'face (magnus-status--review-state-face
+                               review completed-round)))
     (when (numberp finding-count)
       (insert (format " · %d finding%s" finding-count
                       (if (= finding-count 1) "" "s"))))
-    (when (memq delivery '(pending failed))
+    (when diagnostic
       (insert " · ")
-      (insert
-       (propertize (format "delivery %s" delivery)
-                   'face (if (eq delivery 'failed)
-                             'magnus-status-errored
-                           'magnus-status-suspended))))
-    (insert " · ")
-    (insert (propertize age 'face 'magnus-status-instance-dir))
+      (insert (propertize diagnostic 'face 'magnus-status-errored)))
+    (when age
+      (insert " · ")
+      (insert (propertize age 'face 'magnus-status-instance-dir)))
     (insert "\n")
     (put-text-property start (point)
                        'magnus-review-id (magnus-review-id review))))
 
 (defun magnus-status--active-reviews-for-instance (instance)
-  "Return active durable reviews currently executing for INSTANCE."
+  "Return review workflows currently active for INSTANCE."
   (let ((instance-id (magnus-instance-id instance)))
     (cl-remove-if-not
      (lambda (review)
        (and (eq (magnus-review-lifecycle review) 'open)
             (string= (or (magnus-review-author-instance-id review) "")
                      instance-id)
-            (memq (magnus-review-execution review) '(starting running))))
+            (memq (magnus-review-execution review)
+                  '(asking-scope queued running))))
      (magnus-review-list))))
 
 (defun magnus-status--insert-active-review-badge (reviews)
@@ -620,9 +674,17 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
                   reviews))
          (help
           (if (= count 1)
-              (format "%s is reviewing this agent's committed work"
-                      (car reviewers))
-            (format "%s are reviewing this agent's committed work"
+              (pcase (magnus-review-execution (car reviews))
+                ('asking-scope
+                 (format
+                  "Magnus is asking this agent which commits %s should review"
+                  (car reviewers)))
+                ('queued
+                 (format "%s is queued to review this agent's committed work"
+                         (car reviewers)))
+                (_ (format "%s is reviewing this agent's committed work"
+                           (car reviewers))))
+            (format "%s have review work pending for this agent"
                     (string-join reviewers ", "))))
          (start (point)))
     (insert " [")
@@ -824,7 +886,7 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
     (magnus-instances-get id)))
 
 (defun magnus-status--get-review-at-point ()
-  "Get the durable review at point."
+  "Get the review lineage at point."
   (when-let ((id (get-text-property (point) 'magnus-review-id)))
     (magnus-review-get id)))
 
@@ -838,11 +900,7 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
 
 (defun magnus-status--review-round-to-open (review)
   "Return REVIEW's newest unread, or newest completed, round."
-  (let* ((completed
-          (cl-remove-if-not
-           (lambda (round)
-             (eq (magnus-review-round-execution round) 'complete))
-           (magnus-review-rounds review)))
+  (let* ((completed (magnus-review-rounds review))
          (unread
           (cl-remove-if-not
            (lambda (round)
@@ -907,7 +965,7 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
 ;;; Commands
 
 (defun magnus-status-visit ()
-  "Visit the instance or durable review at point."
+  "Visit the instance or review lineage at point."
   (interactive)
   (cond
    ((magnus-status--get-review-at-point)

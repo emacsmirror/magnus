@@ -422,8 +422,8 @@ When MARKER is non-nil, capture its new session against FILES-BEFORE."
                            (process-put process 'magnus-codex-ready t)
                            ;; Existing queued input predates durable ready-hook
                            ;; deliveries.  Defer the hook until that queue has
-                           ;; actually drained so a recovered review notice
-                           ;; cannot jump ahead of user input.
+                           ;; actually drained so an automated notice cannot
+                           ;; jump ahead of user input.
                            (process-put
                             process 'magnus-codex-ready-hook-pending t)
                            (magnus-terminal-drain process)
@@ -464,11 +464,13 @@ When MARKER is non-nil, capture its new session against FILES-BEFORE."
   "Return non-nil when PROCESS's Codex composer accepts automation."
   (process-get process 'magnus-codex-ready))
 
-(defun magnus-codex-send (instance text &optional accepted)
+(defun magnus-codex-send (instance text &optional accepted scope)
   "Queue TEXT for serialized delivery through INSTANCE's native TUI.
 When ACCEPTED is non-nil, call it only after bracketed paste and Return have
-reached vterm.  Return `submitted' for immediate submission or `queued' while
-the message is waiting for readiness, serialization, or user TUI ownership."
+reached vterm.  SCOPE identifies this delivery for selective cancellation and
+defaults to `codex'.  Return `submitted' for immediate submission or `queued'
+while the message is waiting for readiness, serialization, or user TUI
+ownership."
   (let ((process (magnus-codex--tui-process instance)))
     (unless process
       (user-error "Codex instance `%s' is not running"
@@ -478,7 +480,7 @@ the message is waiting for readiness, serialization, or user TUI ownership."
      :ready-p #'magnus-codex--delivery-ready-p
      :settle-delay 0.1
      :idle #'magnus-codex--maybe-run-ready-hook
-     :scope 'codex)))
+     :scope (or scope 'codex))))
 
 (defun magnus-codex--maybe-run-ready-hook (process)
   "Run PROCESS's deferred ready hook once earlier input has drained."
@@ -692,7 +694,7 @@ duplicated in `event_msg' records, and raw reasoning content is encrypted."
 
 (defun magnus-codex-headless-spec (request)
   "Return a Codex headless launch specification for REQUEST's purpose."
-  (pcase (or (plist-get request :purpose) 'review)
+  (pcase (plist-get request :purpose)
     ('review (magnus-codex-headless-review-spec request))
     ('agent (user-error "Codex does not support headless agent work"))
     (purpose (user-error "Codex does not support headless purpose `%s'"
@@ -766,8 +768,7 @@ duplicated in `event_msg' records, and raw reasoning content is encrypted."
    (switch-to . magnus-codex-switch-to)
    (trace-file . magnus-codex-trace-file)
    (trace-entry . magnus-codex-trace-entry)
-   (headless-spec . magnus-codex-headless-spec)
-   (headless-review-spec . magnus-codex-headless-review-spec)))
+   (headless-spec . magnus-codex-headless-spec)))
 
 (provide 'magnus-provider-codex)
 ;;; magnus-provider-codex.el ends here

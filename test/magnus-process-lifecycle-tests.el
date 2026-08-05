@@ -26,10 +26,7 @@
          (magnus-coord--processed-mentions nil)
          (magnus-coord--processed-dms nil)
          (magnus-coord--processed-summons nil)
-         (magnus-coord--processed-review-ready nil)
          (magnus-coord--states nil)
-         (magnus-coord--review-ready-retries
-          (make-hash-table :test #'equal))
          (magnus-process--legacy-session-launches
           (make-hash-table :test #'equal))
          (magnus-coord--session-start-times
@@ -612,6 +609,8 @@ When PRE-EXISTING is non-nil, seed NAME's Active Work row."
             (should (eq (get-buffer-process buffer) replacement-process))
             (magnus-instances-update
              instance :status 'running :buffer buffer)
+            (should-error
+             (magnus-process--discard-created-runtime instance t buffer))
             (cl-letf (((symbol-function 'magnus-provider-call)
                        (lambda (&rest _arguments)
                          (ert-fail "stale owner must not stop the provider"))))

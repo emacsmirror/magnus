@@ -185,17 +185,20 @@ own timers and transport state.  The buffer cleanup is an intentional
 fallback: a provider start may fail after attaching a terminal but before its
 normal `stop' operation is fully usable.
 OWNER-RUNTIME, when non-nil, is an exact (BUFFER . PROCESS) pair.  A bare
-buffer is accepted for internal compatibility but cannot distinguish a
-same-buffer process replacement."
+buffer is not sufficient because it cannot distinguish a same-buffer process
+replacement."
+  (unless (or (null owner-runtime)
+              (and (consp owner-runtime)
+                   (bufferp (car owner-runtime))
+                   (or (null (cdr owner-runtime))
+                       (processp (cdr owner-runtime)))))
+    (error "Invalid runtime owner: %S" owner-runtime))
   ;; Capture the buffer before provider cleanup: a provider may clear the
   ;; instance slot even when its own partial-start cleanup cannot kill the
   ;; terminal it already created.
-  (let* ((exact-owner-p
-          (and (consp owner-runtime) (bufferp (car owner-runtime))))
+  (let* ((exact-owner-p (consp owner-runtime))
          (current-buffer (magnus-instance-buffer instance))
-         (buffer (cond (exact-owner-p (car owner-runtime))
-                       ((bufferp owner-runtime) owner-runtime)
-                       (t current-buffer)))
+         (buffer (if exact-owner-p (car owner-runtime) current-buffer))
          (expected-process (and exact-owner-p (cdr owner-runtime)))
          (attached (and (buffer-live-p buffer)
                         (get-buffer-process buffer)))
@@ -412,7 +415,7 @@ When INITIAL-MESSAGE is non-nil, include it in the native TUI's first turn."
         (when (timerp onboarding-timer)
           (cancel-timer onboarding-timer))
         (magnus-process--discard-created-runtime
-         instance nil (cons buffer owner-process))
+         instance nil (and buffer (cons buffer owner-process)))
         (magnus-process--release-legacy-session-launch
          directory legacy-launch-token)))))
 
@@ -967,7 +970,7 @@ failed attempt. Shared log history remains as an audit trail."
           (when (file-exists-p (magnus-coord-file-path directory))
             (magnus-coord-clear-agent directory agent-name)
             ;; Keep an existing watcher's presentation cache truthful without
-            ;; consuming messages or resetting checkpoint retries.
+            ;; consuming ordinary coordination messages.
             (when (member directory magnus-coord--watched-dirs)
               (magnus-coord--cache-content
                directory (magnus-coord--read-content directory))))
@@ -1187,7 +1190,7 @@ underscores with hyphens."
         (when (timerp ready-timer)
           (cancel-timer ready-timer))
         (magnus-process--discard-created-runtime
-         instance nil (cons buffer owner-process))))))
+         instance nil (and buffer (cons buffer owner-process)))))))
 
 ;;; Instance interaction
 

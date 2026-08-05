@@ -143,7 +143,7 @@
 
 (defun magnus-claude-headless-spec (request)
   "Return a Claude headless launch specification for REQUEST's purpose."
-  (pcase (or (plist-get request :purpose) 'review)
+  (pcase (plist-get request :purpose)
     ('review (magnus-claude-headless-review-spec request))
     ('agent (magnus-claude-headless-agent-spec request))
     (purpose (user-error "Claude does not support headless purpose `%s'"
@@ -232,8 +232,7 @@
 
 (magnus-provider-register
  'claude
- '((headless-spec . magnus-claude-headless-spec)
-   (headless-review-spec . magnus-claude-headless-review-spec)))
+ '((headless-spec . magnus-claude-headless-spec)))
 
 (provide 'magnus-provider-claude)
 ;;; magnus-provider-claude.el ends here
