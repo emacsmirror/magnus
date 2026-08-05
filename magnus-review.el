@@ -75,6 +75,64 @@ artifact without limit."
 (define-error 'magnus-review-checkpoint-rejected
   "Magnus review checkpoint permanently rejected" 'magnus-review-error)
 
+;;; Repository paths
+
+(defun magnus-review-normalize-repository-path (value)
+  "Return safe repository-relative VALUE, or nil.
+This normalizer preserves legitimate top-level `a/' and `b/' directories.
+Synthetic Git side prefixes belong only to unified-diff headers and are
+handled by `magnus-review-decode-diff-header-path'."
+  (when (stringp value)
+    (let ((path (string-remove-prefix "./" value)))
+      (when (and (not (string-empty-p path))
+                 (not (string= path "/dev/null"))
+                 (not (file-name-absolute-p path))
+                 (not (member ".." (split-string path "/" t)))
+                 (not (string-match-p "[\0\n\r]" path)))
+        path))))
+
+(defun magnus-review--decode-git-quoted-path (value)
+  "Decode Git's optional C-quoted path VALUE, or return nil when malformed."
+  (cond
+   ((not (stringp value)) nil)
+   ((and (> (length value) 1)
+         (eq (aref value 0) ?\")
+         (eq (aref value (1- (length value))) ?\"))
+    (condition-case err
+        (pcase-let ((`(,decoded . ,end) (read-from-string value)))
+          (when (and (= end (length value))
+                     (stringp decoded))
+            ;; Git C-quotes UTF-8 bytes with octal escapes.  The Lisp reader
+            ;; returns those octets as a unibyte string.
+            (if (multibyte-string-p decoded)
+                decoded
+              (decode-coding-string decoded 'utf-8-unix))))
+      (error
+       (message "Magnus: malformed Git quoted path: %s"
+                (error-message-string err))
+       nil)))
+   (t value)))
+
+(defun magnus-review-decode-diff-header-path (value side-prefix)
+  "Decode unified-diff path VALUE and remove one Git SIDE-PREFIX.
+SIDE-PREFIX is `a/' for an old-file header or `b/' for a new-file header.
+Return the safe repository-relative path, preserving any real leading `a/' or
+`b/' segment after that single synthetic prefix."
+  (let ((decoded (magnus-review--decode-git-quoted-path value)))
+    (when (and (member side-prefix '("a/" "b/"))
+               (stringp decoded)
+               (string-prefix-p side-prefix decoded))
+      (magnus-review-normalize-repository-path
+       (substring decoded (length side-prefix))))))
+
+(defun magnus-review-canonical-patch-arguments (base head)
+  "Return Git arguments for a canonical patch from BASE to HEAD.
+Explicit side prefixes and color suppression isolate durable review evidence
+from user-level Git presentation settings such as `diff.noprefix'."
+  (list "diff" "--binary" "--full-index" "--no-ext-diff" "--no-color"
+        "--src-prefix=a/" "--dst-prefix=b/" "--find-renames"
+        base head "--"))
+
 ;;; Records
 
 (cl-defstruct (magnus-review-checkpoint-event
@@ -647,9 +705,8 @@ Evidence files are append-only, private, and remain after worktree cleanup."
     ;; Compute both byte streams before publishing either path.  The atomic
     ;; writers ensure readers never observe a partial Git stream.  Exact files
     ;; left by a crash before manifest publication are adopted, never replaced.
-    (let ((patch (magnus-review--git-output-raw
-                  project-root "diff" "--binary" "--full-index"
-                  "--find-renames" "--no-ext-diff" base head "--"))
+    (let ((patch (apply #'magnus-review--git-output-raw project-root
+                        (magnus-review-canonical-patch-arguments base head)))
           (name-status
            (magnus-review--git-output-raw
             project-root "diff" "--name-status" "-z" "--find-renames"

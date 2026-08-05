@@ -27,6 +27,7 @@
 (require 'magit-section)
 (require 'seq)
 (require 'subr-x)
+(require 'magnus-review)
 
 (defvar magnus-review-max-evidence-bytes)
 
@@ -411,17 +412,8 @@ Signal an error containing Git's diagnostic when the command fails."
 
 (defun magnus-review-ui--normalize-path (path)
   "Return a safe repository-relative form of PATH, or nil."
-  (when-let ((text (magnus-review-ui--string path)))
-    (setq text (string-remove-prefix "./" text))
-    (when (or (string-prefix-p "a/" text)
-              (string-prefix-p "b/" text))
-      (setq text (substring text 2)))
-    (unless (or (string-empty-p text)
-                (string= text "/dev/null")
-                (file-name-absolute-p text)
-                (string-match-p "[\0\n\r]" text)
-                (member ".." (split-string text "/" t)))
-      text)))
+  (magnus-review-normalize-repository-path
+   (magnus-review-ui--string path)))
 
 (defun magnus-review-ui--parse-name-status (stream)
   "Parse NUL-delimited Git name-status STREAM into path records."
@@ -522,19 +514,9 @@ signals instead of silently substituting mutable repository state."
 (defun magnus-review-ui--path-from-header (line prefix)
   "Extract and normalize a path from LINE beginning with PREFIX."
   (when (string-prefix-p prefix line)
-    (let ((raw (substring line (length prefix))))
-      (when (and (> (length raw) 1)
-                 (eq (aref raw 0) ?\")
-                 (eq (aref raw (1- (length raw))) ?\"))
-        (setq raw (condition-case nil
-                      (let ((decoded (car (read-from-string raw))))
-                        ;; Git C-quotes UTF-8 path bytes using octal escapes.
-                        ;; The Lisp reader returns those as a unibyte string.
-                        (if (multibyte-string-p decoded)
-                            decoded
-                          (decode-coding-string decoded 'utf-8-unix)))
-                    (error raw))))
-      (magnus-review-ui--normalize-path raw))))
+    (magnus-review-decode-diff-header-path
+     (substring line (length prefix))
+     (if (string= prefix "--- ") "a/" "b/"))))
 
 (defun magnus-review-ui--parse-hunk-header (line)
   "Parse unified diff hunk header LINE into an internal hunk."
@@ -703,10 +685,9 @@ signals instead of silently substituting mutable repository state."
       ;; New reviews must never reach this branch.
       (setq magnus-review-ui--evidence-source 'git)
       (let ((statuses (magnus-review-ui--name-status-live root base head))
-            (patch (magnus-review-ui--git
-                    root "diff" "--binary" "--full-index"
-                    "--no-ext-diff" "--no-color" "--find-renames"
-                    base head "--")))
+            (patch
+             (apply #'magnus-review-ui--git root
+                    (magnus-review-canonical-patch-arguments base head))))
         (magnus-review-ui--parse-diff patch statuses)))))
 
 ;;; Finding assignment

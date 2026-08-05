@@ -32,11 +32,30 @@
             path path path path)))
 
 (ert-deftest magnus-review-ui-normalizes-only-safe-repository-paths ()
-  (should (equal (magnus-review-ui--normalize-path "./a/lib.el") "lib.el"))
-  (should (equal (magnus-review-ui--normalize-path "b/lib.el") "lib.el"))
+  (should (equal (magnus-review-ui--normalize-path "./a/lib.el") "a/lib.el"))
+  (should (equal (magnus-review-ui--normalize-path "b/lib.el") "b/lib.el"))
   (dolist (path '(nil "" "/tmp/escape" "../escape" "a/../../escape"
                       "/dev/null" "bad\npath"))
     (should-not (magnus-review-ui--normalize-path path))))
+
+(ert-deftest magnus-review-ui-preserves-real-a-and-b-top-level-directories ()
+  (dolist (path '("a/sample.el" "b/sample.el"))
+    (let* ((files
+            (magnus-review-ui--parse-evidence
+             (magnus-test-review-ui--patch path)
+             (concat "M\0" path "\0")))
+           (file (car files)))
+      (should (= (length files) 1))
+      (should (equal (magnus-review-ui--file-display-path file) path))
+      (should (equal (magnus-review-ui--file-old-path file) path))
+      (should (equal (magnus-review-ui--file-new-path file) path)))))
+
+(ert-deftest magnus-review-ui-decodes-c-quoted-unicode-header-paths ()
+  (should
+   (equal
+    (magnus-review-ui--path-from-header
+     "+++ \"b/caf\\303\\251.el\"" "+++ ")
+    "café.el")))
 
 (ert-deftest magnus-review-ui-parses-and-cross-checks-immutable-evidence ()
   (let* ((files

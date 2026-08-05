@@ -16,6 +16,34 @@
   "Guard against accidentally nesting the update defun inside create."
   (should (fboundp 'magnus-review-worktree-update)))
 
+(ert-deftest magnus-review-anchors-real-a-b-and-unicode-paths ()
+  (dolist (fixture
+           '(("a/sample.el" . "b/a/sample.el")
+             ("b/sample.el" . "b/b/sample.el")
+             ("café.el" . "\"b/caf\\303\\251.el\"")))
+    (let* ((path (car fixture))
+           (header (cdr fixture))
+           (patch
+            (format
+             (concat "diff --git fixture fixture\n"
+                     "+++ %s\n"
+                     "@@ -0,0 +1 @@\n"
+                     "+reviewed line\n")
+             header))
+           (finding
+            `((kind . "line") (path . ,path)
+              (head_line . 1) (end_line . 1)))
+           (result `((findings . ,(vector finding)))))
+      (should (equal (magnus-review-controller--safe-path path) path))
+      (cl-letf (((symbol-function
+                  'magnus-review-controller--changed-paths)
+                 (lambda (_review _round) (list path))))
+        (magnus-review-controller-anchor-result nil nil result patch))
+      (should (equal (alist-get 'kind finding) "line"))
+      (should (equal (alist-get 'path finding) path))
+      (should (= (alist-get 'head_line finding) 1))
+      (should-not (alist-get 'anchor_status finding)))))
+
 (ert-deftest magnus-review-open-reviewer-reserves-its-project-identity ()
   (let* ((directory (make-temp-file "magnus-review-reservation-" t))
          (open
@@ -111,9 +139,14 @@
              prompt))
     (should (string-match-p
              (regexp-quote
-              (format "git diff --find-renames %s..%s --"
-                      magnus-test-review--base-oid
-                      magnus-test-review--head-oid))
+              (mapconcat
+               #'shell-quote-argument
+               (cons
+                "git"
+                (magnus-review-canonical-patch-arguments
+                 magnus-test-review--base-oid
+                 magnus-test-review--head-oid))
+               " "))
              prompt))
     (should (string-match-p
              (regexp-quote "/tmp/canonical-evidence.patch") prompt))))
@@ -358,6 +391,54 @@
       (magnus-test-review--git root "add" "--" "sample.el")
       (magnus-test-review--git root "commit" "--quiet" "-m" "head")
       (list root base (magnus-test-review--git root "rev-parse" "HEAD")))))
+
+(ert-deftest magnus-review-capture-isolated-from-git-presentation-config ()
+  (pcase-let* ((`(,root ,_initial-base ,base)
+                (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-prefix-storage-" t))
+               (magnus-review-directory-root storage)
+               (review
+                (magnus-review--create
+                 :id "canonical-prefixes"
+                 :project-root root
+                 :project-hash (make-string 64 ?a)))
+               (round nil))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "a" root))
+          (with-temp-file (expand-file-name "a/sample.el" root)
+            (insert "(defun prefixed-path () t)\n"))
+          (magnus-test-review--git root "add" "--" "a/sample.el")
+          (magnus-test-review--git root "commit" "--quiet" "-m" "add a path")
+          (let ((head (magnus-test-review--git root "rev-parse" "HEAD")))
+            ;; These user settings remove side prefixes and force ANSI color
+            ;; unless the evidence command overrides both explicitly.
+            (magnus-test-review--git root "config" "diff.noprefix" "true")
+            (magnus-test-review--git root "config" "color.diff" "always")
+            (setq round
+                  (magnus-review-round--create
+                   :number 1 :base-oid base :head-oid head))
+            (magnus-review-capture-round-evidence review round)
+            (let* ((patch (magnus-review-controller--patch review round))
+                   (finding
+                    '((kind . "line") (path . "a/sample.el")
+                      (head_line . 1) (end_line . 1)))
+                   (result `((findings . ,(vector finding)))))
+              (should
+               (string-match-p
+                "diff --git a/a/sample\\.el b/a/sample\\.el" patch))
+              (should (string-match-p "+++ b/a/sample\\.el" patch))
+              (should-not (string-match-p (regexp-quote "\e[") patch))
+              (should
+               (equal
+                (magnus-review-controller--changed-paths review round)
+                '("a/sample.el")))
+              (magnus-review-controller-anchor-result
+               review round result patch)
+              (should (equal (alist-get 'kind finding) "line"))
+              (should-not (alist-get 'anchor_status finding)))))
+      (delete-directory root t)
+      (delete-directory storage t))))
 
 (defun magnus-test-review--publish-fixture-round (review round)
   "Make ROUND a structurally complete published result in REVIEW."
@@ -1475,6 +1556,12 @@
                       'queued))
           (should (= accepted 0))
           (should-not events)
+          (let ((entry
+                 (car (process-get
+                       process 'magnus-review-delivery-queue))))
+            (should (eq (plist-get entry :instance) instance))
+            (should (eq (plist-get entry :buffer) agent-buffer))
+            (should (eq (plist-get entry :process) process)))
           ;; Simulate the scheduled retry after Hrishi moves away from the TUI.
           (process-put process 'magnus-review-delivery-retry-timer nil)
           (set-window-buffer window other-buffer)
@@ -1488,6 +1575,124 @@
       (when (process-live-p process) (delete-process process))
       (kill-buffer agent-buffer)
       (kill-buffer other-buffer))))
+
+(ert-deftest magnus-review-local-delivery-rejects-a-replaced-runtime ()
+  (let* ((window (selected-window))
+         (original-buffer (window-buffer window))
+         (old-buffer (generate-new-buffer " *magnus-review-old-agent*"))
+         (replacement-buffer
+          (generate-new-buffer " *magnus-review-new-agent*"))
+         (other-buffer (generate-new-buffer " *magnus-review-away-stale*"))
+         (old-process
+          (make-process :name "magnus-review-old-agent-fixture"
+                        :buffer old-buffer
+                        :command (list (or (executable-find "cat") "cat"))
+                        :noquery t))
+         (replacement-process
+          (make-process :name "magnus-review-new-agent-fixture"
+                        :buffer replacement-buffer
+                        :command (list (or (executable-find "cat") "cat"))
+                        :noquery t))
+         (instance (magnus-instance--create
+                    :id "author-replaced-id" :name "quick-wolf"
+                    :provider 'claude :buffer old-buffer :status 'running))
+         (magnus-review-controller--local-delivery-processes
+          (make-hash-table :test #'eq))
+         (magnus-review-controller--shutting-down nil)
+         events
+         (accepted 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'run-with-timer)
+                   (lambda (&rest _args) 'fake-delivery-timer))
+                  ((symbol-function 'vterm-send-string)
+                   (lambda (&rest arguments) (push arguments events)))
+                  ((symbol-function 'vterm-send-return)
+                   (lambda () (push 'return events))))
+          (set-window-buffer window old-buffer)
+          (should (eq (magnus-review-controller--send
+                       instance "durable stale feedback"
+                       (lambda () (cl-incf accepted)))
+                      'queued))
+          ;; The old terminal can remain live briefly after archive, chdir, or
+          ;; resume.  Reassignment must revoke its queued delivery before the
+          ;; retry can publish a false durable receipt.
+          (setf (magnus-instance-buffer instance) replacement-buffer)
+          (set-window-buffer window other-buffer)
+          (process-put old-process 'magnus-review-delivery-retry-timer nil)
+          (magnus-review-controller--drain-local-delivery old-process)
+          (should (process-live-p old-process))
+          (should (= accepted 0))
+          (should-not events)
+          (should-not
+           (process-get old-process 'magnus-review-delivery-queue))
+          (should-not
+           (gethash old-process
+                    magnus-review-controller--local-delivery-processes)))
+      (set-window-buffer window original-buffer)
+      (when (process-live-p old-process) (delete-process old-process))
+      (when (process-live-p replacement-process)
+        (delete-process replacement-process))
+      (kill-buffer old-buffer)
+      (kill-buffer replacement-buffer)
+      (kill-buffer other-buffer))))
+
+(ert-deftest magnus-review-local-delivery-rejects-same-buffer-replacement ()
+  (let* ((window (selected-window))
+         (original-buffer (window-buffer window))
+         (agent-buffer
+          (generate-new-buffer " *magnus-review-shared-agent*"))
+         (other-buffer
+          (generate-new-buffer " *magnus-review-away-shared*"))
+         (old-process
+          (make-process :name "magnus-review-old-shared-fixture"
+                        :buffer agent-buffer
+                        :command (list (or (executable-find "cat") "cat"))
+                        :noquery t))
+         replacement-process
+         (instance (magnus-instance--create
+                    :id "author-shared-id" :name "quick-wolf"
+                    :provider 'claude :buffer agent-buffer :status 'running))
+         (magnus-review-controller--local-delivery-processes
+          (make-hash-table :test #'eq))
+         (magnus-review-controller--shutting-down nil)
+         events
+         (accepted 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'run-with-timer)
+                   (lambda (&rest _args) 'fake-delivery-timer))
+                  ((symbol-function 'vterm-send-string)
+                   (lambda (&rest arguments) (push arguments events)))
+                  ((symbol-function 'vterm-send-return)
+                   (lambda () (push 'return events))))
+          (set-window-buffer window agent-buffer)
+          (should (eq (magnus-review-controller--send
+                       instance "durable same-buffer feedback"
+                       (lambda () (cl-incf accepted)))
+                      'queued))
+          (setq replacement-process
+                (make-process
+                 :name "magnus-review-new-shared-fixture"
+                 :buffer agent-buffer
+                 :command (list (or (executable-find "cat") "cat"))
+                 :noquery t))
+          (should (eq (get-buffer-process agent-buffer)
+                      replacement-process))
+          (set-window-buffer window other-buffer)
+          (process-put old-process 'magnus-review-delivery-retry-timer nil)
+          (magnus-review-controller--drain-local-delivery old-process)
+          (should (= accepted 0))
+          (should-not events)
+          (should-not
+           (process-get old-process 'magnus-review-delivery-queue))
+          (should-not
+           (gethash old-process
+                    magnus-review-controller--local-delivery-processes)))
+      (set-window-buffer window original-buffer)
+      (when (process-live-p old-process) (delete-process old-process))
+      (when (process-live-p replacement-process)
+        (delete-process replacement-process))
+      (when (buffer-live-p agent-buffer) (kill-buffer agent-buffer))
+      (when (buffer-live-p other-buffer) (kill-buffer other-buffer)))))
 
 (ert-deftest magnus-review-local-delivery-retries-transient-vterm-error ()
   (let* ((window (selected-window))
