@@ -361,6 +361,9 @@ While a review is waiting, `r` resends its existing opaque correlation token
 so an author can recover after compaction. If the author reports the already
 reviewed Git head, Magnus finishes that request as a no-op and preserves the
 existing verdict and findings; a later re-review allocates a fresh token.
+A token already bound to one round cannot name a newer Git scope: Magnus
+ignores that stale marker, and `r` intentionally issues the fresh token for the
+next round.
 
 **Attention & Health**
 | Key | Action                      |

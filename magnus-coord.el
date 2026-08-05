@@ -1089,12 +1089,19 @@ launching any work."
 
 (defun magnus-coord--dispatch-review-ready (directory marker)
   "Safely dispatch MARKER from DIRECTORY to review handlers.
-Return non-nil only when all handlers complete, so a failed durable transition
-is not recorded as processed merely because a timer observed it."
+Return non-nil when all handlers complete or permanently reject the marker, so
+an invalid immutable marker is consumed while a failed durable transition is
+left unprocessed for bounded retry."
   (condition-case err
       (progn
         (run-hook-with-args 'magnus-coord-review-ready-hook directory marker)
         t)
+    (magnus-review-checkpoint-rejected
+     (message "Magnus: ignored stale review checkpoint in %s — %s"
+              (file-name-nondirectory (directory-file-name directory))
+              (if (stringp (cadr err)) (cadr err)
+                (error-message-string err)))
+     t)
     (error
      (message "Magnus: review checkpoint handler failed for %s: %s"
               directory (error-message-string err))

@@ -53,6 +53,8 @@ This bounds durable storage and accidental giant binary reviews."
 (define-error 'magnus-review-error "Magnus review error")
 (define-error 'magnus-review-git-error "Magnus review Git error"
   'magnus-review-error)
+(define-error 'magnus-review-checkpoint-rejected
+  "Magnus review checkpoint permanently rejected" 'magnus-review-error)
 
 ;;; Records
 
@@ -2003,7 +2005,10 @@ A new valid marker appends an immutable round and runs
 `magnus-review-ready-hook'.  An unchanged re-review checkpoint is acknowledged
 without duplicating the round or launching a model, and finishes that pending
 request.  A known request with a non-current token never changes Git scope and
-triggers `magnus-review-checkpoint-mismatch-hook' for recovery.  Replayed
+triggers `magnus-review-checkpoint-mismatch-hook' for recovery.  A token that
+is already bound to a round can only replay that round's exact scope; a
+conflicting replay signals `magnus-review-checkpoint-rejected', a permanent
+protocol rejection that coordination consumers must not retry.  Replayed
 markers never append a duplicate round, but a queued round re-runs the hook so
 startup recovery can continue launching it idempotently."
   (let* ((request-id (plist-get marker :request-id))
@@ -2032,6 +2037,7 @@ startup recovery can continue launching it idempotently."
                (magnus-review-rounds review)))
              (acknowledged
               (magnus-review--checkpoint-ack-round-for-token review token))
+             (bound (or persisted acknowledged))
              (persisted-match
               (and persisted
                    (string= base (magnus-review-round-base-oid persisted))
@@ -2057,11 +2063,40 @@ startup recovery can continue launching it idempotently."
               (magnus-review--acknowledge-unchanged-checkpoint
                review token base head)
             acknowledged))
-         ;; Once the token binds to a real round, only that canonical scope or
-         ;; its earlier acknowledged no-progress scope may replay successfully.
-         (persisted
-          (magnus-review--signal
-           "Replayed review-ready marker changed its Git scope"))
+         ;; Once a token binds to a real round or an acknowledged no-progress
+         ;; scope, it can never identify another Git scope.  This is a permanent
+         ;; protocol rejection rather than a transient handler failure: retrying
+         ;; the immutable marker cannot repair it and used to create a noisy
+         ;; timer loop on every startup.
+         ;; If a newer request is genuinely waiting, redeliver that canonical
+         ;; token so an author recovering from compaction can still proceed.
+         (bound
+          (let ((recover-current
+                 (and (eq (magnus-review-execution review)
+                          'waiting-for-checkpoint)
+                      (not (string= token
+                                    (or (magnus-review-checkpoint-token review)
+                                        ""))))))
+            (when recover-current
+              (run-hook-with-args
+               'magnus-review-checkpoint-mismatch-hook review marker))
+            (signal
+             'magnus-review-checkpoint-rejected
+             (list
+              (format
+               (concat
+                "checkpoint token is already bound to round %d (%s..%s); "
+                "ignored conflicting marker for %s..%s%s")
+               (magnus-review-round-number bound)
+               (substring (magnus-review-round-base-oid bound) 0 8)
+               (substring (magnus-review-round-head-oid bound) 0 8)
+               (substring base 0 8)
+               (substring head 0 8)
+               (if recover-current
+                   "; retained the current checkpoint request"
+                 (concat
+                  "; request a fresh re-review if that committed work should "
+                  "be reviewed")))))))
          ((not (string= token
                         (or (magnus-review-checkpoint-token review) "")))
           ;; Context compaction can make an otherwise healthy author invent or

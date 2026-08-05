@@ -274,43 +274,174 @@
               (insert "(defun sample ()\n  3)\n"))
             (magnus-test-review--git root "add" "--" "sample.el")
             (magnus-test-review--git root "commit" "--quiet" "-m" "advance")
-            (let* ((next-token (magnus-review-await-checkpoint review))
-                   (new-head
-                    (magnus-test-review--git root "rev-parse" "HEAD"))
-                   (new-marker
-                    (list :request-id (magnus-review-id review)
-                          :checkpoint-token next-token
-                          :base base :head new-head))
-                   (round-two
-                    (magnus-review-handle-ready-marker root new-marker)))
-              (should (= (magnus-review-round-number round-two) 2))
-              (should (equal (magnus-review-round-previous-head-oid round-two)
-                             head))
-              (should (= (length (magnus-review-rounds review)) 2))
-              (should (= ready 1))
-              (should-not (equal token next-token))
-              ;; Once the token advances, neither its provisional nor canonical
-              ;; scope permits an unrelated third object.
-              (should-error
-               (magnus-review-handle-ready-marker
-                root (plist-put (copy-sequence new-marker) :head
-                                "cccccccccccccccccccccccccccccccccccccccc"))
-               :type 'magnus-review-error)
-              ;; Startup replays the whole coordination log.  Loading from disk
-              ;; in file order: provisional first, canonical second.  Both are
-              ;; benign, and only queued canonical recovery runs the hook.
-              (setq magnus-reviews nil)
-              (should (= (magnus-review-load-all) 1))
-              (let* ((loaded (magnus-review-get "unchanged-checkpoint"))
-                     (loaded-rounds (magnus-review-rounds loaded)))
-                (should (eq (magnus-review-handle-ready-marker root marker)
-                            (nth 0 loaded-rounds)))
-                (should (eq (magnus-review-handle-ready-marker root new-marker)
-                            (nth 1 loaded-rounds)))
-                (should (eq (magnus-review-execution loaded) 'queued))
-                (should (= (length loaded-rounds) 2))
-                (should (= (length (magnus-review-checkpoint-acks loaded)) 1))
-                (should (= ready 2))))))
+            (let ((new-head
+                   (magnus-test-review--git root "rev-parse" "HEAD")))
+              ;; A no-progress acknowledgement also binds its fresh token to
+              ;; the acknowledged round.  Reusing it for later commits is the
+              ;; same permanent conflict as reusing a material round token.
+              (let ((settled-at (magnus-review-updated-at review)))
+                (should-error
+                 (magnus-review-handle-ready-marker
+                  root (plist-put (copy-sequence marker) :head new-head))
+                 :type 'magnus-review-checkpoint-rejected)
+                (should (= (magnus-review-updated-at review) settled-at))
+                (should (eq (magnus-review-execution review) 'complete))
+                (should (= (length (magnus-review-rounds review)) 1))
+                (should (= (length (magnus-review-checkpoint-acks review)) 1))
+                (should (= ready 0)))
+              (let* ((next-token (magnus-review-await-checkpoint review))
+                     (new-marker
+                      (list :request-id (magnus-review-id review)
+                            :checkpoint-token next-token
+                            :base base :head new-head))
+                     (round-two
+                      (magnus-review-handle-ready-marker root new-marker)))
+                (should (= (magnus-review-round-number round-two) 2))
+                (should (equal (magnus-review-round-previous-head-oid round-two)
+                               head))
+                (should (= (length (magnus-review-rounds review)) 2))
+                (should (= ready 1))
+                (should-not (equal token next-token))
+                ;; Once the token advances, neither its provisional nor
+                ;; canonical scope permits an unrelated third object.  The
+                ;; immutable bad marker is permanently rejected without changing
+                ;; state; coordination consumes this specific condition so it
+                ;; does not retry it forever.
+                (should-error
+                 (magnus-review-handle-ready-marker
+                  root (plist-put (copy-sequence new-marker) :head
+                                  "cccccccccccccccccccccccccccccccccccccccc"))
+                 :type 'magnus-review-checkpoint-rejected)
+                (should (= (length (magnus-review-rounds review)) 2))
+                (should (eq (magnus-review-execution review) 'queued))
+                (should (= ready 1))
+                ;; Startup replays the whole coordination log.  Loading from
+                ;; disk in file order: provisional first, canonical second.
+                ;; Both are benign, and only queued canonical recovery runs the
+                ;; hook.
+                (setq magnus-reviews nil)
+                (should (= (magnus-review-load-all) 1))
+                (let* ((loaded (magnus-review-get "unchanged-checkpoint"))
+                       (loaded-rounds (magnus-review-rounds loaded)))
+                  (should (eq (magnus-review-handle-ready-marker root marker)
+                              (nth 0 loaded-rounds)))
+                  (should
+                   (eq (magnus-review-handle-ready-marker root new-marker)
+                       (nth 1 loaded-rounds)))
+                  (should (eq (magnus-review-execution loaded) 'queued))
+                  (should (= (length loaded-rounds) 2))
+                  (should (= (length (magnus-review-checkpoint-acks loaded)) 1))
+                  (should (= ready 2)))))))
+      (delete-directory root t)
+      (delete-directory storage t))))
+
+(ert-deftest magnus-review-conflicting-bound-token-is-a-terminal-rejection ()
+  (pcase-let* ((`(,root ,base ,head) (magnus-test-review--repository))
+               (storage (make-temp-file "magnus-review-conflict-" t))
+               (magnus-review-directory-root storage)
+               (magnus-reviews nil)
+               (magnus-reviews-changed-hook nil)
+               (magnus-coord--processed-review-ready nil)
+               (magnus-coord--review-ready-retries
+                (make-hash-table :test #'equal))
+               (ready 0)
+               (recovered nil)
+               (magnus-review-ready-hook
+                (list (lambda (_review _round) (cl-incf ready))))
+               (magnus-review-checkpoint-mismatch-hook
+                (list (lambda (review marker)
+                        (setq recovered (list review marker))))))
+    (unwind-protect
+        (let* ((review
+                (magnus-review-create
+                 root "conflict-author" "quick-wren"
+                 :id "bound-token-conflict"
+                 :task "Reject a reused round token"
+                 :reviewer-name "keen-owl"
+                 :reviewer-provider 'codex))
+               (bound-token (magnus-review-checkpoint-token review))
+               (round
+                (magnus-review-append-round
+                 review base head :checkpoint-token bound-token))
+               original-updated original-acks)
+          (magnus-test-review--publish-fixture-round review round)
+          (setq original-updated (magnus-review-updated-at review)
+                original-acks
+                (copy-tree (magnus-review-checkpoint-acks review)))
+          (with-temp-file (expand-file-name "sample.el" root)
+            (insert "(defun sample ()\n  3)\n"))
+          (magnus-test-review--git root "add" "--" "sample.el")
+          (magnus-test-review--git root "commit" "--quiet" "-m" "advance")
+          (let* ((new-head (magnus-test-review--git root "rev-parse" "HEAD"))
+                 (bad-marker
+                  (list :request-id (magnus-review-id review)
+                        :checkpoint-token bound-token
+                        :base base :head new-head))
+                 (file (expand-file-name magnus-coord-file root))
+                 (magnus-coord-review-ready-hook
+                  (list #'magnus-review-handle-ready-marker)))
+            (with-temp-file file
+              (insert
+               (format
+                "[REVIEW-READY request=%s checkpoint=%s base=%s head=%s]\n"
+                (magnus-review-id review) bound-token base head))
+              (insert
+               (format
+                "[REVIEW-READY request=%s checkpoint=%s base=%s head=%s]\n"
+                (magnus-review-id review) bound-token base new-head)))
+            ;; This exact production path must mark the permanent conflict as
+            ;; processed instead of scheduling bounded retries and repeating
+            ;; the user-facing handler error.
+            (magnus-coord--check-new-review-ready root)
+            (should (= (length
+                        (alist-get
+                         root magnus-coord--processed-review-ready
+                         nil nil #'equal))
+                       2))
+            (should (= (hash-table-count
+                        magnus-coord--review-ready-retries)
+                       0))
+            (should (= (length (magnus-review-rounds review)) 1))
+            (should (eq (magnus-review-latest-round review) round))
+            (should (eq (magnus-review-execution review) 'complete))
+            (should (equal (magnus-review-head-oid review) head))
+            (should (equal (magnus-review-checkpoint-token review)
+                           bound-token))
+            (should (equal (magnus-review-checkpoint-acks review)
+                           original-acks))
+            (should (= (magnus-review-updated-at review) original-updated))
+            (should (= ready 0))
+            (should-not recovered)
+            ;; Once Hrishi intentionally requests another round, the same stale
+            ;; marker remains rejected and recovers the new canonical request.
+            (let ((fresh-token (magnus-review-await-checkpoint review)))
+              (should-not (equal fresh-token bound-token))
+              ;; Reproduce a restart: both historical markers replay through
+              ;; coordination while the fresh request is waiting.  The stale
+              ;; one is consumed and redelivers only the fresh current token.
+              (setq magnus-coord--processed-review-ready nil
+                    recovered nil)
+              (magnus-coord--check-new-review-ready root)
+              (should (= (length
+                          (alist-get
+                           root magnus-coord--processed-review-ready
+                           nil nil #'equal))
+                         2))
+              (should (= (hash-table-count
+                          magnus-coord--review-ready-retries)
+                         0))
+              (should (equal recovered (list review bad-marker)))
+              (should (eq (magnus-review-execution review)
+                          'waiting-for-checkpoint))
+              (should (= (length (magnus-review-rounds review)) 1))
+              (let ((round-two
+                     (magnus-review-handle-ready-marker
+                      root (list :request-id (magnus-review-id review)
+                                 :checkpoint-token fresh-token
+                                 :base base :head new-head))))
+                (should (= (magnus-review-round-number round-two) 2))
+                (should (= ready 1))
+                (should (eq (magnus-review-execution review) 'queued))))))
       (delete-directory root t)
       (delete-directory storage t))))
 
