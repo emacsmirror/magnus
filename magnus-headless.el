@@ -56,11 +56,12 @@
 ;;   :on-error     (PROCESS ERROR-PLIST)
 ;;   :on-complete  (PROCESS RESULT-PLIST)
 ;;
-;; Raw complete JSONL lines are delivered before parsing, so callers can always
-;; persist the provider evidence even when decoding fails.  All callbacks occur
-;; from process filters, sentinels, or a zero-delay timer after this function
-;; returns.  Provider and callback failures are reported explicitly rather than
-;; aborting the remaining JSONL stream.
+;; Raw complete JSONL lines are delivered before parsing, so callers can persist
+;; malformed provider evidence.  Records beyond `magnus-headless-jsonl-line-limit'
+;; are instead discarded with an explicit error.  All callbacks occur from
+;; process filters, sentinels, or a zero-delay timer after this function returns.
+;; Provider and callback failures are reported explicitly rather than aborting
+;; the remaining JSONL stream.
 
 ;;; Code:
 
@@ -71,8 +72,28 @@
 (require 'magnus-provider)
 
 (defcustom magnus-headless-stderr-limit (* 256 1024)
-  "Maximum trailing stderr bytes retained in a headless result.
+  "Maximum trailing stderr characters retained in a headless result.
 The complete stream remains available through the :on-stderr callback."
+  :type 'integer
+  :group 'magnus)
+
+(defcustom magnus-headless-jsonl-line-limit (* 4 1024 1024)
+  "Maximum characters retained for one headless JSONL record.
+This bounds both a complete record and stdout waiting for its terminating
+newline.  An overlong record is discarded through its next newline and becomes
+an explicit `jsonl-line-too-long' decode error; later records are still read."
+  :type 'integer
+  :group 'magnus)
+
+(defcustom magnus-headless-error-limit 64
+  "Maximum headless errors retained in one completion result.
+The limit is shared by decode, provider, and callback errors.  Every error is
+still delivered to :on-error, while the result reports how many were omitted."
+  :type 'integer
+  :group 'magnus)
+
+(defcustom magnus-headless-error-detail-limit (* 16 1024)
+  "Maximum characters retained for one headless error detail value."
   :type 'integer
   :group 'magnus)
 
@@ -93,6 +114,66 @@ The complete stream remains available through the :on-stderr callback."
 (defconst magnus-headless--callback-keys
   '(:on-raw-event :on-event :on-session :on-stderr :on-error :on-complete)
   "Recognized keys in a headless CALLBACKS plist.")
+
+(defun magnus-headless--bounded-error-value (value)
+  "Return diagnostic VALUE in a bounded, printable form."
+  (let ((limit (max 0 magnus-headless-error-detail-limit)))
+    (cond
+     ((stringp value)
+      (cond
+       ((zerop limit) "")
+       ((> (length value) limit)
+        (concat (substring value 0 limit) "…"))
+       (t value)))
+     ((or (null value) (numberp value) (symbolp value)) value)
+     (t
+      ;; Error details are diagnostic only.  Keeping an arbitrary provider
+      ;; object here could retain an entire oversized decoded event.
+      (let* ((print-circle t)
+             (print-length 50)
+             (print-level 8)
+             (printed (prin1-to-string value)))
+        (cond
+         ((zerop limit) "")
+         ((> (length printed) limit)
+          (concat (substring printed 0 limit) "…"))
+         (t printed)))))))
+
+(defun magnus-headless--bounded-error-data (data)
+  "Return error plist DATA with every value bounded."
+  (let (bounded)
+    (while data
+      (let ((key (pop data))
+            (value (pop data)))
+        (setq bounded
+              (append bounded
+                      (list key
+                            (magnus-headless--bounded-error-value value))))))
+    bounded))
+
+(defun magnus-headless--error-result-key (property)
+  "Return public result key corresponding to error PROPERTY."
+  (pcase property
+    ('magnus-headless-decode-errors :decode-errors)
+    ('magnus-headless-provider-errors :provider-errors)
+    ('magnus-headless-callback-errors :callback-errors)
+    (_ :other-errors)))
+
+(defun magnus-headless--store-error (process property failure)
+  "Retain bounded FAILURE under PROCESS PROPERTY, or count its omission."
+  (let ((count (or (process-get process 'magnus-headless-error-count) 0))
+        (limit (max 0 magnus-headless-error-limit)))
+    (process-put process 'magnus-headless-error-count (1+ count))
+    (if (< count limit)
+        (process-put process property
+                     (cons failure (process-get process property)))
+      (let* ((key (magnus-headless--error-result-key property))
+             (dropped
+              (copy-sequence
+               (or (process-get process 'magnus-headless-dropped-errors) nil))))
+        (setq dropped
+              (plist-put dropped key (1+ (or (plist-get dropped key) 0))))
+        (process-put process 'magnus-headless-dropped-errors dropped)))))
 
 (defun magnus-headless--validate-request (provider request)
   "Validate PROVIDER and common fields in REQUEST."
@@ -178,12 +259,12 @@ file and the caller is responsible for deleting it."
        (let ((failure
               (list :kind 'callback-error
                     :callback key
-                    :message (error-message-string err)
-                    :error err)))
-         (process-put
-          process 'magnus-headless-callback-errors
-          (cons failure
-                (process-get process 'magnus-headless-callback-errors)))
+                    :message
+                    (magnus-headless--bounded-error-value
+                     (error-message-string err))
+                    :error (magnus-headless--bounded-error-value err))))
+         (magnus-headless--store-error
+          process 'magnus-headless-callback-errors failure)
          (message "Magnus: headless callback %s failed: %s"
                   key (error-message-string err))
          (unless (eq key :on-error)
@@ -191,9 +272,12 @@ file and the caller is responsible for deleting it."
 
 (defun magnus-headless--record-error (process property kind message &rest data)
   "Record a PROCESS error under PROPERTY with KIND, MESSAGE, and DATA."
-  (let ((failure (append (list :kind kind :message message) data)))
-    (process-put process property
-                 (cons failure (process-get process property)))
+  (let ((failure
+         (append
+          (list :kind kind
+                :message (magnus-headless--bounded-error-value message))
+          (magnus-headless--bounded-error-data data))))
+    (magnus-headless--store-error process property failure)
     (magnus-headless--callback process :on-error failure)
     failure))
 
@@ -271,24 +355,67 @@ file and the caller is responsible for deleting it."
         (error-message-string err) :line line :error err)))))
 
 (defun magnus-headless--filter (process output)
-  "Consume JSONL OUTPUT from PROCESS while retaining an incomplete line."
-  (let* ((combined (concat (process-get process 'magnus-headless-partial-line)
-                           output))
-         (lines (split-string combined "\n" nil))
-         (remainder (car (last lines))))
-    (process-put process 'magnus-headless-partial-line remainder)
-    (dolist (line (butlast lines))
-      (magnus-headless--consume-line process line))))
+  "Consume bounded JSONL OUTPUT from PROCESS.
+An overlong record is discarded through its next newline without preventing
+subsequent records in OUTPUT from being decoded."
+  (let* ((segments (split-string output "\n" nil))
+         (last-index (1- (length segments)))
+         (partial (or (process-get process 'magnus-headless-partial-line) ""))
+         (discarding
+          (process-get process 'magnus-headless-discarding-line-p))
+         (limit (max 0 magnus-headless-jsonl-line-limit)))
+    (cl-loop
+     for segment in segments
+     for index from 0
+     for final-p = (= index last-index)
+     do
+     (if discarding
+         ;; A non-final segment is followed by a newline, which terminates the
+         ;; record currently being discarded.  The next segment starts clean.
+         (unless final-p
+           (setq discarding nil
+                 partial ""))
+       (let ((combined-length (+ (length partial) (length segment))))
+         (cond
+          ((> combined-length limit)
+           (process-put
+            process 'magnus-headless-discarded-jsonl-lines
+            (1+ (or (process-get
+                     process 'magnus-headless-discarded-jsonl-lines)
+                    0)))
+           (magnus-headless--record-error
+            process 'magnus-headless-decode-errors 'jsonl-line-too-long
+            (format "Provider JSONL record exceeded %d characters" limit)
+            :limit limit :observed-at-least combined-length)
+           (setq partial ""
+                 ;; Without a newline this same record continues in the next
+                 ;; filter invocation and must be dropped without another error.
+                 discarding final-p))
+          (t
+           (let ((combined (concat partial segment)))
+             (if final-p
+                 (setq partial combined)
+               (setq partial "")
+               (magnus-headless--consume-line process combined))))))))
+    (process-put process 'magnus-headless-partial-line partial)
+    (process-put process 'magnus-headless-discarding-line-p discarding)))
 
 (defun magnus-headless--stderr-filter (stderr-process output)
   "Deliver and retain OUTPUT from STDERR-PROCESS."
   (when-let ((process (process-get stderr-process 'magnus-headless-process)))
     (let* ((existing (or (process-get process 'magnus-headless-stderr) ""))
            (combined (concat existing output))
-           (length (length combined)))
-      (when (> length magnus-headless-stderr-limit)
+           (length (length combined))
+           (limit (max 0 magnus-headless-stderr-limit)))
+      (when (> length limit)
+        (process-put
+         process 'magnus-headless-stderr-dropped-chars
+         (+ (- length limit)
+            (or (process-get
+                 process 'magnus-headless-stderr-dropped-chars)
+                0)))
         (setq combined (substring combined
-                                  (- length magnus-headless-stderr-limit))))
+                                  (- length limit))))
       (process-put process 'magnus-headless-stderr combined)
       (magnus-headless--callback process :on-stderr output))))
 
@@ -307,7 +434,11 @@ file and the caller is responsible for deleting it."
          (provider-errors
           (nreverse (process-get process 'magnus-headless-provider-errors)))
          (callback-errors
-          (nreverse (process-get process 'magnus-headless-callback-errors))))
+          (nreverse (process-get process 'magnus-headless-callback-errors)))
+         (dropped-errors
+          (process-get process 'magnus-headless-dropped-errors))
+         (stderr-dropped
+          (or (process-get process 'magnus-headless-stderr-dropped-chars) 0)))
     (list
      :provider (process-get process 'magnus-headless-provider)
      :success-p (and (eq status 'exit)
@@ -318,9 +449,8 @@ file and the caller is responsible for deleting it."
                           ('terminal terminal)
                           ('structured-result structured-p)))
                       success-requires)
-                     (null decode-errors)
-                     (null provider-errors)
-                     (null callback-errors))
+                     (zerop
+                      (or (process-get process 'magnus-headless-error-count) 0)))
      :status status
      :exit-status exit-status
      :process-event (process-get process 'magnus-headless-process-event)
@@ -333,6 +463,13 @@ file and the caller is responsible for deleting it."
      (process-get process 'magnus-headless-structured-result)
      :terminal-event terminal
      :stderr (or (process-get process 'magnus-headless-stderr) "")
+     :stderr-truncated-p (> stderr-dropped 0)
+     :stderr-dropped-chars stderr-dropped
+     :jsonl-line-limit (max 0 magnus-headless-jsonl-line-limit)
+     :discarded-jsonl-lines
+     (or (process-get process 'magnus-headless-discarded-jsonl-lines) 0)
+     :errors-truncated-p (not (null dropped-errors))
+     :dropped-errors dropped-errors
      :decode-errors decode-errors
      :provider-errors provider-errors
      :callback-errors callback-errors)))
@@ -363,10 +500,12 @@ structured-result event."
   (unless (process-get process 'magnus-headless-completed-p)
     (magnus-headless--drain-terminal-output process)
     (process-put process 'magnus-headless-completed-p t)
-    (when-let ((partial (process-get process 'magnus-headless-partial-line)))
-      (unless (string-empty-p partial)
-        (process-put process 'magnus-headless-partial-line "")
-        (magnus-headless--consume-line process partial)))
+    (unless (process-get process 'magnus-headless-discarding-line-p)
+      (when-let ((partial (process-get process 'magnus-headless-partial-line)))
+        (unless (string-empty-p partial)
+          (process-put process 'magnus-headless-partial-line "")
+          (magnus-headless--consume-line process partial))))
+    (process-put process 'magnus-headless-discarding-line-p nil)
     (let ((request (process-get process 'magnus-headless-request)))
       (unwind-protect
           (magnus-headless--callback
@@ -508,6 +647,7 @@ remains with the caller."
             (process-put process 'magnus-headless-success-requires
                          (plist-get spec :success-requires))
             (process-put process 'magnus-headless-partial-line "")
+            (process-put process 'magnus-headless-discarding-line-p nil)
             (when-let ((session-id (plist-get spec :session-id)))
               (process-put process 'magnus-headless-session-id session-id))
             (when-let ((candidate (plist-get spec :candidate-session-id)))
