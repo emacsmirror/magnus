@@ -372,7 +372,8 @@ The review transient should set this to its dispatcher."
 
 (defun magnus-review-ui--string (value &optional fallback)
   "Convert VALUE to a display string, or return FALLBACK."
-  (cond ((stringp value) value)
+  (cond ((null value) fallback)
+        ((stringp value) value)
         ((symbolp value) (symbol-name value))
         ((numberp value) (number-to-string value))
         (t fallback)))
