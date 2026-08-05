@@ -283,6 +283,10 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
 (defun magnus-status ()
   "Open or switch to the magnus status buffer."
   (interactive)
+  ;; `magnus--shutdown' removes this global hook.  Reinstall it here as well as
+  ;; in the mode constructor so an existing status buffer can be reused after
+  ;; a clean initialize/shutdown/initialize lifecycle.
+  (add-hook 'magnus-instances-changed-hook #'magnus-status--maybe-refresh)
   (let ((buffer (get-buffer-create magnus-buffer-name)))
     (with-current-buffer buffer
       (unless (derived-mode-p 'magnus-status-mode)
@@ -351,6 +355,11 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
     (cancel-timer magnus-status--review-animation-timer))
   (setq magnus-status--review-animation-timer nil
         magnus-status--review-animation-frame 0))
+
+(defun magnus-status-shutdown ()
+  "Stop global status presentation resources and detach refresh hooks."
+  (magnus-status-stop-review-animation)
+  (remove-hook 'magnus-instances-changed-hook #'magnus-status--maybe-refresh))
 
 (defun magnus-status--review-animation-slot-p ()
   "Return non-nil when the current buffer contains an animation slot."

@@ -82,7 +82,13 @@
 (declare-function magnus-review-load-all "magnus-review")
 (declare-function magnus-review-controller-setup "magnus-review-controller")
 (declare-function magnus-review-controller-shutdown "magnus-review-controller")
-(declare-function magnus-status-stop-review-animation "magnus-status")
+(declare-function magnus-status-shutdown "magnus-status")
+(declare-function magnus-persistence-shutdown "magnus-persistence")
+(declare-function magnus-context-shutdown "magnus-context")
+(declare-function magnus-coord-shutdown "magnus-coord")
+(declare-function magnus-attention-shutdown "magnus-attention")
+(declare-function magnus-health-shutdown "magnus-health")
+(declare-function magnus-trace-stop-timer "magnus-trace")
 
 (defvar magnus-context-directory)
 (defvar magnus-context-cache-directory)
@@ -585,44 +591,46 @@ them now; new agents populate once their memory file exists."
     (user-error
      "Magnus was upgraded in this Emacs session; restart Emacs before use"))
   (unless magnus--initialized
-    (require 'magnus-instances)
-    (require 'magnus-persistence)
-    (require 'magnus-process)
-    (require 'magnus-context)
-    (require 'magnus-coord)
-    (require 'magnus-attention)
-    (require 'magnus-health)
-    (require 'magnus-review)
-    (require 'magnus-review-controller)
-    (require 'magnus-review-ui)
-    (require 'magnus-status)
-    (require 'magnus-transient)
-    (magnus--migrate-data-files)
-    (magnus-persistence-load)
-    (magnus--agents-index-load)
-    ;; Reviews must be reconstructed before the controller attaches its hooks.
-    ;; Controller setup then rebuilds its durable queue and synchronously replays
-    ;; review checkpoints before the general coordination watcher starts.
-    (magnus-review-load-all)
-    (magnus-persistence--setup-autosave)
-    (add-hook 'kill-emacs-hook #'magnus--shutdown)
-    (condition-case error-data
-        (progn
-          (magnus-review-controller-setup)
-          (magnus-coord-ensure-watchers)
-          (magnus-context-setup-hooks)
-          (magnus-attention-setup-hooks)
-          (magnus-attention-start)
-          (magnus-coord-start-reminders)
-          (magnus-health-start)
-          (magnus-coord-attention-load)
-          (magnus-coord-setup-attention-tracking)
-          (setq magnus--initialized t))
-      (error
-       ;; A controller setup may already have launched a review.  Tear down
-       ;; immediately so retrying M-x magnus cannot create a second owner.
-       (magnus--shutdown)
-       (signal (car error-data) (cdr error-data))))))
+    (let ((complete nil))
+      (unwind-protect
+          (progn
+            (require 'magnus-instances)
+            (require 'magnus-persistence)
+            (require 'magnus-process)
+            (require 'magnus-context)
+            (require 'magnus-coord)
+            (require 'magnus-attention)
+            (require 'magnus-health)
+            (require 'magnus-review)
+            (require 'magnus-review-controller)
+            (require 'magnus-review-ui)
+            (require 'magnus-status)
+            (require 'magnus-transient)
+            (magnus--migrate-data-files)
+            (magnus-persistence-load)
+            (magnus--agents-index-load)
+            ;; Reviews must be reconstructed before the controller attaches its
+            ;; hooks.  Controller setup then rebuilds the durable queue and
+            ;; synchronously replays checkpoints before the general watcher.
+            (magnus-review-load-all)
+            (magnus-persistence--setup-autosave)
+            (add-hook 'kill-emacs-hook #'magnus--shutdown)
+            (magnus-review-controller-setup)
+            (magnus-coord-ensure-watchers)
+            (magnus-context-setup-hooks)
+            (magnus-attention-setup-hooks)
+            (magnus-attention-start)
+            (magnus-coord-start-reminders)
+            (magnus-health-start)
+            (magnus-coord-attention-load)
+            (magnus-coord-setup-attention-tracking)
+            (setq magnus--initialized t
+                  complete t))
+        ;; Any setup step may have installed a hook, launched a reviewer, or
+        ;; allocated a timer before failing.  Teardown functions are idempotent,
+        ;; so unwind without guessing how far initialization progressed.
+        (unless complete
+          (magnus--shutdown))))))
 
 ;;;###autoload
 (defun magnus ()
@@ -664,22 +672,35 @@ The agent runs to completion and exits."
 
 ;;; Upgrade
 
-(defvar magnus-persistence--save-timer)
+(defun magnus--shutdown-subsystem (function)
+  "Call teardown FUNCTION without preventing the remaining cleanup.
+Return non-nil when FUNCTION completed successfully or is unavailable."
+  (if (not (fboundp function))
+      t
+    (condition-case err
+        (progn
+          (funcall function)
+          t)
+      (error
+       (message "Magnus: %s failed during shutdown: %s"
+                function (error-message-string err))
+       nil))))
 
 (defun magnus--shutdown ()
   "Stop all Magnus timers, watchers, and hooks."
-  (when (fboundp 'magnus-review-controller-shutdown)
-    (magnus-review-controller-shutdown))
-  (when (fboundp 'magnus-status-stop-review-animation)
-    (magnus-status-stop-review-animation))
-  (magnus-coord-stop-reminders)
-  (magnus-health-stop)
-  (magnus-attention-stop)
-  (when magnus-persistence--save-timer
-    (cancel-timer magnus-persistence--save-timer)
-    (setq magnus-persistence--save-timer nil))
-  (remove-hook 'kill-emacs-hook #'magnus--shutdown)
-  (setq magnus--initialized nil))
+  (unwind-protect
+      (dolist (function
+               '(magnus-review-controller-shutdown
+                 magnus-status-shutdown
+                 magnus-trace-stop-timer
+                 magnus-coord-shutdown
+                 magnus-health-shutdown
+                 magnus-attention-shutdown
+                 magnus-context-shutdown
+                 magnus-persistence-shutdown))
+        (magnus--shutdown-subsystem function))
+    (remove-hook 'kill-emacs-hook #'magnus--shutdown)
+    (setq magnus--initialized nil)))
 
 (defun magnus--upgrade-execute ()
   "Archive all agents, save state, and reinstall Magnus.

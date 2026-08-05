@@ -343,6 +343,11 @@ Compares time since last visit against twice the adaptive interval."
   (add-hook 'window-buffer-change-functions
             #'magnus-coord--on-buffer-focus))
 
+(defun magnus-coord-stop-attention-tracking ()
+  "Stop tracking user attention patterns."
+  (remove-hook 'window-buffer-change-functions
+               #'magnus-coord--on-buffer-focus))
+
 ;;; Attention persistence
 
 (defun magnus-coord--schedule-attention-save ()
@@ -825,6 +830,22 @@ Also updates vterm buffer activity ticks for quiescence tracking."
                (cancel-timer timer)))
            magnus-coord--review-ready-retries)
   (clrhash magnus-coord--review-ready-retries))
+
+(defun magnus-coord-shutdown ()
+  "Stop every long-lived coordination resource.
+Safe to call after partial setup and safe to call more than once."
+  (magnus-coord-stop-reminders)
+  (magnus-coord-stop-all-watchers)
+  (magnus-coord-stop-attention-tracking)
+  (remove-hook 'pre-command-hook #'magnus-coord--on-user-return)
+  (when magnus-coord--attention-save-timer
+    (cancel-timer magnus-coord--attention-save-timer)
+    (setq magnus-coord--attention-save-timer nil)
+    (condition-case err
+        (magnus-coord-attention-save)
+      (error
+       (message "Magnus: could not flush attention data: %s"
+                (error-message-string err))))))
 
 (defun magnus-coord--init-processed-mentions (directory)
   "Initialize processed mentions for DIRECTORY from current file content."

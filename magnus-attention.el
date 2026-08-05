@@ -388,5 +388,16 @@ Sends `y' which maps to confirm:yes in all CC prompt formats."
   (add-hook 'magnus-instances-changed-hook
             #'magnus-attention--on-instances-empty))
 
+(defun magnus-attention-shutdown ()
+  "Stop attention monitoring and detach its global hooks.
+This operation is idempotent so partial Magnus initialization can unwind
+without knowing which attention resources were installed."
+  (magnus-attention-stop)
+  (remove-hook 'magnus-instances-changed-hook
+               #'magnus-attention--on-instances-empty)
+  (setq magnus-attention-queue nil
+        magnus-attention-current nil
+        magnus-attention--checking nil))
+
 (provide 'magnus-attention)
 ;;; magnus-attention.el ends here

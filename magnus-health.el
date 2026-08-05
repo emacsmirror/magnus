@@ -574,5 +574,14 @@ the side window from flickering or resizing."
     (kill-buffer buf))
   (message "MAGNUS TERMINAL OFFLINE"))
 
+(defun magnus-health-shutdown ()
+  "Stop health monitoring and every optional dashboard resource."
+  (magnus-health-stop)
+  (when (or magnus-health-dashboard--timer
+            magnus-health-dashboard--generating
+            (get-buffer magnus-health-dashboard--buffer)
+            (get-process "magnus-health-bloomberg-gen"))
+    (magnus-health-dashboard--stop)))
+
 (provide 'magnus-health)
 ;;; magnus-health.el ends here

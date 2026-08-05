@@ -414,5 +414,21 @@ The file is placed in the project directory for easy access."
   "Set up hooks for context buffer persistence."
   (add-hook 'kill-emacs-hook #'magnus-context--save-all))
 
+(defun magnus-context-shutdown ()
+  "Flush context buffers, cancel pending saves, and detach global hooks.
+The live context buffers remain available to the user; only Magnus-owned
+background resources are stopped."
+  (condition-case err
+      (magnus-context--save-all)
+    (error
+     (message "Magnus: could not flush context buffers: %s"
+              (error-message-string err))))
+  (maphash (lambda (_directory timer)
+             (when (timerp timer)
+               (cancel-timer timer)))
+           magnus-context--save-timers)
+  (clrhash magnus-context--save-timers)
+  (remove-hook 'kill-emacs-hook #'magnus-context--save-all))
+
 (provide 'magnus-context)
 ;;; magnus-context.el ends here

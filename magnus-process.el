@@ -14,7 +14,11 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'filenotify)
+(require 'json)
+(require 'seq)
+(require 'subr-x)
 (require 'vterm)
 (require 'magnus-instances)
 (require 'magnus-provider)
@@ -49,6 +53,139 @@ Functions are called with the ready `magnus-instance' as their sole argument.")
 
 ;;; Process creation
 
+(defun magnus-process--discard-created-runtime (instance external)
+  "Discard runtime resources acquired while creating INSTANCE.
+When EXTERNAL is non-nil, first give the provider a chance to release its
+own timers and transport state.  The buffer cleanup is an intentional
+fallback: a provider start may fail after attaching a terminal but before its
+normal `stop' operation is fully usable."
+  (when external
+    (condition-case err
+        (magnus-provider-call instance 'stop t)
+      (error
+       (message "Magnus: provider creation rollback failed for %s: %s"
+                (magnus-instance-name instance)
+                (error-message-string err)))))
+  (when-let ((buffer (magnus-instance-buffer instance)))
+    (when (buffer-live-p buffer)
+      (when-let ((process (get-buffer-process buffer)))
+        (ignore-errors (set-process-query-on-exit-flag process nil))
+        (when (process-live-p process)
+          (ignore-errors (delete-process process))))
+      (ignore-errors (kill-buffer buffer))))
+  ;; The object is about to leave the registry.  Set these slots directly so
+  ;; a failing registry hook cannot strand a live-looking ghost while cleanup
+  ;; is still in progress.
+  (setf (magnus-instance-buffer instance) nil
+        (magnus-instance-status instance) 'stopped))
+
+(defun magnus-process--coord-row-existed-p (directory name)
+  "Return non-nil when DIRECTORY already has an Active Work row for NAME.
+If an existing coordination file cannot be parsed, return non-nil: rollback
+must prefer leaving ambiguous pre-existing data untouched."
+  (let ((file (magnus-coord-file-path directory)))
+    (and (file-exists-p file)
+         (condition-case nil
+             (cl-some
+              (lambda (entry)
+                (string= (or (plist-get entry :agent) "") name))
+              (plist-get (magnus-coord-parse directory) :active))
+           (error t)))))
+
+(defun magnus-process--rollback-coordination
+    (directory instance attempted watcher-existed
+               session-start-existed session-start-value row-existed)
+  "Roll back coordination state acquired for a failed INSTANCE creation.
+ATTEMPTED says registration began.  WATCHER-EXISTED and the session-start
+arguments snapshot project state from before this creation.  ROW-EXISTED is
+non-nil when its coordination identity already belonged to pre-existing data."
+  (when attempted
+    ;; An agent can publish its Active Work row very quickly after its terminal
+    ;; starts.  Remove only this new identity's row; a pre-existing namesake is
+    ;; deliberately left alone because the Markdown table is keyed by name.
+    (unless row-existed
+      (condition-case err
+          (when (file-exists-p (magnus-coord-file-path directory))
+            (magnus-coord-clear-agent
+             directory (magnus-instance-name instance)))
+        (error
+         (message "Magnus: coordination row rollback failed for %s: %s"
+                  (magnus-instance-name instance)
+                  (error-message-string err)))))
+    ;; Restore only state this registration changed.  In particular, never
+    ;; stop a watcher that was already serving another project agent.
+    (condition-case err
+        (if session-start-existed
+            (puthash directory session-start-value
+                     magnus-coord--session-start-times)
+          (remhash directory magnus-coord--session-start-times))
+      (error
+       (message "Magnus: session-state rollback failed for %s: %s"
+                directory (error-message-string err))))
+    (when (and (not watcher-existed)
+               (member directory magnus-coord--watched-dirs))
+      (condition-case err
+          (magnus-coord-stop-watching directory)
+        (error
+         (message "Magnus: watcher rollback failed for %s: %s"
+                  directory (error-message-string err)))))))
+
+(defun magnus-process--rollback-creation
+    (instance directory coordination-attempted runtime-attempted external
+              watcher-existed session-start-existed session-start-value
+              row-existed)
+  "Release resources acquired by one failed INSTANCE creation transaction."
+  ;; Reverse acquisition order: runtime, coordination, registry.
+  (when runtime-attempted
+    (magnus-process--discard-created-runtime instance external))
+  (magnus-process--rollback-coordination
+   directory instance coordination-attempted watcher-existed
+   session-start-existed session-start-value row-existed)
+  (when (memq instance (magnus-instances-list))
+    (condition-case err
+        (magnus-instances-remove instance)
+      (error
+       ;; `magnus-instances-remove' mutates the registry before running its
+       ;; hook, so an error here is diagnostic rather than a ghost instance.
+       (message "Magnus: registry rollback hook failed for %s: %s"
+                (magnus-instance-name instance)
+                (error-message-string err))))))
+
+(defun magnus-process--create-transaction (instance starter)
+  "Register INSTANCE and call STARTER as one rollback-safe transaction.
+STARTER receives INSTANCE and a non-nil external-provider flag.  On failure,
+release only the runtime, coordination state, and registry entry acquired by
+this call.  Return INSTANCE after successful startup."
+  (let* ((directory (magnus-instance-directory instance))
+         (missing (make-symbol "missing-session-start"))
+         (session-start-value
+          (gethash directory magnus-coord--session-start-times missing))
+         (session-start-existed (not (eq session-start-value missing)))
+         (watcher-existed
+          (and (member directory magnus-coord--watched-dirs) t))
+         (row-existed
+          (magnus-process--coord-row-existed-p
+           directory (magnus-instance-name instance)))
+         coordination-attempted
+         runtime-attempted
+         external
+         committed)
+    (unwind-protect
+        (progn
+          (magnus-instances-add instance)
+          (setq coordination-attempted t)
+          (magnus-coord-register-agent directory instance)
+          (setq external (magnus-provider-external-p instance)
+                runtime-attempted t)
+          (funcall starter instance external)
+          (setq committed t)
+          instance)
+      (unless committed
+        (magnus-process--rollback-creation
+         instance directory coordination-attempted runtime-attempted external
+         watcher-existed session-start-existed session-start-value
+         row-existed)))))
+
 (defun magnus-process-create (&optional directory name provider initial-message)
   "Create a new agent instance.
 DIRECTORY is the working directory.  If nil, prompts for one.
@@ -61,15 +198,14 @@ INITIAL-MESSAGE is passed to external providers when non-nil."
          (instance-name (or name
                             (funcall magnus-instance-name-generator dir)))
          (instance (magnus-instances-create dir instance-name provider)))
-    (magnus-instances-add instance)
-    ;; Set up coordination files and register agent
-    (magnus-coord-register-agent dir instance)
-    (if (magnus-provider-external-p instance)
-        (if initial-message
-            (magnus-provider-call instance 'start initial-message)
-          (magnus-provider-call instance 'start))
-      (magnus-process--spawn instance))
-    instance))
+    (magnus-process--create-transaction
+     instance
+     (lambda (candidate external)
+       (if external
+           (if initial-message
+               (magnus-provider-call candidate 'start initial-message)
+             (magnus-provider-call candidate 'start))
+         (magnus-process--spawn candidate))))))
 
 (defun magnus-process-create-codex (&optional directory name initial-message)
   "Create an opt-in Codex instance in DIRECTORY with NAME.
@@ -90,30 +226,48 @@ When INITIAL-MESSAGE is non-nil, include it in the native TUI's first turn."
          (directory (magnus-instance-directory instance))
          (buffer-name (format "*claude:%s*" name))
          (default-directory directory)
-         (sessions-before (magnus-process--list-sessions directory)))
-    ;; Create vterm buffer
-    (let ((buffer (magnus-process--create-vterm-buffer buffer-name)))
-      (magnus-instances-update instance
-                               :buffer buffer
-                               :status 'running)
-      ;; Send the claude command
-      (with-current-buffer buffer
-        (vterm-send-string magnus-claude-executable)
-        (run-with-timer 0.1 nil
-                        (lambda ()
-                          (when (buffer-live-p buffer)
-                            (with-current-buffer buffer
-                              (vterm-send-return))))))
-      ;; Set up process sentinel
-      (magnus-process--setup-sentinel instance buffer)
-      ;; Send onboarding message after Claude starts
-      ;; Capture summon context now (dynamic binding unwinds before timer fires)
-      (let ((summon-ctx magnus--summon-context))
-        (run-with-timer 5 nil #'magnus-process--send-onboarding
-                        instance summon-ctx))
-      ;; Watch for new session to appear
-      (magnus-process--watch-for-session instance directory sessions-before)
-      buffer)))
+         (sessions-before (magnus-process--list-sessions directory))
+         return-timer
+         onboarding-timer
+         buffer
+         spawned)
+    (unwind-protect
+        (progn
+          ;; Create vterm buffer.
+          (setq buffer (magnus-process--create-vterm-buffer buffer-name))
+          (magnus-instances-update instance
+                                   :buffer buffer
+                                   :status 'running)
+          ;; Send the claude command.
+          (with-current-buffer buffer
+            (vterm-send-string magnus-claude-executable)
+            (setq return-timer
+                  (run-with-timer
+                   0.1 nil
+                   (lambda ()
+                     (when (buffer-live-p buffer)
+                       (with-current-buffer buffer
+                         (vterm-send-return)))))))
+          ;; Set up process sentinel.
+          (magnus-process--setup-sentinel instance buffer)
+          ;; Send onboarding after Claude starts.  Capture summon context now;
+          ;; its dynamic binding unwinds before the timer fires.
+          (let ((summon-ctx magnus--summon-context))
+            (setq onboarding-timer
+                  (run-with-timer 5 nil #'magnus-process--send-onboarding
+                                  instance summon-ctx)))
+          ;; Watch for a new session to appear.  This is deliberately last, so
+          ;; no later synchronous failure can orphan a successful watcher.
+          (magnus-process--watch-for-session
+           instance directory sessions-before)
+          (setq spawned t)
+          buffer)
+      (unless spawned
+        (when (timerp return-timer)
+          (cancel-timer return-timer))
+        (when (timerp onboarding-timer)
+          (cancel-timer onboarding-timer))
+        (magnus-process--discard-created-runtime instance nil)))))
 
 (defun magnus-process--send-onboarding (instance &optional summon-context)
   "Send onboarding message to INSTANCE.
@@ -296,27 +450,40 @@ Uses both filenotify and polling fallback for robustness."
     (let* ((descriptor nil)
            (poll-timer nil)
            (cleanup-timer nil)
+           (watching nil)
            (detect-fn
             (lambda ()
               (magnus-process--detect-new-session
                instance directory sessions-before
                (list descriptor poll-timer cleanup-timer)))))
-      ;; Primary: file-notify watcher
-      (setq descriptor
-            (file-notify-add-watch
-             sessions-dir '(change)
-             (lambda (_event) (funcall detect-fn))))
-      ;; Fallback: poll every 5 seconds
-      (setq poll-timer
-            (run-with-timer 5 5 detect-fn))
-      ;; Final cleanup after 120 seconds
-      (setq cleanup-timer
-            (run-with-timer 120 nil
-                            (lambda ()
-                              (when descriptor
-                                (ignore-errors (file-notify-rm-watch descriptor)))
-                              (when poll-timer
-                                (cancel-timer poll-timer))))))))
+      (unwind-protect
+          (progn
+            ;; Primary: file-notify watcher.
+            (setq descriptor
+                  (file-notify-add-watch
+                   sessions-dir '(change)
+                   (lambda (_event) (funcall detect-fn))))
+            ;; Fallback: poll every 5 seconds.
+            (setq poll-timer
+                  (run-with-timer 5 5 detect-fn))
+            ;; Final cleanup after 120 seconds.
+            (setq cleanup-timer
+                  (run-with-timer
+                   120 nil
+                   (lambda ()
+                     (when descriptor
+                       (ignore-errors
+                         (file-notify-rm-watch descriptor)))
+                     (when poll-timer
+                       (cancel-timer poll-timer)))))
+            (setq watching t))
+        (unless watching
+          (when descriptor
+            (ignore-errors (file-notify-rm-watch descriptor)))
+          (when (timerp poll-timer)
+            (cancel-timer poll-timer))
+          (when (timerp cleanup-timer)
+            (cancel-timer cleanup-timer)))))))
 
 (defun magnus-process--detect-new-session (instance directory sessions-before resources)
   "Try to detect a new session for INSTANCE in DIRECTORY.
@@ -366,11 +533,18 @@ a list of (descriptor poll-timer cleanup-timer) to clean up."
 
 (defun magnus-process--create-vterm-buffer (buffer-name)
   "Create a vterm buffer with BUFFER-NAME."
-  (let ((buffer (generate-new-buffer buffer-name)))
-    (with-current-buffer buffer
-      (vterm-mode)
-      (magnus-process--setup-keys))
-    buffer))
+  (let ((buffer (generate-new-buffer buffer-name))
+        initialized)
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (vterm-mode)
+            (magnus-process--setup-keys))
+          (setq initialized t)
+          buffer)
+      (unless initialized
+        (when (buffer-live-p buffer)
+          (ignore-errors (kill-buffer buffer)))))))
 
 (defun magnus-process-send-escape ()
   "Send ESC to Claude Code (mapped from \\`keyboard-quit')."
@@ -711,10 +885,10 @@ Returns the new instance."
                             (concat "headless-"
                                     (funcall magnus-instance-name-generator dir))))
          (instance (magnus-instances-create dir instance-name)))
-    (magnus-instances-add instance)
-    (magnus-coord-register-agent dir instance)
-    (magnus-process--spawn-headless instance prompt)
-    instance))
+    (magnus-process--create-transaction
+     instance
+     (lambda (candidate _external)
+       (magnus-process--spawn-headless candidate prompt)))))
 
 (defun magnus-process--spawn-headless (instance prompt)
   "Spawn a headless Claude Code process for INSTANCE with PROMPT."
@@ -724,7 +898,7 @@ Returns the new instance."
          (default-directory directory)
          (full-prompt (magnus-process--headless-prompt instance prompt))
          (args (magnus-process--headless-args full-prompt)))
-    (let ((buffer (get-buffer-create buffer-name)))
+    (let ((buffer (generate-new-buffer buffer-name)))
       (with-current-buffer buffer
         (magnus-process-headless-mode)
         (setq magnus-process--headless-instance instance)
