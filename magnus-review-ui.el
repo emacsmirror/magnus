@@ -277,11 +277,60 @@ Signal an error containing Git's diagnostic when the command fails."
             (let ((safe-path (magnus-review-ui--normalize-path path)))
               (unless safe-path
                 (error "Review evidence contains an unsafe changed path"))
-              (push (list :status status
-                          :old-path (unless (eq letter ?A) safe-path)
-                          :new-path (unless (eq letter ?D) safe-path))
-                    records))))))
+              ;; Git represents a blob/symlink type change as one `T' status
+              ;; but emits adjacent deletion and addition patch sections.  Feed
+              ;; those sections exact one-sided records, then recombine them
+              ;; into one logical file after both headers have been checked.
+              (if (eq letter ?T)
+                  (progn
+                    (push (list :status status
+                                :old-path safe-path
+                                :new-path nil)
+                          records)
+                    (push (list :status status
+                                :old-path nil
+                                :new-path safe-path)
+                          records))
+                (push (list :status status
+                            :old-path (unless (eq letter ?A) safe-path)
+                            :new-path (unless (eq letter ?D) safe-path))
+                      records)))))))
     (nreverse records)))
+
+(defun magnus-review-ui--collapse-type-changes (files)
+  "Collapse adjacent one-sided type-change FILES into logical files."
+  (let (collapsed)
+    (while files
+      (let ((file (pop files)))
+        (if (and (string-prefix-p "T" (or (magnus-review-ui--file-status file)
+                                           ""))
+                 (magnus-review-ui--file-old-path file)
+                 (null (magnus-review-ui--file-new-path file)))
+            (let ((addition (pop files)))
+              (unless (and addition
+                           (string-prefix-p
+                            "T" (or (magnus-review-ui--file-status addition)
+                                    ""))
+                           (null (magnus-review-ui--file-old-path addition))
+                           (equal (magnus-review-ui--file-old-path file)
+                                  (magnus-review-ui--file-new-path addition)))
+                (error "Review patch has a malformed Git type change"))
+              (setf (magnus-review-ui--file-new-path file)
+                    (magnus-review-ui--file-new-path addition)
+                    (magnus-review-ui--file-display-path file)
+                    (magnus-review-ui--file-new-path addition)
+                    (magnus-review-ui--file-headers file)
+                    (append (magnus-review-ui--file-headers file)
+                            (magnus-review-ui--file-headers addition))
+                    (magnus-review-ui--file-hunks file)
+                    (append (magnus-review-ui--file-hunks file)
+                            (magnus-review-ui--file-hunks addition)))
+              (push file collapsed))
+          (when (string-prefix-p "T" (or (magnus-review-ui--file-status file)
+                                          ""))
+            (error "Review patch has a malformed Git type change"))
+          (push file collapsed))))
+    (nreverse collapsed)))
 
 (defun magnus-review-ui--artifact-bytes (path kind)
   "Read exact bytes from regular, non-symlink evidence PATH named KIND."
@@ -365,9 +414,11 @@ Signal an error containing Git's diagnostic when the command fails."
           (line)
           (finish-file)
           (let ((record (pop status-queue)))
+            (unless record
+              (error "Review patch contains a file absent from name-status"))
             (setq file
                   (magnus-review-ui--make-file
-                   :status (or (plist-get record :status) "M")
+                   :status (plist-get record :status)
                    :old-path (plist-get record :old-path)
                    :new-path (plist-get record :new-path)
                    :headers (list line)
@@ -433,18 +484,15 @@ Signal an error containing Git's diagnostic when the command fails."
           (check-path-header line "--- " 'old)
           (check-path-header line "+++ " 'new))))
       (finish-file))
+    (when status-queue
+      (error "Review name-status contains a file absent from the patch"))
     (nreverse files)))
 
 (defun magnus-review-ui--parse-evidence (patch name-status)
   "Parse and cross-check persisted PATCH and NAME-STATUS evidence."
   (let* ((statuses (magnus-review-ui--parse-name-status name-status))
          (files (magnus-review-ui--parse-diff patch statuses)))
-    (unless (= (length files) (length statuses))
-      (error
-       "Review evidence disagrees: patch has %d file%s, name-status has %d"
-       (length files) (if (= (length files) 1) "" "s")
-       (length statuses)))
-    files))
+    (magnus-review-ui--collapse-type-changes files)))
 
 (defun magnus-review-ui--validate-result-scope (round result)
   "Require any scope object IDs in RESULT to agree with ROUND."
@@ -456,7 +504,8 @@ Signal an error containing Git's diagnostic when the command fails."
             (kind (nth 2 spec)))
         (when (and actual expected
                    (not (and (stringp actual)
-                             (string-equal-ignore-case actual expected))))
+                             (string= (downcase actual)
+                                      (downcase expected)))))
           (error "Review result %s object does not match its immutable round"
                  kind))))))
 

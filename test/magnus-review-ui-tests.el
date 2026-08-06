@@ -55,6 +55,26 @@
              " shared value\n")
             path path path path)))
 
+(defun magnus-test-review-ui--type-change-patch (&optional patch-path)
+  "Return Git's two-section regular-file-to-symlink patch for PATCH-PATH."
+  (let ((path (or patch-path "lib/link")))
+    (format (concat
+             "diff --git a/%s b/%s\n"
+             "deleted file mode 100644\n"
+             "index 1111111..0000000\n"
+             "--- a/%s\n"
+             "+++ /dev/null\n"
+             "@@ -1 +0,0 @@\n"
+             "-target\n"
+             "diff --git a/%s b/%s\n"
+             "new file mode 120000\n"
+             "index 0000000..2222222\n"
+             "--- /dev/null\n"
+             "+++ b/%s\n"
+             "@@ -0,0 +1 @@\n"
+             "+target\n")
+            path path path path path path)))
+
 (ert-deftest magnus-review-ui-normalizes-only-safe-repository-paths ()
   (should (equal (magnus-review-ui--normalize-path "./a/lib.el") "a/lib.el"))
   (should (equal (magnus-review-ui--normalize-path "b/lib.el") "b/lib.el"))
@@ -98,6 +118,30 @@
                    '(1 nil 2)))
     (should (equal (mapcar #'magnus-review-ui--diff-line-new-line lines)
                    '(nil 1 2)))))
+
+(ert-deftest magnus-review-ui-collapses-git-type-change-patch-sections ()
+  (let* ((files
+          (magnus-review-ui--parse-evidence
+           (magnus-test-review-ui--type-change-patch)
+           "T\0lib/link\0"))
+         (file (car files)))
+    (should (= (length files) 1))
+    (should (equal (magnus-review-ui--file-status file) "T"))
+    (should (equal (magnus-review-ui--file-old-path file) "lib/link"))
+    (should (equal (magnus-review-ui--file-new-path file) "lib/link"))
+    (should (= (length (magnus-review-ui--file-hunks file)) 2))
+    (should (= (cl-count-if
+                (lambda (header) (string-prefix-p "diff --git " header))
+                (magnus-review-ui--file-headers file))
+               2))))
+
+(ert-deftest magnus-review-ui-rejects-incomplete-git-type-change ()
+  (let* ((patch (magnus-test-review-ui--type-change-patch))
+         (second (string-match "diff --git " patch 1)))
+    (should-error
+     (magnus-review-ui--parse-evidence (substring patch 0 second)
+                                       "T\0lib/link\0")
+     :type 'error)))
 
 (ert-deftest magnus-review-ui-renders-a-magit-style-completed-round ()
   (let* ((round (magnus-test-review-ui--round 1))
