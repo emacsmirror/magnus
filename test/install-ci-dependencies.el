@@ -2,6 +2,8 @@
 
 (require 'package)
 
+(setq package-install-upgrade-built-in t)
+
 (setq package-archives
       '(("gnu" . "https://elpa.gnu.org/packages/")
         ("nongnu" . "https://elpa.nongnu.org/nongnu/")

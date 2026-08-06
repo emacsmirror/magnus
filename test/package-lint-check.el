@@ -3,7 +3,13 @@
 (require 'package)
 (require 'package-lint)
 
-;; Populate package descriptors without activating unrelated autoload files.
+;; Package lint validates every declared dependency.  CI intentionally does not
+;; compile vterm, so load cached archive descriptors as well as installed ones.
+(setq package-archives
+      '(("gnu" . "https://elpa.gnu.org/packages/")
+        ("nongnu" . "https://elpa.nongnu.org/nongnu/")
+        ("melpa" . "https://melpa.org/packages/")))
+(package-read-all-archive-contents)
 (package-load-all-descriptors)
 
 (let ((file (expand-file-name "magnus.el" magnus-test-project-directory))
