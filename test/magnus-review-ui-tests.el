@@ -20,7 +20,10 @@
    :completed-at 2
    :verdict 'comment
    :read-state 'unread
-   :metadata '((finding_count . 1))))
+   :finding-count 1
+   :result-sha256 (make-string 64 ?a)
+   :patch-sha256 (make-string 64 ?b)
+   :name-status-sha256 (make-string 64 ?c)))
 
 (defun magnus-test-review-ui--review (&rest rounds)
   "Return a canonical review containing ROUNDS."
@@ -35,6 +38,8 @@
    :model "gpt-test"
    :effort 'high
    :task "Review the committed implementation"
+   :reviewer-expertise nil
+   :revision 1
    :lifecycle 'open
    :created-at 1
    :updated-at 2
@@ -152,8 +157,7 @@
            "M\0lib/sample.el\0")))
     (with-temp-buffer
       (magnus-review-ui-mode)
-      (setq-local magnus-review-ui--review review)
-      (setq-local magnus-review-ui--round round)
+      (magnus-review-ui--remember-identity review round)
       (setq-local
        magnus-review-ui--result
        `(:result
@@ -250,31 +254,34 @@
     (magnus-review-ui-mode)
     (let* ((round (magnus-test-review-ui--round 1))
            (review (magnus-test-review-ui--review round))
-           calls)
-      (setq-local magnus-review-ui--review review)
-      (setq-local magnus-review-ui--round round)
+           (writes 0))
+      (magnus-review-ui--remember-identity review round)
       (setq-local magnus-review-ui--result '(:result (:summary "Reviewed")))
-      (let ((magnus-review-ui-mark-read-function
-             (lambda (candidate candidate-round)
-               (push (list candidate candidate-round) calls))))
+      (setq-local magnus-review-ui--diff-error nil)
+      (cl-letf (((symbol-function 'magnus-review-mark-read)
+                 (lambda (_candidate candidate-round)
+                   (unless (eq (magnus-review-round-read-state candidate-round)
+                               'read)
+                     (setf (magnus-review-round-read-state candidate-round)
+                           'read)
+                     (cl-incf writes)))))
         (magnus-review-ui--mark-read)
         (magnus-review-ui--mark-read))
-      (should (= (length calls) 1))
-      (should (equal magnus-review-ui--marked-read-rounds '(1))))))
+      (should (= writes 1)))))
 
 (ert-deftest magnus-review-ui-keeps-corrupt-result-unread ()
   (with-temp-buffer
     (magnus-review-ui-mode)
     (let ((round (magnus-test-review-ui--round 1))
           called)
-      (setq-local magnus-review-ui--round round)
+      (setq-local magnus-review-ui--round round
+                  magnus-review-ui--diff-error nil)
       (setq-local magnus-review-ui--result
                   '(:magnus_review_ui_error "invalid JSON"))
-      (let ((magnus-review-ui-mark-read-function
-             (lambda (&rest _arguments) (setq called t))))
+      (cl-letf (((symbol-function 'magnus-review-mark-read)
+                 (lambda (&rest _arguments) (setq called t))))
         (magnus-review-ui--mark-read))
-      (should-not called)
-      (should-not magnus-review-ui--marked-read-rounds))))
+      (should-not called))))
 
 (ert-deftest magnus-review-ui-round-navigation-is-bounded-and-stable ()
   (with-temp-buffer
@@ -283,8 +290,7 @@
            (second (magnus-test-review-ui--round 2))
            (review (magnus-test-review-ui--review first second))
            (refreshed 0))
-      (setq-local magnus-review-ui--review review)
-      (setq-local magnus-review-ui--round first)
+      (magnus-review-ui--remember-identity review first)
       (cl-letf (((symbol-function 'magnus-review-ui-refresh)
                  (lambda () (cl-incf refreshed))))
         (magnus-review-ui-next-round)
@@ -301,14 +307,39 @@
     (magnus-review-ui-mode)
     (let* ((round (magnus-test-review-ui--round 1))
            (review (magnus-test-review-ui--review round))
+           (magnus-reviews (list review))
            received)
-      (setq-local magnus-review-ui--review review)
-      (setq-local magnus-review-ui--round round)
-      (let ((magnus-review-ui-action-function
-             (lambda (candidate candidate-round)
-               (setq received (list candidate candidate-round)))))
+      (magnus-review-ui--remember-identity review round)
+      (cl-letf (((symbol-function 'magnus-review-actions)
+                 (lambda (candidate candidate-round)
+                   (setq received (list candidate candidate-round)))))
         (magnus-review-ui-actions))
       (should (equal received (list review round))))))
+
+(ert-deftest magnus-review-ui-refresh-re-resolves-stale-buffer-objects ()
+  (with-temp-buffer
+    (magnus-review-ui-mode)
+    (let* ((old-round (magnus-test-review-ui--round 1))
+           (new-round (magnus-test-review-ui--round 1))
+           (old-review (magnus-test-review-ui--review old-round))
+           (new-review (magnus-test-review-ui--review new-round))
+           (magnus-reviews (list new-review)))
+      (magnus-review-ui--remember-identity old-review old-round)
+      (cl-letf (((symbol-function 'magnus-review-ui--load-artifacts)
+                 (lambda (&rest _arguments)
+                   '(:ui-result (:result (:summary "Verified"))
+                     :patch "" :name-status "")))
+                ((symbol-function 'magnus-review-ui--load-diff)
+                 (lambda (&rest _arguments) nil))
+                ((symbol-function 'magnus-review-ui--render) #'ignore)
+                ((symbol-function 'magnus-review-ui--mark-read) #'ignore))
+        (magnus-review-ui-refresh))
+      (should (eq magnus-review-ui--review new-review))
+      (should (eq magnus-review-ui--round new-round)))))
+
+(ert-deftest magnus-review-ui-sanitizes-section-heading-values ()
+  (should (equal (magnus-review-ui--display-value "unsafe\ntitle")
+                 "unsafe title")))
 
 (provide 'magnus-review-ui-tests)
 ;;; magnus-review-ui-tests.el ends here

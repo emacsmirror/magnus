@@ -26,20 +26,19 @@
    :completed-at 2
    :verdict (or verdict 'comment)
    :read-state (or read-state 'read)
-   :metadata `((finding_count . ,(or finding-count 0)))))
+   :finding-count (or finding-count 0)))
 
 (defun magnus-test-status--candidate-round (&optional number)
   "Return one prepared, not-yet-completed review round numbered NUMBER."
-  (magnus-review-round--create
+  (magnus-review-candidate--create
    :number (or number 2)
    :base-oid magnus-test-status--base-oid
    :head-oid magnus-test-status--head-oid
-   :created-at 3
-   :read-state 'not-ready))
+   :created-at 3))
 
 (defun magnus-test-status--runtime-state (review)
   "Return REVIEW's fixture-only ephemeral execution state."
-  (alist-get 'test_execution (magnus-review-metadata review)))
+  (magnus-review-reviewer-expertise review))
 
 (defun magnus-test-status--render-instance (instance reviews)
   "Render INSTANCE with REVIEWS and return its text plus slot position."
@@ -70,7 +69,7 @@ ARGUMENTS are passed to `magnus-review--create'."
    (append
     arguments
     (list
-     :metadata `((test_execution . ,execution))
+     :reviewer-expertise execution
      :rounds
      (unless (eq execution 'asking-scope)
        (list (magnus-test-status--completed-round)))))))
@@ -463,7 +462,6 @@ ARGUMENTS are passed to `magnus-review--create'."
   (let ((magnus-review-runtime-state-function
          #'magnus-test-status--runtime-state))
     (dolist (case '((asking-scope . "asking author")
-                    (queued . "queued")
                     (running . "running")
                     (failed . "failed")
                     (interrupted . "interrupted")))
@@ -534,7 +532,7 @@ ARGUMENTS are passed to `magnus-review--create'."
            :reviewer-provider 'codex :effort 'high
            :author-name "quick-wren" :lifecycle 'open
            :created-at (float-time) :updated-at (float-time)
-           :metadata '((test_execution . failed))
+           :reviewer-expertise 'failed
            :rounds (list completed)))
          (magnus-review-runtime-state-function
           #'magnus-test-status--runtime-state))
@@ -562,7 +560,7 @@ ARGUMENTS are passed to `magnus-review--create'."
            :reviewer-provider 'codex :effort 'high
            :author-name "quick-wren" :lifecycle 'open
            :created-at (float-time) :updated-at (float-time)
-           :metadata '((test_execution . asking-scope))
+           :reviewer-expertise 'asking-scope
            :rounds (list completed)))
          (magnus-review-runtime-state-function
           #'magnus-test-status--runtime-state))
@@ -581,7 +579,7 @@ ARGUMENTS are passed to `magnus-review--create'."
            :id "author" :name "quick-wren" :directory "/tmp/project"
            :created-at (current-time) :status 'running))
          (magnus-status-review-animation-interval 0.4))
-    (dolist (state '(asking-scope queued running))
+    (dolist (state '(asking-scope running))
       (let* ((review
               (magnus-test-status--review-in-state
                state
@@ -635,7 +633,7 @@ ARGUMENTS are passed to `magnus-review--create'."
             :id "first" :author-instance-id "author"
             :reviewer-name "keen-owl" :lifecycle 'open)
            (magnus-test-status--review-in-state
-            'queued
+            'asking-scope
             :id "second" :author-instance-id "author"
             :reviewer-name "swift-hare" :lifecycle 'open))))
     (let* ((magnus-status-review-animation-interval 0.4)

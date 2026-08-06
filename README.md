@@ -156,18 +156,18 @@ coordination journal and generated instructions are excluded from the clean
 gate; any other tracked or untracked project work blocks review creation.
 
 The request popup offers optional provider (`p`), model (`m`), and reasoning
-effort (`e`) overrides. Reviews share Magnus's single background-model FIFO
-with indexing and retrospectives, so at most one non-interactive provider
-process runs at a time.
+effort (`e`) overrides. Each review owns its headless provider process directly,
+so independent reviews may run concurrently with one another and with optional
+low-priority indexing or retrospective work.
 
 Reviewers run in private detached checkouts derived from the immutable round
 number and HEAD. Different rounds never share a mutable worktree, and Magnus
 rejects tracked, untracked, or ignored residue in a managed checkout.
 
-Magnus deliberately makes pending work disposable. The author query, queue
-entry, provider process, failures, and retries live only in the current Emacs
-session. Queued terminal delivery, the author's response, and the provider run
-are bounded independently by `magnus-review-delivery-timeout`,
+Magnus deliberately makes pending work disposable. The author query, provider
+process, failures, and retries live only in the current Emacs session. Queued
+terminal delivery, the author's response, and the provider run are bounded by
+`magnus-review-delivery-timeout`,
 `magnus-review-scope-timeout`, and `magnus-review-timeout`. If execution fails,
 use the review menu to retry while that Emacs session is still open. If resuming
 the provider session itself is the problem, `f` repeats the same candidate with
@@ -184,12 +184,15 @@ reserved, every finding from the immediately preceding round needs a
 disposition, and an older resolved finding can retain its identity if it later
 resurfaces. Missing or corrupt prior evidence blocks the next round rather than
 silently starting over; each result's digest, verdict, and finding count are
-bound into the durable round manifest. Archive the lineage when that body of
-work is finished.
+bound into the durable round manifest alongside exact patch and changed-path
+digests. Archive the lineage when that body of work is finished.
 
-Review storage has one writer: do not mutate the same review lineage from two
-live Emacs processes at once. This matches Magnus's existing single-session
-ownership model for its other durable registries.
+Review publication uses native cross-process file locks and a monotonic
+manifest revision. First publication also locks the project/author identity, so
+two Emacs processes cannot split one author's work across parallel open
+lineages. A stale Emacs is refused before it can replace final artifacts or
+delete a newly durable candidate; locks left by a killed process are reclaimed
+by Emacs's lock protocol.
 
 While a reviewer is executing, the author row shows an animated review badge.
 Completed reviews appear in a separate section with an unread marker. The
@@ -204,7 +207,7 @@ reader presents the exact `base..head` diff using `magit-section`:
 | `e` | Open the corresponding current worktree file |
 | `[` / `]` | Previous or next review round |
 | `?` | Open review actions |
-| `g` | Refresh |
+| `g` | Refresh from the latest durable manifest revision |
 | `q` | Close |
 
 The review actions popup can request another committed round, retry failed

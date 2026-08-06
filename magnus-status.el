@@ -202,7 +202,7 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
                            (format "%s · round %d"
                                    (or (magnus-review-reviewer-name review)
                                        "Review")
-                                   (magnus-review-round-number round))
+                                   (magnus-review-scope-number round))
                          (or (magnus-review-reviewer-name review) "Review"))))
                  (concat
                   identity " — "
@@ -539,14 +539,14 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
      ((eq verdict 'changes-requested) 'magnus-status-suspended)
      ((memq execution '(failed interrupted)) 'magnus-status-errored)
      ((eq execution 'complete) 'magnus-status-finished)
-     ((memq execution '(asking-scope queued running))
+     ((memq execution '(asking-scope running))
       'magnus-status-running)
      (t 'magnus-status-instance-dir))))
 
 (defun magnus-status--review-runtime-p (execution)
   "Return non-nil when EXECUTION describes disposable review work."
   (memq execution
-        '(asking-scope queued running failed interrupted)))
+        '(asking-scope running failed interrupted)))
 
 (defun magnus-status--review-runtime-round (review execution)
   "Return REVIEW's prepared candidate round while EXECUTION is disposable."
@@ -560,13 +560,13 @@ truthful.  CALLBACK is accepted for ElDoc's documentation-function protocol."
 EXECUTION selects disposable versus completed work.  CANDIDATE is the prepared
 ephemeral round and COMPLETED is the latest successful round."
   (cond
-   (candidate (magnus-review-round-number candidate))
+   (candidate (magnus-review-scope-number candidate))
    ((magnus-status--review-runtime-p execution)
     ;; Scope discovery precedes candidate preparation, but it is already work
     ;; on the next round.  Name that round without pretending a candidate has
     ;; been frozen yet.
-    (1+ (if completed (magnus-review-round-number completed) 0)))
-   (completed (magnus-review-round-number completed))))
+    (1+ (if completed (magnus-review-scope-number completed) 0)))
+   (completed (magnus-review-scope-number completed))))
 
 (defun magnus-status--review-error-summary (review execution)
   "Return REVIEW's bounded one-line diagnostic for failed EXECUTION."
@@ -603,8 +603,7 @@ ephemeral round and COMPLETED is the latest successful round."
          (finding-count
           (and (not runtime-p)
                completed-round
-               (alist-get 'finding_count
-                          (magnus-review-round-metadata completed-round))))
+               (magnus-review-round-finding-count completed-round)))
          (diagnostic
           (magnus-status--review-error-summary review execution))
          (age
@@ -662,7 +661,7 @@ ephemeral round and COMPLETED is the latest successful round."
             (string= (or (magnus-review-author-instance-id review) "")
                      instance-id)
             (memq (magnus-review-execution review)
-                  '(asking-scope queued running))))
+                  '(asking-scope running))))
      (magnus-review-list))))
 
 (defun magnus-status--insert-active-review-badge (reviews)
@@ -679,9 +678,6 @@ ephemeral round and COMPLETED is the latest successful round."
                  (format
                   "Magnus is asking this agent which commits %s should review"
                   (car reviewers)))
-                ('queued
-                 (format "%s is queued to review this agent's committed work"
-                         (car reviewers)))
                 (_ (format "%s is reviewing this agent's committed work"
                            (car reviewers))))
             (format "%s have review work pending for this agent"

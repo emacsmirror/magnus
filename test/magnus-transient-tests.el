@@ -71,6 +71,28 @@ layout representation, which differs between supported Transient releases."
               ((symbol-function 'magnus-instances-list) (lambda () nil)))
       (should (equal (magnus-transient--creation-directory) "/default/")))))
 
+(ert-deftest magnus-transient-shipped-create-commands-preserve-directories ()
+  (let ((default-directory "/current/")
+        created
+        (refreshes 0))
+    (cl-letf (((symbol-function 'magnus-process-create)
+               (lambda (directory &rest _arguments) (push directory created)))
+              ((symbol-function 'magnus-status-refresh)
+               (lambda () (cl-incf refreshes)))
+              ((symbol-function 'read-directory-name)
+               (lambda (&rest _arguments) "/chosen/"))
+              ((symbol-function 'magnus-project-root)
+               (lambda () "/project/")))
+      (magnus-transient-create-current-dir)
+      (magnus-transient-create-choose-dir)
+      (magnus-transient-create-project-root))
+    (should (equal (nreverse created)
+                   '("/current/" "/chosen/" "/project/")))
+    (should (= refreshes 3))))
+
+(ert-deftest magnus-transient-shipped-create-menu-remains-a-command ()
+  (should (commandp 'magnus-create-dispatch)))
+
 (ert-deftest magnus-transient-create-codex-forwards-task-and-provider ()
   (let (arguments creation-task refreshed)
     (cl-letf (((symbol-function 'read-string)
@@ -156,7 +178,6 @@ layout representation, which differs between supported Transient releases."
       ;; where non-nil means Transient should render that action inapt.
       (dolist (case '((complete completed nil (nil nil t t t nil))
                       (asking-scope draft nil (t t t t nil nil))
-                      (queued completed candidate (nil t t t nil nil))
                       (running completed candidate (nil t t t nil nil))
                       (failed completed candidate (nil t nil nil t nil))
                       (interrupted completed candidate (nil t nil nil t nil))
@@ -193,23 +214,22 @@ layout representation, which differs between supported Transient releases."
             (rereview
              "Re-review quick-wren with keen-owl (same reviewer session)"
              "Request the next review round" nil nil)
-            (asking "Asking quick-wren which commits belong to its work"
-                    "Waiting for the author to identify its committed range"
-                    t nil)
-            (queued "keen-owl's review of quick-wren — queued"
-                    "Review is queued" t nil)
+            (asking-scope "Asking quick-wren which commits belong to its work"
+                          "Waiting for the author to identify its committed range"
+                          t nil)
             (running "keen-owl is reviewing quick-wren now"
                      "Review is in progress" t nil)
-            (retry "Retry keen-owl's review of quick-wren"
-                   "Retry failed review" nil nil))))
+            (failed "Retry keen-owl's failed review of quick-wren"
+                    "Retry failed review" nil nil)
+            (interrupted "Retry keen-owl's interrupted review of quick-wren"
+                         "Retry interrupted review" nil nil))))
     (unwind-protect
         (dolist (case cases)
           (let ((action (nth 0 case)))
             (setq magnus-transient--review-request-context
                   (list :author author
                         :review (unless (eq action 'new) review)
-                        :action action
-                        :execution (and (eq action 'retry) 'failed)))
+                        :action action))
             (should (equal (magnus-transient--review-request-heading)
                            (nth 1 case)))
             (should (equal
@@ -258,7 +278,7 @@ layout representation, which differs between supported Transient releases."
                  (lambda () author))
                 ((symbol-function 'magnus-review-request-context)
                  (lambda (candidate)
-                   (list :author candidate :action 'new :state-key '(new))))
+                   (list :author candidate :action 'new)))
                 ((symbol-function 'transient-setup)
                  (lambda (prefix &rest _arguments) (setq opened prefix))))
         (magnus-review-request-dispatch))
@@ -266,21 +286,22 @@ layout representation, which differs between supported Transient releases."
       (should (eq (plist-get magnus-transient--review-request-context :author)
                   author)))))
 
-(ert-deftest magnus-transient-review-request-rejects-stale-runtime-context ()
+(ert-deftest magnus-transient-review-request-defers-freshness-to-controller ()
   (let* ((author
           (magnus-instance--create
            :id "author" :name "quick-wren" :directory "/tmp/project"))
          (cached (list :author author :root "/tmp/project" :task "Task"
-                       :action 'queued :state-key '(queued old)))
-         (fresh (list :author author :root "/tmp/project" :task "Task"
-                      :action 'running :state-key '(running new))))
+                       :action 'running))
+         arguments)
     (let ((magnus-transient--review-request-context cached))
-      (cl-letf (((symbol-function 'magnus-review-request-context)
-                 (lambda (_author) fresh)))
-        (should-error
-         (magnus-transient--validated-review-request-context cached)
-         :type 'user-error)
-        (should (eq magnus-transient--review-request-context fresh))))))
+      (cl-letf (((symbol-function 'transient-args) (lambda (_prefix) nil))
+                ((symbol-function 'magnus-review-request)
+                 (lambda (&rest values) (setq arguments values)))
+                ((symbol-function 'magnus-status-refresh) #'ignore))
+        (magnus-transient-request-review)
+        (should (eq (car arguments) author))
+        (should (eq (plist-get (cdr arguments) :context) cached))
+        (should-not magnus-transient--review-request-context)))))
 
 (ert-deftest magnus-transient-review-actions-retain-lineage-and-round-context ()
   (let* ((old-round (magnus-test-transient--round 1))
@@ -290,9 +311,10 @@ layout representation, which differs between supported Transient releases."
          (fresh-review
           (magnus-test-transient--review "review-a" (list fresh-round)))
          (other-review (magnus-test-transient--review "review-b"))
+         (attempt (cons 'runtime 'process))
          (magnus-transient--review-action-context
           (list :review-id "review-a" :round-number 1
-                :state-key '(rereview stable)
+                :attempt attempt
                 :reviewer-name "keen-owl" :author-name "quick-wren"))
          (transient-current-command 'magnus-review-actions-menu)
          opened rereviewed retried restarted interrupted archived
@@ -302,9 +324,6 @@ layout representation, which differs between supported Transient releases."
                (lambda (id) (and (string= id "review-a") fresh-review)))
               ((symbol-function 'magnus-status--get-review-at-point)
                (lambda () other-review))
-              ((symbol-function 'magnus-review-controller--operation)
-               (lambda (_review)
-                 '(:action rereview :state-key (rereview stable))))
               ((symbol-function 'magnus-review-ui-open)
                (lambda (review round) (setq opened (list review round))))
               ((symbol-function 'magnus-review-rereview)
@@ -314,7 +333,8 @@ layout representation, which differs between supported Transient releases."
               ((symbol-function 'magnus-review-restart-session)
                (lambda (review) (setq restarted review)))
               ((symbol-function 'magnus-review-interrupt)
-               (lambda (review) (setq interrupted review)))
+               (lambda (review &optional expected)
+                 (setq interrupted (list review expected))))
               ((symbol-function 'magnus-review-controller-archive)
                (lambda (review) (setq archived review)))
               ((symbol-function 'magnus-status-refresh)
@@ -331,26 +351,39 @@ layout representation, which differs between supported Transient releases."
     (should (eq rereviewed fresh-review))
     (should (eq retried fresh-review))
     (should (eq restarted fresh-review))
-    (should (eq interrupted fresh-review))
+    (should (equal interrupted (list fresh-review attempt)))
     (should (eq archived fresh-review))
     (should (= refreshes 5))
     (should-not (eq rereviewed other-review))))
 
-(ert-deftest magnus-transient-review-action-rejects-an-ephemeral-aba-change ()
+(ert-deftest magnus-transient-review-interrupt-fences-exact-attempt-after-prompt ()
   (let* ((review (magnus-test-transient--review "review-a"))
+         (old-runtime
+          (magnus-review-controller--make-runtime
+           :phase 'running :process 'old-process))
+         (replacement-runtime
+          (magnus-review-controller--make-runtime
+           :phase 'running :process 'replacement-process))
          (magnus-transient--review-action-context
-          (list :review-id "review-a" :state-key '(queued first)))
+          (list :review-id "review-a"
+                :attempt (cons old-runtime 'old-process)))
          (transient-current-command 'magnus-review-actions-menu)
-         called)
+         (magnus-review-controller--runtimes (make-hash-table :test #'equal))
+         cancelled)
+    (puthash "review-a" replacement-runtime
+             magnus-review-controller--runtimes)
     (cl-letf (((symbol-function 'magnus-review-get)
                (lambda (_id) review))
-              ((symbol-function 'magnus-review-controller--operation)
-               (lambda (_review)
-                 '(:action queued :state-key (queued replacement))))
-              ((symbol-function 'magnus-review-retry)
-               (lambda (_review) (setq called t))))
-      (should-error (magnus-transient-review-retry) :type 'user-error))
-    (should-not called)))
+              ((symbol-function 'yes-or-no-p) (lambda (&rest _arguments) t))
+              ((symbol-function 'magnus-headless-cancel)
+               (lambda (process &optional _force) (setq cancelled process)))
+              ((symbol-function 'magnus-status-refresh) #'ignore))
+      (should-error (magnus-transient-review-interrupt) :type 'user-error))
+    (should-not cancelled)
+    (should (eq (magnus-review-controller-runtime-phase replacement-runtime)
+                'running))
+    (should (eq (magnus-review-controller-runtime-process replacement-runtime)
+                'replacement-process))))
 
 (provide 'magnus-transient-tests)
 ;;; magnus-transient-tests.el ends here

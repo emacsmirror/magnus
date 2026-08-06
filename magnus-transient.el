@@ -38,7 +38,6 @@
 (declare-function magnus-review-ui-open "magnus-review-ui")
 (declare-function magnus-doctor "magnus-doctor")
 
-(defvar magnus-review-ui-action-function)
 (defvar magnus--creation-task)
 
 (defvar magnus-transient--review-request-context nil
@@ -62,27 +61,6 @@
   "Return the cached review request context, if any."
   magnus-transient--review-request-context)
 
-(defun magnus-transient--review-request-context-signature (context)
-  "Return the user-visible operation identity for request CONTEXT."
-  (let ((author (plist-get context :author))
-        (review (plist-get context :review)))
-    (list (and author (magnus-instance-id author))
-          (plist-get context :root)
-          (plist-get context :task)
-          (and review (magnus-review-id review))
-          (plist-get context :action)
-          (plist-get context :state-key))))
-
-(defun magnus-transient--validated-review-request-context (context)
-  "Return a fresh equivalent of CONTEXT or reject a stale popup."
-  (let* ((author (plist-get context :author))
-         (fresh (and author (magnus-review-request-context author))))
-    (unless (equal (magnus-transient--review-request-context-signature context)
-                   (magnus-transient--review-request-context-signature fresh))
-      (setq magnus-transient--review-request-context fresh)
-      (user-error "Review state changed; close this popup and press v again"))
-    fresh))
-
 (defun magnus-transient--review-request-new-p ()
   "Return non-nil when the request transient would create a reviewer."
   (eq (plist-get (magnus-transient--current-review-request-context) :action)
@@ -91,7 +69,7 @@
 (defun magnus-transient--review-request-busy-p ()
   "Return non-nil when the selected review already has pending work."
   (memq (plist-get (magnus-transient--current-review-request-context) :action)
-        '(asking queued running)))
+        '(asking-scope running)))
 
 (defun magnus-transient--review-request-heading ()
   "Describe the exact task-scoped operation in the request transient."
@@ -105,12 +83,12 @@
       ('new (format "Independent review of %s" author-name))
       ('rereview (format "Re-review %s with %s (same reviewer session)"
                          author-name reviewer-name))
-      ('retry (format "Retry %s's review of %s"
-                      reviewer-name author-name))
-      ('asking (format "Asking %s which commits belong to its work"
-                       author-name))
-      ('queued (format "%s's review of %s — queued"
+      ('failed (format "Retry %s's failed review of %s"
                        reviewer-name author-name))
+      ('interrupted (format "Retry %s's interrupted review of %s"
+                            reviewer-name author-name))
+      ('asking-scope (format "Asking %s which commits belong to its work"
+                             author-name))
       ('running (format "%s is reviewing %s now"
                         reviewer-name author-name))
       (_ "Independent review"))))
@@ -123,22 +101,14 @@
 
 (defun magnus-transient--review-request-action-description ()
   "Describe what RET will do in the request transient."
-  (let* ((context (magnus-transient--current-review-request-context))
-         (review (plist-get context :review))
-         (execution
-          (or (plist-get context :execution)
-              (and review
-                   (plist-get
-                    (magnus-review-controller--operation review)
-                    :execution)))))
+  (let ((context (magnus-transient--current-review-request-context)))
     (pcase (plist-get context :action)
       ('new "Start independent review")
       ('rereview "Request the next review round")
-      ('retry (if (eq execution 'interrupted)
-                  "Retry interrupted review"
-                "Retry failed review"))
-      ('asking "Waiting for the author to identify its committed range")
-      ('queued "Review is queued")
+      ('failed "Retry failed review")
+      ('interrupted "Retry interrupted review")
+      ('asking-scope
+       "Waiting for the author to identify its committed range")
       ('running "Review is in progress")
       (_ "Start review"))))
 
@@ -203,6 +173,16 @@ review actions."
    (1 "D" "Diagnose installation" magnus-doctor)
    (1 "q" "Quit" quit-window)])
 
+;;; Shipped create-menu compatibility
+
+(transient-define-prefix magnus-create-dispatch ()
+  "Create a new Claude Code instance."
+  ["Create Instance"
+   ("c" "In current directory" magnus-transient-create-current-dir)
+   ("d" "Choose directory" magnus-transient-create-choose-dir)
+   ("p" "In project root" magnus-transient-create-project-root)
+   ("h" "Headless (fire-and-forget)" magnus-transient-create-headless)])
+
 ;;; Durable reviews
 
 (transient-define-prefix magnus-review-request-menu ()
@@ -227,7 +207,6 @@ review actions."
                      (magnus-status--get-instance-at-point)
                      (user-error
                       "Put point on the agent whose work should be reviewed")))
-         (context (magnus-transient--validated-review-request-context context))
          (arguments (transient-args 'magnus-review-request-menu))
          (provider-name (transient-arg-value "--provider=" arguments))
          (model (transient-arg-value "--model=" arguments))
@@ -249,13 +228,11 @@ review actions."
 
 (defun magnus-transient--make-review-action-context (review &optional round)
   "Return a pinned action context for REVIEW and optional ROUND."
-  (let ((operation (magnus-review-controller--operation review)))
-    (list :review-id (magnus-review-id review)
-          :round-number (and round (magnus-review-round-number round))
-          :action (plist-get operation :action)
-          :state-key (copy-tree (plist-get operation :state-key))
-          :reviewer-name (magnus-review-reviewer-name review)
-          :author-name (magnus-review-author-name review))))
+  (list :review-id (magnus-review-id review)
+        :round-number (and round (magnus-review-scope-number round))
+        :attempt (magnus-review-controller--attempt-token review)
+        :reviewer-name (magnus-review-reviewer-name review)
+        :author-name (magnus-review-author-name review)))
 
 (defun magnus-transient--review-description ()
   "Return a heading for the current review action transient."
@@ -308,7 +285,7 @@ review actions."
 (defun magnus-transient--review-interrupt-inapt-p ()
   "Return non-nil unless the selected review has disposable active work."
   (not (memq (magnus-transient--review-action-state)
-             '(asking-scope queued running))))
+             '(asking-scope running))))
 
 (defun magnus-transient--review-archive-inapt-p ()
   "Return non-nil when the selected review is already archived."
@@ -349,20 +326,13 @@ When called from the status buffer, use the review at point."
   "Return non-nil while invoking a suffix of the review action transient."
   (eq transient-current-command 'magnus-review-actions-menu))
 
-(defun magnus-transient--review-action-review (&optional validate)
-  "Resolve the action transient's pinned review, optionally VALIDATE its state."
+(defun magnus-transient--review-action-review ()
+  "Resolve the action transient's pinned review."
   (let* ((context magnus-transient--review-action-context)
          (id (plist-get context :review-id))
          (review (and id (magnus-review-get id))))
     (unless review
       (user-error "The selected review is no longer loaded"))
-    (when (and validate
-               (not (equal
-                     (plist-get context :state-key)
-                     (plist-get
-                      (magnus-review-controller--operation review)
-                      :state-key))))
-      (user-error "Review state changed; close this popup and press v again"))
     review))
 
 (defun magnus-transient--review-action-round (review)
@@ -371,7 +341,7 @@ When called from the status buffer, use the review at point."
               (plist-get magnus-transient--review-action-context
                          :round-number)))
     (let ((round (nth (1- number) (magnus-review-rounds review))))
-      (unless (and round (= (magnus-review-round-number round) number))
+      (unless (and round (= (magnus-review-scope-number round) number))
         (user-error "The selected review round is no longer available"))
       round)))
 
@@ -383,9 +353,9 @@ When called from the status buffer, use the review at point."
     (magnus-transient--review-action-review)))
 
 (defun magnus-transient--review-for-mutation ()
-  "Return the pinned review for a popup mutation, rejecting stale state."
+  "Return the currently selected review for a popup mutation."
   (if (magnus-transient--review-actions-active-p)
-      (magnus-transient--review-action-review t)
+      (magnus-transient--review-action-review)
     (magnus-transient--selected-review)))
 
 (defun magnus-transient-review-open ()
@@ -424,11 +394,14 @@ When called from the status buffer, use the review at point."
 (defun magnus-transient-review-interrupt ()
   "Interrupt the selected review's ephemeral query or provider run."
   (interactive)
-  (let ((review (magnus-transient--review-for-mutation)))
+  (let ((review (magnus-transient--review-for-mutation))
+        (attempt
+         (and (magnus-transient--review-actions-active-p)
+              (plist-get magnus-transient--review-action-context :attempt))))
     (when (yes-or-no-p
            (format "Interrupt the review by %s? "
                    (magnus-review-reviewer-name review)))
-      (magnus-review-interrupt review)
+      (magnus-review-interrupt review attempt)
       (magnus-status-refresh))))
 
 (defun magnus-transient-review-archive ()
@@ -446,6 +419,28 @@ When called from the status buffer, use the review at point."
                  (magnus-review-reviewer-name review))))))
 
 ;;; Create instance commands
+
+(defun magnus-transient-create-current-dir ()
+  "Create a Claude agent in `default-directory'."
+  (interactive)
+  (magnus-process-create default-directory)
+  (magnus-status-refresh))
+
+(defun magnus-transient-create-choose-dir ()
+  "Create a Claude agent in a chosen directory."
+  (interactive)
+  (let ((directory (read-directory-name "Directory: " nil nil t)))
+    (magnus-process-create directory)
+    (magnus-status-refresh)))
+
+(defun magnus-transient-create-project-root ()
+  "Create a Claude agent in the current project root."
+  (interactive)
+  (if-let ((root (magnus-project-root)))
+      (progn
+        (magnus-process-create root)
+        (magnus-status-refresh))
+    (user-error "Not in a project")))
 
 (defun magnus-transient--creation-directory ()
   "Return the most relevant directory for a status-buffer creation action."
@@ -508,7 +503,5 @@ or the best status-buffer project directory."
 ;; The review reader calls this dispatcher from its `?' binding.  Controller
 ;; setup installs the same value during Magnus startup; assigning it here also
 ;; makes direct loading of the UI and transient modules behave consistently.
-(setq magnus-review-ui-action-function #'magnus-review-actions)
-
 (provide 'magnus-transient)
 ;;; magnus-transient.el ends here

@@ -42,6 +42,11 @@
   :type 'integer
   :group 'magnus-review)
 
+(defcustom magnus-review-max-result-bytes (* 10 1024 1024)
+  "Maximum bytes accepted for one structured review result or report."
+  :type 'integer
+  :group 'magnus-review)
+
 (defconst magnus-review-schema-version 1
   "Manifest version for completed review lineages.")
 
@@ -52,6 +57,10 @@
 
 (define-error 'magnus-review-error "Magnus review error")
 (define-error 'magnus-review-git-error "Magnus review Git error"
+  'magnus-review-error)
+(define-error 'magnus-review-stale-error "Stale Magnus review state"
+  'magnus-review-error)
+(define-error 'magnus-review-busy-error "Magnus review is being written"
   'magnus-review-error)
 
 ;;; Repository paths
@@ -103,22 +112,39 @@ side prefixes are handled by `magnus-review-decode-diff-header-path'."
         "--src-prefix=a/" "--dst-prefix=b/" "--find-renames"
         base head "--"))
 
-;;; Completed lineage records
+;;; Ephemeral candidates and completed lineage records
 
-(cl-defstruct (magnus-review-round
-               (:constructor magnus-review-round--create)
+(cl-defstruct (magnus-review-scope
+               (:constructor nil)
                (:copier nil))
-  "One successfully completed immutable Git review round.
-Before publication the same structure represents an ephemeral candidate, with
-nil completion, verdict, and read state."
+  "Shared immutable Git identity for a candidate or completed round."
   number
   base-oid
   head-oid
-  created-at
+  created-at)
+
+(cl-defstruct (magnus-review-candidate
+               (:include magnus-review-scope)
+               (:constructor magnus-review-candidate--create)
+               (:copier nil))
+  "One unpublished, process-local review candidate.
+Candidates never appear in a manifest.  Their evidence digests pin the exact
+bytes captured before the reviewer starts."
+  patch-sha256
+  name-status-sha256)
+
+(cl-defstruct (magnus-review-round
+               (:include magnus-review-scope)
+               (:constructor magnus-review-round--create)
+               (:copier nil))
+  "One successfully published review round."
   completed-at
   verdict
   read-state
-  metadata)
+  finding-count
+  result-sha256
+  patch-sha256
+  name-status-sha256)
 
 (cl-defstruct (magnus-review
                (:constructor magnus-review--create)
@@ -134,8 +160,9 @@ nil completion, verdict, and read state."
   model
   effort
   task
+  reviewer-expertise
   session-id
-  metadata
+  (revision 0)
   (lifecycle 'open)
   created-at
   updated-at
@@ -228,33 +255,37 @@ does not persist its answer.")
     (magnus-review--signal "Invalid %s number: %S" kind value))
   value)
 
-(defun magnus-review--round-component (round)
-  "Return the collision-free managed path component for ROUND."
-  (unless (magnus-review-round-p round)
-    (magnus-review--signal "Not a Magnus review round: %S" round))
+(defun magnus-review--scope-component (scope)
+  "Return a bounded collision-resistant managed path component for SCOPE."
+  (unless (magnus-review-scope-p scope)
+    (magnus-review--signal "Not a Magnus review scope: %S" scope))
   (magnus-review--positive-number
-   (magnus-review-round-number round) "round")
+   (magnus-review-scope-number scope) "round")
   (unless (and (magnus-review--valid-oid-p
-                (magnus-review-round-base-oid round))
+                (magnus-review-scope-base-oid scope))
                (magnus-review--valid-oid-p
-                (magnus-review-round-head-oid round)))
+                (magnus-review-scope-head-oid scope)))
     (magnus-review--signal "Review round has invalid Git evidence"))
-  (format "%03d-%s-%s"
-          (magnus-review-round-number round)
-          (downcase (magnus-review-round-base-oid round))
-          (downcase (magnus-review-round-head-oid round))))
+  (let* ((base (downcase (magnus-review-scope-base-oid scope)))
+         (head (downcase (magnus-review-scope-head-oid scope)))
+         (digest (secure-hash 'sha256 (concat base ":" head))))
+    (format "%03d-%s-%s-%s"
+            (magnus-review-scope-number scope)
+            (substring base 0 8)
+            (substring head 0 8)
+            digest)))
 
 (defun magnus-review-round-directory (review round)
   "Return the artifact directory for REVIEW candidate or completed ROUND."
   (magnus-review--child-path
    (expand-file-name "rounds" (magnus-review-directory review))
-   (magnus-review--round-component round)))
+   (magnus-review--scope-component round)))
 
 (defun magnus-review-round-checkout-path (review round)
   "Return REVIEW's isolated detached worktree path for ROUND."
   (magnus-review--child-path
    (expand-file-name "checkouts" (magnus-review-directory review))
-   (magnus-review--round-component round)))
+   (magnus-review--scope-component round)))
 
 (defun magnus-review-round-result-path (review round)
   "Return the canonical structured result path for REVIEW ROUND."
@@ -349,15 +380,49 @@ CODING defaults to `utf-8-unix'; use `no-conversion' for Git byte evidence."
     (magnus-review--ensure-private-directory (file-name-directory path))
     path))
 
-(defun magnus-review--read-artifact-bytes (file)
-  "Return exact bytes from regular, non-symlink artifact FILE."
+(defun magnus-review--read-artifact-bytes
+    (file &optional kind limit)
+  "Return exact bytes from regular, non-symlink artifact FILE.
+KIND names the artifact in diagnostics.  LIMIT bounds its byte size."
   (when (or (file-symlink-p file) (not (file-regular-p file)))
-    (magnus-review--signal "Unsafe review artifact: %s" file))
+    (magnus-review--signal "Unsafe review %s artifact: %s"
+                           (or kind "stored") file))
+  (let ((size (file-attribute-size (file-attributes file 'string))))
+    (unless (and (integerp size) (>= size 0)
+                 (or (null limit) (<= size limit)))
+      (magnus-review--signal "Review %s artifact exceeds %d bytes: %s"
+                             (or kind "stored") (or limit 0) file)))
   (with-temp-buffer
     (set-buffer-multibyte nil)
     (let ((coding-system-for-read 'no-conversion))
       (insert-file-contents-literally file))
     (buffer-string)))
+
+(defun magnus-review--verify-bytes (bytes digest kind)
+  "Return BYTES when its SHA-256 equals DIGEST, naming artifact KIND."
+  (unless (and (magnus-review--valid-sha256-p digest)
+               (string= (secure-hash 'sha256 bytes) digest))
+    (magnus-review--signal "Review %s artifact digest disagrees with manifest"
+                           kind))
+  bytes)
+
+(defun magnus-review--verify-candidate-evidence (review candidate)
+  "Verify CANDIDATE's exact patch and name-status bytes for REVIEW."
+  (unless (magnus-review-candidate-p candidate)
+    (magnus-review--signal "Evidence verification requires a candidate"))
+  (list
+   :patch
+   (magnus-review--verify-bytes
+    (magnus-review--read-artifact-bytes
+     (magnus-review-round-patch-path review candidate)
+     "patch" magnus-review-max-evidence-bytes)
+    (magnus-review-candidate-patch-sha256 candidate) "patch")
+   :name-status
+   (magnus-review--verify-bytes
+    (magnus-review--read-artifact-bytes
+     (magnus-review-round-name-status-path review candidate)
+     "name-status" magnus-review-max-evidence-bytes)
+    (magnus-review-candidate-name-status-sha256 candidate) "name-status")))
 
 (defun magnus-review--completed-artifact-path-p (review path)
   "Return non-nil when PATH belongs to a completed round of REVIEW."
@@ -578,9 +643,11 @@ candidate artifact, but never an artifact belonging to a completed round."
 
 (defun magnus-review-capture-round-evidence (review round)
   "Persist immutable Git patch and changed-path evidence for REVIEW ROUND."
+  (unless (magnus-review-candidate-p round)
+    (magnus-review--signal "Review evidence requires an ephemeral candidate"))
   (let* ((project-root (magnus-review-project-root review))
-         (base (magnus-review-round-base-oid round))
-         (head (magnus-review-round-head-oid round))
+         (base (magnus-review-scope-base-oid round))
+         (head (magnus-review-scope-head-oid round))
          (patch-path (magnus-review-round-patch-path review round))
          (name-status-path
           (magnus-review-round-name-status-path review round))
@@ -590,10 +657,11 @@ candidate artifact, but never an artifact belonging to a completed round."
           (magnus-review--git-output-raw
            project-root "diff" "--name-status" "-z" "--find-renames"
            "--no-ext-diff" base head "--")))
-    (when (> (length patch) magnus-review-max-evidence-bytes)
-      (magnus-review--signal
-       "Review patch is %d bytes; configured limit is %d"
-       (length patch) magnus-review-max-evidence-bytes))
+    (dolist (entry `(("patch" ,patch) ("name-status" ,name-status)))
+      (when (> (length (cadr entry)) magnus-review-max-evidence-bytes)
+        (magnus-review--signal
+         "Review %s is %d bytes; configured limit is %d"
+         (car entry) (length (cadr entry)) magnus-review-max-evidence-bytes)))
     (magnus-review--ensure-review-directories review round)
     (cl-mapc
      (lambda (path contents)
@@ -604,6 +672,10 @@ candidate artifact, but never an artifact belonging to a completed round."
          (magnus-review--atomic-write-string path contents 'no-conversion)))
      (list patch-path name-status-path)
      (list patch name-status))
+    (setf (magnus-review-candidate-patch-sha256 round)
+          (secure-hash 'sha256 patch)
+          (magnus-review-candidate-name-status-sha256 round)
+          (secure-hash 'sha256 name-status))
     (list :patch patch-path :name-status name-status-path)))
 
 ;;; Detached candidate worktrees
@@ -645,12 +717,12 @@ candidate artifact, but never an artifact belonging to a completed round."
 
 (defun magnus-review-ensure-checkout (review head-revision round)
   "Ensure an isolated clean detached checkout for REVIEW ROUND at HEAD-REVISION."
-  (unless (magnus-review-round-p round)
-    (magnus-review--signal "A review round is required for isolated checkout"))
+  (unless (magnus-review-scope-p round)
+    (magnus-review--signal "A review scope is required for isolated checkout"))
   (let* ((project-root (magnus-review-project-root review))
          (head (magnus-review-resolve-oid project-root head-revision))
          (checkout (magnus-review-round-checkout-path review round)))
-    (unless (string= head (magnus-review-round-head-oid round))
+    (unless (string= head (magnus-review-scope-head-oid round))
       (magnus-review--signal "Checkout HEAD does not match candidate round"))
     (magnus-review--ensure-review-directories review)
     (magnus-review--ensure-private-directory (file-name-directory checkout))
@@ -722,22 +794,19 @@ Path identity is checked as well as object identity so a copied or forged
 round cannot target the artifacts of a completed lineage round."
   (unless (magnus-review-p review)
     (magnus-review--signal "Not a Magnus review: %S" review))
-  (unless (magnus-review-round-p round)
-    (magnus-review--signal "Not a Magnus review round: %S" round))
+  (unless (magnus-review-candidate-p round)
+    (magnus-review--signal "Not a Magnus review candidate: %S" round))
   ;; Computing the directory validates every path-forming round field before
   ;; any deletion is considered.
   (let ((candidate-directory
          (expand-file-name (magnus-review-round-directory review round))))
-    (when (or (magnus-review-round-completed-at round)
-              (magnus-review-round-verdict round)
-              (magnus-review-round-read-state round)
-              (cl-some
+    (when (cl-some
                (lambda (completed)
                  (string=
                   candidate-directory
                   (expand-file-name
                    (magnus-review-round-directory review completed))))
-               (magnus-review-rounds review)))
+               (magnus-review-rounds review))
       (magnus-review--signal "Refusing to discard a completed review round")))
   round)
 
@@ -768,7 +837,7 @@ round cannot target the artifacts of a completed lineage round."
     (when (file-directory-p checkout)
       (let ((head
              (magnus-review--verified-clean-checkout-head review checkout)))
-        (unless (string= head (magnus-review-round-head-oid round))
+        (unless (string= head (magnus-review-scope-head-oid round))
           (magnus-review--signal
            "Candidate checkout has unexpected HEAD %s" head))))
     checkout))
@@ -811,13 +880,20 @@ paths are preserved and reported rather than forced away."
 Completed rounds, escaped managed paths, symlinks, modified checkouts, and
 unexpected candidate artifacts are refused.  Repeating a successful discard is
 safe and returns non-nil."
-  (magnus-review--assert-unpublished-candidate review round)
-  ;; Preflight both trees before mutating either.  This makes a refusal leave
-  ;; every candidate artifact available for inspection.
-  (magnus-review--preflight-round-checkout review round)
-  (magnus-review--preflight-round-directory review round)
-  (magnus-review--remove-round-checkout review round)
-  (magnus-review--remove-candidate-round-directory review round)
+  (setq review (magnus-review-resolve-current review))
+  (magnus-review--call-with-lineage-lock
+   review
+   (lambda ()
+     ;; A stale process must be rejected before it can remove a directory that
+     ;; another Emacs has just made durable.
+     (magnus-review--assert-current-revision-locked review)
+     (magnus-review--assert-unpublished-candidate review round)
+     ;; Preflight both trees before mutating either.  This makes a refusal leave
+     ;; every candidate artifact available for inspection.
+     (magnus-review--preflight-round-checkout review round)
+     (magnus-review--preflight-round-directory review round)
+     (magnus-review--remove-round-checkout review round)
+     (magnus-review--remove-candidate-round-directory review round)))
   t)
 
 ;;; Ephemeral preparation and successful publication
@@ -830,6 +906,68 @@ safe and returns non-nil."
   "Return the known review whose ID is ID."
   (and (stringp id)
        (cl-find id magnus-reviews :key #'magnus-review-id :test #'string=)))
+
+(defun magnus-review--open-for-author-matches
+    (project-root author-instance-id &optional excluded-id)
+  "Return loaded open reviews for AUTHOR-INSTANCE-ID in PROJECT-ROOT.
+EXCLUDED-ID, when non-nil, omits that lineage identity."
+  (let ((project-root (magnus-review--canonical-directory project-root)))
+    (cl-remove-if-not
+     (lambda (review)
+       (and (eq (magnus-review-lifecycle review) 'open)
+            (string= (magnus-review-project-root review) project-root)
+            (string= (magnus-review-author-instance-id review)
+                     author-instance-id)
+            (or (null excluded-id)
+                (not (string= (magnus-review-id review) excluded-id)))))
+     magnus-reviews)))
+
+(defun magnus-review-open-for-author (project-root author-instance-id)
+  "Return AUTHOR-INSTANCE-ID's open review in PROJECT-ROOT, if any.
+One author instance has at most one open lineage per project.  A changed task
+therefore requires explicitly archiving the previous lineage instead of
+silently creating a second reviewer conversation."
+  (let ((matches
+         (magnus-review--open-for-author-matches
+          project-root author-instance-id)))
+    (when (cdr matches)
+      (magnus-review--signal
+       "Author %s has multiple loaded open reviews in this project"
+       author-instance-id))
+    (car matches)))
+
+(defun magnus-review-resolve-current (review)
+  "Return REVIEW's current registry object, or signal on stale identity."
+  (unless (magnus-review-p review)
+    (magnus-review--signal "Not a Magnus review: %S" review))
+  (let ((current (magnus-review-get (magnus-review-id review))))
+    (unless current
+      (magnus-review--signal "Review is no longer loaded: %s"
+                             (magnus-review-id review)))
+    (unless (string= (magnus-review-project-hash current)
+                     (magnus-review-project-hash review))
+      (magnus-review--signal "Review identity changed across projects"))
+    current))
+
+(defun magnus-review-resolve-round (review round)
+  "Resolve completed ROUND by stable identity within current REVIEW."
+  (let* ((review (magnus-review-resolve-current review))
+         (number (cond ((magnus-review-round-p round)
+                        (magnus-review-scope-number round))
+                       ((integerp round) round)
+                       (t nil)))
+         (current
+          (and (integerp number) (> number 0)
+               (nth (1- number) (magnus-review-rounds review)))))
+    (unless (and current (= (magnus-review-scope-number current) number))
+      (magnus-review--signal "Completed review round is no longer available"))
+    (when (magnus-review-round-p round)
+      (unless (and (string= (magnus-review-scope-base-oid current)
+                            (magnus-review-scope-base-oid round))
+                   (string= (magnus-review-scope-head-oid current)
+                            (magnus-review-scope-head-oid round)))
+        (magnus-review--signal "Completed review round identity changed")))
+    (cons review current)))
 
 (defun magnus-review-latest-round (review)
   "Return REVIEW's latest successfully completed round, or nil."
@@ -910,10 +1048,28 @@ safe and returns non-nil."
     (intern value))
    (t (magnus-review--signal "Invalid %s: %S" kind value))))
 
+(defun magnus-review--bounded-string-value
+    (value kind limit &optional allow-nil)
+  "Return bounded string VALUE, naming it KIND, or signal.
+ALLOW-NIL permits nil but never an empty string."
+  (unless (or (and (stringp value)
+                   (<= 1 (length value) limit))
+              (and allow-nil (null value)))
+    (magnus-review--signal "Invalid %s: %S" kind value))
+  value)
+
+(defun magnus-review--model-value (value)
+  "Return VALUE as a bounded optional model string."
+  (cond ((null value) nil)
+        ((symbolp value)
+         (magnus-review--bounded-string-value
+          (symbol-name value) "model" 200))
+        (t (magnus-review--bounded-string-value value "model" 200))))
+
 (cl-defun magnus-review-create
     (project-root author-instance-id author-name
                   &key id task reviewer-name reviewer-provider model effort
-                  metadata)
+                  reviewer-expertise)
   "Register an unsaved review draft for AUTHOR-NAME in PROJECT-ROOT.
 The draft becomes durable only when `magnus-review-complete-round' publishes a
 successful first round."
@@ -930,14 +1086,16 @@ successful first round."
                  magnus-review-directory-root project-hash)
                 id)))
       (magnus-review--signal "Review ID is already in use: %s" id))
-    (unless (and (stringp author-instance-id)
-                 (not (string-empty-p author-instance-id))
-                 (stringp author-name)
-                 (not (string-empty-p author-name)))
-      (magnus-review--signal "Review author identity is incomplete"))
-    (unless (and (stringp reviewer-name)
-                 (not (string-empty-p reviewer-name)))
-      (magnus-review--signal "Review reviewer identity is incomplete"))
+    (magnus-review--bounded-string-value
+     author-instance-id "author instance ID" 256)
+    (magnus-review--bounded-string-value author-name "author name" 256)
+    (magnus-review--bounded-string-value reviewer-name "reviewer name" 256)
+    (when-let ((existing
+                (magnus-review-open-for-author
+                 project-root author-instance-id)))
+      (magnus-review--signal
+       "Author %s already has open review %s in this project"
+       author-name (magnus-review-id existing)))
     (let ((review
            (magnus-review--create
             :id id
@@ -948,11 +1106,14 @@ successful first round."
             :reviewer-name reviewer-name
             :reviewer-provider
             (magnus-review--optional-symbol-value reviewer-provider "provider")
-            :model model
+            :model (magnus-review--model-value model)
             :effort (magnus-review--optional-symbol-value effort "effort")
-            :task task
+            :task (magnus-review--bounded-string-value task "task" 4000 t)
+            :reviewer-expertise
+            (magnus-review--bounded-string-value
+             reviewer-expertise "reviewer expertise" 1200 t)
             :session-id nil
-            :metadata metadata
+            :revision 0
             :lifecycle 'open
             :created-at now
             :updated-at now
@@ -961,15 +1122,14 @@ successful first round."
       (magnus-review--run-changed-hooks)
       review)))
 
-(cl-defun magnus-review-prepare-round
-    (review base-oid head-oid &key metadata)
+(defun magnus-review-prepare-round (review base-oid head-oid)
   "Prepare and return an unpersisted candidate for REVIEW at BASE-OID..HEAD-OID.
 Both arguments must be full commit IDs supplied by the author agent.  Git
 validates the claim; Magnus requires a clean source worktree, captures immutable
 evidence, and creates an isolated detached checkout.  The lineage is unchanged
 until `magnus-review-complete-round' succeeds."
-  (unless (and (magnus-review-p review)
-               (eq (magnus-review-lifecycle review) 'open))
+  (setq review (magnus-review-resolve-current review))
+  (unless (eq (magnus-review-lifecycle review) 'open)
     (magnus-review--signal "Cannot prepare a round for a closed review"))
   (unless (and (magnus-review--valid-oid-p base-oid)
                (magnus-review--valid-oid-p head-oid))
@@ -994,142 +1154,308 @@ until `magnus-review-complete-round' succeeds."
                (string= head (magnus-review-round-head-oid latest)))
       (magnus-review--signal
        "Scope %s..%s is already the latest review round" base head))
-    (let* ((summary
-            `((commit_count . ,(plist-get scope :commit-count))
-              (changed_file_count . ,(plist-get scope :changed-file-count))
-              (shortstat . ,(plist-get scope :shortstat))))
-           (round
-            (magnus-review-round--create
+    (let ((round
+            (magnus-review-candidate--create
              :number (1+ (length (magnus-review-rounds review)))
              :base-oid base
              :head-oid head
              :created-at (float-time)
-             :completed-at nil
-             :verdict nil
-             :read-state nil
-             :metadata `((scope . ,summary) (request . ,metadata)))))
+             :patch-sha256 nil
+             :name-status-sha256 nil)))
       (condition-case original-error
           (progn
             (magnus-review-capture-round-evidence review round)
             (magnus-review-ensure-checkout review head round)
             round)
         (error
-         ;; Preparation is not durable.  Remove each safely removable half of
-         ;; the candidate independently, but never replace the useful original
-         ;; failure with a cleanup failure.
-         (dolist (remover '(magnus-review--remove-round-checkout
-                            magnus-review--remove-candidate-round-directory))
-           (condition-case cleanup-error
-               (funcall remover review round)
-             (error
-              (message "Magnus: candidate cleanup after preparation failure: %s"
-                       (error-message-string cleanup-error)))))
+         ;; Preparation is not durable.  Cleanup still uses the cross-process
+         ;; freshness gate so it cannot race another Emacs's publication.
+         (condition-case cleanup-error
+             (magnus-review-discard-candidate review round)
+           (error
+            (message "Magnus: candidate cleanup after preparation failure: %s"
+                     (error-message-string cleanup-error))))
          (signal (car original-error) (cdr original-error)))))))
 
 (defun magnus-review--safe-regular-file-p (path)
   "Return non-nil when PATH is a regular, non-symlink file."
   (and (file-regular-p path) (not (file-symlink-p path))))
 
+(defun magnus-review--lineage-lock-target (review)
+  "Return the file-lock target for REVIEW's durable manifest."
+  (magnus-review-manifest-path review))
+
+(defun magnus-review--call-with-file-lock (target description function)
+  "Call FUNCTION while exclusively locking TARGET for DESCRIPTION.
+Use Emacs's native lock-file protocol so dead-process locks are recognized and
+reclaimed instead of permanently wedging a lineage after a crash."
+  (let ((create-lockfiles t)
+        acquired)
+    (cl-labels
+        ((busy (owner)
+           (signal
+            'magnus-review-busy-error
+            (list
+             (format "%s is being written by another Emacs process%s"
+                     description
+                     (if (stringp owner) (format " (%s)" owner) ""))))))
+      ;; `file-locked-p' removes a stale native lock.  The subsequent
+      ;; `lock-file' remains the atomic acquisition and closes the check/create
+      ;; race against another live Emacs.
+      (when-let ((owner (file-locked-p target)))
+        (busy owner))
+      (condition-case err
+          (cl-letf (((symbol-function 'ask-user-about-lock)
+                     (lambda (_file owner) (busy owner))))
+            (lock-file target)
+            (setq acquired t))
+        (magnus-review-busy-error
+         (signal (car err) (cdr err)))
+        (file-locked (busy (nth 2 err)))
+        (error (signal (car err) (cdr err))))
+      (unwind-protect
+          (funcall function)
+        ;; Unlocking follows the manifest commit point and may not turn a
+        ;; successful publication into a reported failure.
+        (when acquired
+          (condition-case cleanup-error
+              (unlock-file target)
+            (error
+             (message "Magnus: could not release %s lock: %s"
+                      description
+                      (error-message-string cleanup-error)))))))))
+
+(defun magnus-review--call-with-lineage-lock (review function)
+  "Call FUNCTION under REVIEW's exclusive cross-process write lock."
+  (magnus-review--ensure-review-directories review)
+  (magnus-review--call-with-file-lock
+   (magnus-review--lineage-lock-target review)
+   (format "Review %s" (magnus-review-id review))
+   function))
+
+(defun magnus-review--project-storage-directory (review)
+  "Return REVIEW's private project-level storage directory."
+  (magnus-review--child-path
+   (expand-file-name magnus-review-directory-root)
+   (magnus-review-project-hash review)))
+
+(defun magnus-review--author-lock-target (review)
+  "Return REVIEW's project/author uniqueness lock target."
+  (expand-file-name
+   (format ".author-%s"
+           (secure-hash
+            'sha256 (magnus-review-author-instance-id review)))
+   (magnus-review--project-storage-directory review)))
+
+(defun magnus-review--disk-open-for-author-locked (review)
+  "Return another durable open lineage for REVIEW's author, if any.
+The caller must hold REVIEW's project/author lock.  Malformed unrelated
+lineages are warned about and ignored exactly as they are during normal load."
+  (let ((project-directory (magnus-review--project-storage-directory review))
+        found)
+    (dolist (entry (directory-files project-directory t "\\`[^.]" t))
+      (let* ((id (file-name-nondirectory entry))
+             (manifest (expand-file-name "manifest.json" entry)))
+        (when (and (not (string= id (magnus-review-id review)))
+                   (magnus-review--valid-id-p id)
+                   (file-directory-p entry)
+                   (not (file-symlink-p entry))
+                   (file-exists-p manifest))
+          (condition-case error-data
+              (let ((candidate
+                     (magnus-review--from-json
+                      (magnus-review--read-json-file manifest)
+                      id (magnus-review-project-hash review))))
+                (when (and
+                       (eq (magnus-review-lifecycle candidate) 'open)
+                       (string=
+                        (magnus-review-author-instance-id candidate)
+                        (magnus-review-author-instance-id review)))
+                  (if found
+                      (magnus-review--signal
+                       "Author %s has multiple durable open reviews"
+                       (magnus-review-author-name review))
+                    (setq found candidate))))
+            (error
+             (display-warning
+              'magnus-review
+              (format "Ignoring review manifest %s while checking author ownership: %s"
+                      manifest (error-message-string error-data))
+              :warning))))))
+    found))
+
+(defun magnus-review--call-with-publication-locks
+    (review candidate function)
+  "Call FUNCTION with locks required to publish REVIEW CANDIDATE.
+The first round also serializes the project/author invariant across Emacs
+processes; later rounds need only the lineage revision lock."
+  (if (= (magnus-review-scope-number candidate) 1)
+      (progn
+        (magnus-review--ensure-review-directories review)
+        (magnus-review--call-with-file-lock
+         (magnus-review--author-lock-target review)
+         (format "Review author %s" (magnus-review-author-name review))
+         (lambda ()
+           (when-let ((existing
+                       (magnus-review--disk-open-for-author-locked review)))
+             (magnus-review--signal
+              "Author %s already has durable open review %s in this project"
+              (magnus-review-author-name review)
+              (magnus-review-id existing)))
+           (magnus-review--call-with-lineage-lock review function))))
+    (magnus-review--call-with-lineage-lock review function)))
+
 (cl-defun magnus-review-complete-round
-    (review round verdict &key session-id metadata)
-  "Publish successful candidate ROUND with VERDICT into REVIEW.
+    (review candidate verdict
+            &key session-id result-json report finding-count)
+  "Publish successful CANDIDATE with VERDICT into REVIEW.
 SESSION-ID, when non-nil, becomes the lineage's last successful provider
-session.  This single transition is the only way a prepared round becomes
-durable.  METADATA replaces the candidate metadata when supplied."
-  (unless (and (magnus-review-p review)
-               (eq (magnus-review-lifecycle review) 'open))
+session.  RESULT-JSON and REPORT are final UTF-8 artifact contents.
+This transition owns final artifact replacement and the manifest commit."
+  (setq review (magnus-review-resolve-current review))
+  (unless (eq (magnus-review-lifecycle review) 'open)
     (magnus-review--signal "Cannot complete a round for a closed review"))
-  (unless (magnus-review-round-p round)
-    (magnus-review--signal "Not a Magnus review round: %S" round))
+  (unless (magnus-review-candidate-p candidate)
+    (magnus-review--signal "Not a Magnus review candidate: %S" candidate))
   (unless (memq verdict magnus-review--verdict-states)
     (magnus-review--signal "Invalid review verdict: %S" verdict))
-  (unless (= (magnus-review-round-number round)
+  (unless (and (integerp finding-count) (>= finding-count 0))
+    (magnus-review--signal "Invalid review finding count: %S" finding-count))
+  (dolist (entry `(("structured result" ,result-json)
+                   ("rendered report" ,report)))
+    (unless (stringp (cadr entry))
+      (magnus-review--signal "Missing %s contents" (car entry)))
+    (when (> (string-bytes (encode-coding-string (cadr entry) 'utf-8-unix))
+             magnus-review-max-result-bytes)
+      (magnus-review--signal "%s exceeds %d bytes"
+                             (capitalize (car entry))
+                             magnus-review-max-result-bytes)))
+  (unless (= (magnus-review-scope-number candidate)
              (1+ (length (magnus-review-rounds review))))
     (magnus-review--signal "Review candidate is obsolete"))
-  (when (or (magnus-review-round-completed-at round)
-            (magnus-review-round-verdict round)
-            (magnus-review-round-read-state round)
-            (memq round (magnus-review-rounds review)))
-    (magnus-review--signal "Review candidate is already published"))
   (when-let ((latest (magnus-review-latest-round review)))
-    (when (and (string= (magnus-review-round-base-oid latest)
-                        (magnus-review-round-base-oid round))
-               (string= (magnus-review-round-head-oid latest)
-                        (magnus-review-round-head-oid round)))
+    (when (and (string= (magnus-review-scope-base-oid latest)
+                        (magnus-review-scope-base-oid candidate))
+               (string= (magnus-review-scope-head-oid latest)
+                        (magnus-review-scope-head-oid candidate)))
       (magnus-review--signal "Review candidate duplicates the latest round")))
-  (dolist (path (list (magnus-review-round-patch-path review round)
-                      (magnus-review-round-name-status-path review round)
-                      (magnus-review-round-result-path review round)
-                      (magnus-review-round-report-path review round)))
-    (unless (magnus-review--safe-regular-file-p path)
-      (magnus-review--signal
-       "Successful review artifact is missing or unsafe: %s" path))
-    (set-file-modes path #o600))
   (when (and session-id
-             (not (and (stringp session-id)
-                       (not (string-empty-p session-id)))))
+             (not (and (stringp session-id) (<= 1 (length session-id) 1000))))
     (magnus-review--signal "Provider returned an invalid session ID"))
-  (let ((now (float-time))
-        (old-rounds (magnus-review-rounds review))
-        (old-updated-at (magnus-review-updated-at review))
-        (old-session-id (magnus-review-session-id review))
-        (old-completed-at (magnus-review-round-completed-at round))
-        (old-verdict (magnus-review-round-verdict round))
-        (old-read-state (magnus-review-round-read-state round))
-        (old-metadata (magnus-review-round-metadata round)))
-    (condition-case err
-        (progn
-          (when metadata
-            (setf (magnus-review-round-metadata round) metadata))
-          (setf (magnus-review-round-completed-at round) now
-                (magnus-review-round-verdict round) verdict
-                (magnus-review-round-read-state round) 'unread
-                (magnus-review-rounds review) (append old-rounds (list round))
-                (magnus-review-updated-at review) now)
-          (when session-id
-            (setf (magnus-review-session-id review) session-id))
-          (magnus-review-save review))
-      (error
-       ;; Publication has one local rollback boundary.  An I/O failure restores
-       ;; the in-memory lineage and leaves the exact candidate retryable.
-       (setf (magnus-review-rounds review) old-rounds
-             (magnus-review-updated-at review) old-updated-at
-             (magnus-review-session-id review) old-session-id
-             (magnus-review-round-completed-at round) old-completed-at
-             (magnus-review-round-verdict round) old-verdict
-             (magnus-review-round-read-state round) old-read-state
-             (magnus-review-round-metadata round) old-metadata)
-       (signal (car err) (cdr err))))
-    round))
+  (let (completed)
+    (magnus-review--call-with-publication-locks
+     review candidate
+     (lambda ()
+       ;; This freshness gate is deliberately before replaceable result/report
+       ;; writes.  Detecting a stale writer after those writes is too late.
+       (magnus-review--assert-current-revision-locked review)
+       (magnus-review--assert-unpublished-candidate review candidate)
+       (magnus-review--verify-candidate-evidence review candidate)
+       (magnus-review-write-artifact
+        review (magnus-review-round-result-path review candidate)
+        result-json 'utf-8-unix t)
+       (magnus-review-write-artifact
+        review (magnus-review-round-report-path review candidate)
+        report 'utf-8-unix t)
+       (let* ((now (float-time))
+              (result-bytes
+               (magnus-review--read-artifact-bytes
+                (magnus-review-round-result-path review candidate)
+                "result" magnus-review-max-result-bytes))
+              (old-rounds (magnus-review-rounds review))
+              (old-updated-at (magnus-review-updated-at review))
+              (old-session-id (magnus-review-session-id review))
+              (old-revision (magnus-review-revision review)))
+         (setq completed
+               (magnus-review-round--create
+                :number (magnus-review-scope-number candidate)
+                :base-oid (magnus-review-scope-base-oid candidate)
+                :head-oid (magnus-review-scope-head-oid candidate)
+                :created-at (magnus-review-scope-created-at candidate)
+                :completed-at now
+                :verdict verdict
+                :read-state 'unread
+                :finding-count finding-count
+                :result-sha256 (secure-hash 'sha256 result-bytes)
+                :patch-sha256
+                (magnus-review-candidate-patch-sha256 candidate)
+                :name-status-sha256
+                (magnus-review-candidate-name-status-sha256 candidate)))
+         ;; Validate the exact durable result bytes before they become visible
+         ;; through the manifest.
+         (magnus-review-read-verified-result review completed)
+         (condition-case err
+             (progn
+               (setf (magnus-review-rounds review)
+                     (append old-rounds (list completed))
+                     (magnus-review-updated-at review) now)
+               (when session-id
+                 (setf (magnus-review-session-id review) session-id))
+               (magnus-review--save-locked review))
+           (error
+            (setf (magnus-review-rounds review) old-rounds
+                  (magnus-review-updated-at review) old-updated-at
+                  (magnus-review-session-id review) old-session-id
+                  (magnus-review-revision review) old-revision)
+            (signal (car err) (cdr err)))))))
+    (magnus-review--run-changed-hooks)
+    completed))
 
 (defun magnus-review-mark-read (review &optional round)
   "Mark latest or supplied completed ROUND of REVIEW read."
-  (setq round (or round (magnus-review-latest-round review)))
-  (unless (and round (memq round (magnus-review-rounds review)))
+  (setq review (magnus-review-resolve-current review))
+  (if round
+      (pcase-let ((`(,current-review . ,current-round)
+                   (magnus-review-resolve-round review round)))
+        (setq review current-review round current-round))
+    (setq round (magnus-review-latest-round review)))
+  (unless round
     (magnus-review--signal "Only a completed review round can be read"))
   (unless (eq (magnus-review-round-read-state round) 'read)
-    (setf (magnus-review-round-read-state round) 'read
-          (magnus-review-updated-at review) (float-time))
-    (magnus-review-save review))
+    (let ((old-state (magnus-review-round-read-state round))
+          (old-updated-at (magnus-review-updated-at review)))
+      (condition-case err
+          (progn
+            (setf (magnus-review-round-read-state round) 'read
+                  (magnus-review-updated-at review) (float-time))
+            (magnus-review-save review))
+        (error
+         (setf (magnus-review-round-read-state round) old-state
+               (magnus-review-updated-at review) old-updated-at)
+         (signal (car err) (cdr err))))))
   round)
 
 (defun magnus-review-archive (review)
   "Archive REVIEW without deleting its completed reports."
+  (setq review (magnus-review-resolve-current review))
   (let ((state (and (functionp magnus-review-runtime-state-function)
                     (funcall magnus-review-runtime-state-function review))))
-    (when (memq state '(asking-scope queued running))
+    (when (memq state '(asking-scope running))
       (magnus-review--signal "Cannot archive a running review")))
-  (let ((now (float-time)))
-    (setf (magnus-review-lifecycle review) 'archived
-          (magnus-review-archived-at review) now
-          (magnus-review-updated-at review) now)
+  (let ((now (float-time))
+        (old-lifecycle (magnus-review-lifecycle review))
+        (old-archived-at (magnus-review-archived-at review))
+        (old-updated-at (magnus-review-updated-at review)))
     ;; A failed first run has no report to archive.  Removing that unsaved
     ;; draft avoids an archived status row which cannot be opened or resumed.
     (if (null (magnus-review-rounds review))
         (progn
+          (setf (magnus-review-lifecycle review) 'archived
+                (magnus-review-archived-at review) now
+                (magnus-review-updated-at review) now)
           (setq magnus-reviews (delq review magnus-reviews))
           (magnus-review--run-changed-hooks))
-      (magnus-review-save review))
+      (condition-case err
+          (progn
+            (setf (magnus-review-lifecycle review) 'archived
+                  (magnus-review-archived-at review) now
+                  (magnus-review-updated-at review) now)
+            (magnus-review-save review))
+        (error
+         (setf (magnus-review-lifecycle review) old-lifecycle
+               (magnus-review-archived-at review) old-archived-at
+               (magnus-review-updated-at review) old-updated-at)
+         (signal (car err) (cdr err)))))
     review))
 
 ;;; Strict completed-lineage persistence
@@ -1140,64 +1466,27 @@ durable.  METADATA replaces the candidate metadata when supplied."
         ((stringp value) value)
         (t nil)))
 
-(defun magnus-review--json-safe-value (value)
-  "Return a recursively JSON-serializable representation of VALUE."
-  (cond
-   ((or (null value) (stringp value) (numberp value)
-        (eq value t) (eq value :json-false))
-    value)
-   ((vectorp value)
-    (vconcat (mapcar #'magnus-review--json-safe-value (append value nil))))
-   ((hash-table-p value)
-    (let (entries)
-      (maphash
-       (lambda (key item)
-         (unless (or (stringp key) (symbolp key))
-           (magnus-review--signal "Invalid JSON metadata key: %S" key))
-         (push (cons key (magnus-review--json-safe-value item)) entries))
-       value)
-      entries))
-   ((and (consp value) (keywordp (car value)))
-    (let ((remaining value) result)
-      (while remaining
-        (let ((key (pop remaining)))
-          (unless (and (keywordp key) remaining)
-            (magnus-review--signal "Malformed metadata plist: %S" value))
-          (setq result
-                (append result
-                        (list key
-                              (magnus-review--json-safe-value
-                               (pop remaining)))))))
-      result))
-   ((and (listp value) (cl-every #'consp value))
-    (mapcar
-     (lambda (entry)
-       (unless (or (stringp (car entry)) (symbolp (car entry)))
-         (magnus-review--signal "Invalid JSON metadata key: %S" (car entry)))
-       (cons (car entry) (magnus-review--json-safe-value (cdr entry))))
-     value))
-   ((listp value)
-    (vconcat (mapcar #'magnus-review--json-safe-value value)))
-   ((symbolp value) (symbol-name value))
-   (t (magnus-review--signal "Metadata value is not JSON-safe: %S" value))))
-
 (defun magnus-review--round-to-json (round)
   "Return strict JSON-ready data for completed ROUND."
-  `((number . ,(magnus-review-round-number round))
-    (base_oid . ,(magnus-review-round-base-oid round))
-    (head_oid . ,(magnus-review-round-head-oid round))
-    (created_at . ,(magnus-review-round-created-at round))
+  `((number . ,(magnus-review-scope-number round))
+    (base_oid . ,(magnus-review-scope-base-oid round))
+    (head_oid . ,(magnus-review-scope-head-oid round))
+    (created_at . ,(magnus-review-scope-created-at round))
     (completed_at . ,(magnus-review-round-completed-at round))
     (verdict . ,(magnus-review--symbol-name
                  (magnus-review-round-verdict round)))
     (read_state . ,(magnus-review--symbol-name
                     (magnus-review-round-read-state round)))
-    (metadata . ,(magnus-review--json-safe-value
-                  (magnus-review-round-metadata round)))))
+    (finding_count . ,(magnus-review-round-finding-count round))
+    (result_sha256 . ,(magnus-review-round-result-sha256 round))
+    (patch_sha256 . ,(magnus-review-round-patch-sha256 round))
+    (name_status_sha256
+     . ,(magnus-review-round-name-status-sha256 round))))
 
-(defun magnus-review--to-json (review)
+(defun magnus-review--to-json (review &optional revision)
   "Return strict JSON-ready completed-lineage data for REVIEW."
   `((schema_version . ,magnus-review-schema-version)
+    (revision . ,(or revision (magnus-review-revision review)))
     (id . ,(magnus-review-id review))
     (project_root . ,(magnus-review-project-root review))
     (project_hash . ,(magnus-review-project-hash review))
@@ -1206,12 +1495,11 @@ durable.  METADATA replaces the candidate metadata when supplied."
     (reviewer_name . ,(magnus-review-reviewer-name review))
     (reviewer_provider . ,(magnus-review--symbol-name
                            (magnus-review-reviewer-provider review)))
-    (model . ,(magnus-review--symbol-name (magnus-review-model review)))
+    (model . ,(magnus-review-model review))
     (effort . ,(magnus-review--symbol-name (magnus-review-effort review)))
     (task . ,(magnus-review-task review))
+    (reviewer_expertise . ,(magnus-review-reviewer-expertise review))
     (session_id . ,(magnus-review-session-id review))
-    (metadata . ,(magnus-review--json-safe-value
-                  (magnus-review-metadata review)))
     (lifecycle . ,(magnus-review--symbol-name
                    (magnus-review-lifecycle review)))
     (created_at . ,(magnus-review-created-at review))
@@ -1238,25 +1526,54 @@ durable.  METADATA replaces the candidate metadata when supplied."
                              kind actual)))
   object)
 
-(defun magnus-review--require-string (value kind &optional allow-nil)
-  "Return string VALUE or signal, naming it KIND.
-When ALLOW-NIL is non-nil, nil is accepted."
-  (unless (or (and (stringp value) (not (string-empty-p value)))
+(defun magnus-review--require-string
+    (value kind limit &optional allow-nil)
+  "Return bounded string VALUE or signal, naming it KIND."
+  (unless (or (and (stringp value) (<= 1 (length value) limit))
               (and allow-nil (null value)))
     (magnus-review--signal "Invalid %s in manifest: %S" kind value))
   value)
 
-(defun magnus-review--require-number (value kind &optional allow-nil)
-  "Return numeric VALUE or signal, naming it KIND."
-  (unless (or (numberp value) (and allow-nil (null value)))
+(defun magnus-review--valid-timestamp-p (value)
+  "Return non-nil when VALUE is a finite, plausible Unix timestamp."
+  (and (numberp value) (>= value 0) (< value 1000000000000)))
+
+(defun magnus-review--require-timestamp (value kind &optional allow-nil)
+  "Return timestamp VALUE or signal, naming it KIND."
+  (unless (or (magnus-review--valid-timestamp-p value)
+              (and allow-nil (null value)))
     (magnus-review--signal "Invalid %s in manifest: %S" kind value))
   value)
 
-(defun magnus-review--require-oid (value kind)
-  "Return lowercase full OID VALUE or signal, naming it KIND."
-  (unless (magnus-review--valid-oid-p value)
+(defun magnus-review--require-integer
+    (value kind &optional allow-zero)
+  "Return integer VALUE or signal, naming it KIND."
+  (unless (and (integerp value)
+               (if allow-zero (>= value 0) (> value 0)))
     (magnus-review--signal "Invalid %s in manifest: %S" kind value))
-  (downcase value))
+  value)
+
+(defun magnus-review--canonical-oid-p (value)
+  "Return non-nil when VALUE is a canonical lowercase full Git OID."
+  (and (magnus-review--valid-oid-p value)
+       (string= value (downcase value))))
+
+(defun magnus-review--require-oid (value kind)
+  "Return canonical lowercase full OID VALUE or signal, naming it KIND."
+  (unless (magnus-review--canonical-oid-p value)
+    (magnus-review--signal "Invalid %s in manifest: %S" kind value))
+  value)
+
+(defun magnus-review--valid-sha256-p (value)
+  "Return non-nil when VALUE is a lowercase SHA-256 digest."
+  (and (stringp value)
+       (string-match-p "\\`[0-9a-f]\\{64\\}\\'" value)))
+
+(defun magnus-review--require-sha256 (value kind)
+  "Return SHA-256 VALUE or signal, naming it KIND."
+  (unless (magnus-review--valid-sha256-p value)
+    (magnus-review--signal "Invalid %s in manifest: %S" kind value))
+  value)
 
 (defun magnus-review--validate-state (value states kind)
   "Parse string VALUE as one of STATES, naming it KIND."
@@ -1268,7 +1585,7 @@ When ALLOW-NIL is non-nil, nil is accepted."
 (defun magnus-review--optional-symbol (value kind)
   "Parse bounded optional symbol string VALUE, naming it KIND."
   (when value
-    (magnus-review--require-string value kind)
+    (magnus-review--require-string value kind 100)
     (unless (and (<= (length value) 100)
                  (string-match-p "\\`[[:alnum:]_.-]+\\'" value))
       (magnus-review--signal "Invalid %s in manifest: %S" kind value))
@@ -1279,7 +1596,7 @@ When ALLOW-NIL is non-nil, nil is accepted."
   (magnus-review--require-object-shape
    object
    '(number base_oid head_oid created_at completed_at verdict read_state
-            metadata)
+            finding_count result_sha256 patch_sha256 name_status_sha256)
    "round")
   (let ((number (alist-get 'number object)))
     (unless (eql number expected-number)
@@ -1290,9 +1607,9 @@ When ALLOW-NIL is non-nil, nil is accepted."
                 (alist-get 'base_oid object) "round base OID")
      :head-oid (magnus-review--require-oid
                 (alist-get 'head_oid object) "round head OID")
-     :created-at (magnus-review--require-number
+     :created-at (magnus-review--require-timestamp
                   (alist-get 'created_at object) "round creation time")
-     :completed-at (magnus-review--require-number
+     :completed-at (magnus-review--require-timestamp
                     (alist-get 'completed_at object) "round completion time")
      :verdict (magnus-review--validate-state
                (alist-get 'verdict object)
@@ -1300,16 +1617,28 @@ When ALLOW-NIL is non-nil, nil is accepted."
      :read-state (magnus-review--validate-state
                   (alist-get 'read_state object)
                   magnus-review--read-states "round read state")
-     :metadata (alist-get 'metadata object))))
+     :finding-count
+     (magnus-review--require-integer
+      (alist-get 'finding_count object) "round finding count" t)
+     :result-sha256
+     (magnus-review--require-sha256
+      (alist-get 'result_sha256 object) "round result digest")
+     :patch-sha256
+     (magnus-review--require-sha256
+      (alist-get 'patch_sha256 object) "round patch digest")
+     :name-status-sha256
+     (magnus-review--require-sha256
+      (alist-get 'name_status_sha256 object) "round name-status digest"))))
 
 (defun magnus-review--from-json (object &optional expected-id expected-hash)
   "Deserialize strict completed-lineage OBJECT.
 EXPECTED-ID and EXPECTED-HASH validate its managed storage identity."
   (magnus-review--require-object-shape
    object
-   '(schema_version id project_root project_hash author_instance_id author_name
-                    reviewer_name reviewer_provider model effort task session_id
-                    metadata lifecycle created_at updated_at archived_at rounds)
+   '(schema_version revision id project_root project_hash author_instance_id
+                    author_name reviewer_name reviewer_provider model effort task
+                    reviewer_expertise session_id lifecycle created_at updated_at
+                    archived_at rounds)
    "review")
   (unless (eql (alist-get 'schema_version object)
                magnus-review-schema-version)
@@ -1322,8 +1651,12 @@ EXPECTED-ID and EXPECTED-HASH validate its managed storage identity."
          (number 0))
     (unless (magnus-review--valid-id-p id)
       (magnus-review--signal "Invalid review ID in manifest: %S" id))
-    (magnus-review--require-string project-root "project root")
+    (magnus-review--require-string project-root "project root" 4096)
+    (unless (string= project-root
+                     (magnus-review--canonical-directory project-root))
+      (magnus-review--signal "Project root is not canonical in manifest"))
     (unless (and (magnus-review--valid-hash-p project-hash)
+                 (string= project-hash (downcase project-hash))
                  (string= project-hash
                           (magnus-review-compute-project-hash project-root)))
       (magnus-review--signal "Project hash does not match manifest root"))
@@ -1335,42 +1668,50 @@ EXPECTED-ID and EXPECTED-HASH validate its managed storage identity."
     (magnus-review--validate-invariants
      (magnus-review--create
       :id id
-      :project-root (magnus-review--canonical-directory project-root)
+      :project-root project-root
       :project-hash project-hash
       :author-instance-id
       (magnus-review--require-string
-       (alist-get 'author_instance_id object) "author instance ID")
+       (alist-get 'author_instance_id object) "author instance ID" 256)
       :author-name
       (magnus-review--require-string
-       (alist-get 'author_name object) "author name")
+       (alist-get 'author_name object) "author name" 256)
       :reviewer-name
       (magnus-review--require-string
-       (alist-get 'reviewer_name object) "reviewer name")
+       (alist-get 'reviewer_name object) "reviewer name" 256)
       :reviewer-provider
       (magnus-review--optional-symbol
        (alist-get 'reviewer_provider object) "reviewer provider")
       :model (magnus-review--require-string
-              (alist-get 'model object) "model" t)
+              (alist-get 'model object) "model" 200 t)
       :effort (magnus-review--optional-symbol
                (alist-get 'effort object) "effort")
       :task (magnus-review--require-string
-             (alist-get 'task object) "task" t)
+             (alist-get 'task object) "task" 4000 t)
+      :reviewer-expertise
+      (magnus-review--require-string
+       (alist-get 'reviewer_expertise object) "reviewer expertise" 1200 t)
       :session-id (magnus-review--require-string
-                   (alist-get 'session_id object) "session ID" t)
-      :metadata (alist-get 'metadata object)
+                   (alist-get 'session_id object) "session ID" 1000 t)
+      :revision
+      (magnus-review--require-integer
+       (alist-get 'revision object) "manifest revision")
       :lifecycle (magnus-review--validate-state
                   (alist-get 'lifecycle object)
                   magnus-review--lifecycle-states "lifecycle")
-      :created-at (magnus-review--require-number
+      :created-at (magnus-review--require-timestamp
                    (alist-get 'created_at object) "creation time")
-      :updated-at (magnus-review--require-number
+      :updated-at (magnus-review--require-timestamp
                    (alist-get 'updated_at object) "update time")
-      :archived-at (magnus-review--require-number
+      :archived-at (magnus-review--require-timestamp
                     (alist-get 'archived_at object) "archive time" t)
       :rounds
-      (mapcar (lambda (round)
-                (magnus-review--round-from-json round (cl-incf number)))
-              (append (alist-get 'rounds object) nil))))))
+      (let ((rounds (alist-get 'rounds object)))
+        (unless (listp rounds)
+          (magnus-review--signal "Invalid rounds array in manifest"))
+        (mapcar (lambda (round)
+                  (magnus-review--round-from-json round (cl-incf number)))
+                rounds))))))
 
 (defun magnus-review--validate-invariants (review)
   "Validate completed lineage invariants for REVIEW."
@@ -1379,72 +1720,146 @@ EXPECTED-ID and EXPECTED-HASH validate its managed storage identity."
                (magnus-review--valid-hash-p
                 (magnus-review-project-hash review))
                (string= (magnus-review-project-hash review)
+                        (downcase (magnus-review-project-hash review)))
+               (string= (magnus-review-project-root review)
+                        (magnus-review--canonical-directory
+                         (magnus-review-project-root review)))
+               (string= (magnus-review-project-hash review)
                         (magnus-review-compute-project-hash
                          (magnus-review-project-root review))))
     (magnus-review--signal "Review storage identity is inconsistent"))
-  (dolist (value (list (magnus-review-author-instance-id review)
-                       (magnus-review-author-name review)
-                       (magnus-review-reviewer-name review)))
-    (unless (and (stringp value) (not (string-empty-p value)))
-      (magnus-review--signal "Review participant identity is incomplete")))
+  (magnus-review--bounded-string-value
+   (magnus-review-author-instance-id review) "author instance ID" 256)
+  (magnus-review--bounded-string-value
+   (magnus-review-author-name review) "author name" 256)
+  (magnus-review--bounded-string-value
+   (magnus-review-reviewer-name review) "reviewer name" 256)
+  (magnus-review--optional-symbol-value
+   (magnus-review-reviewer-provider review) "reviewer provider")
+  (magnus-review--model-value (magnus-review-model review))
+  (magnus-review--optional-symbol-value
+   (magnus-review-effort review) "effort")
+  (magnus-review--bounded-string-value
+   (magnus-review-task review) "task" 4000 t)
+  (magnus-review--bounded-string-value
+   (magnus-review-reviewer-expertise review) "reviewer expertise" 1200 t)
+  (unless (and (integerp (magnus-review-revision review))
+               (>= (magnus-review-revision review) 0))
+    (magnus-review--signal "Invalid manifest revision"))
   (unless (memq (magnus-review-lifecycle review)
                 magnus-review--lifecycle-states)
     (magnus-review--signal "Invalid review lifecycle"))
-  (unless (and (numberp (magnus-review-created-at review))
-               (numberp (magnus-review-updated-at review))
+  (unless (and (magnus-review--valid-timestamp-p
+                (magnus-review-created-at review))
+               (magnus-review--valid-timestamp-p
+                (magnus-review-updated-at review))
                (<= (magnus-review-created-at review)
                    (magnus-review-updated-at review)))
     (magnus-review--signal "Invalid review timestamps"))
   (if (eq (magnus-review-lifecycle review) 'archived)
-      (unless (numberp (magnus-review-archived-at review))
+      (unless (and (magnus-review--valid-timestamp-p
+                    (magnus-review-archived-at review))
+                   (<= (magnus-review-created-at review)
+                       (magnus-review-archived-at review))
+                   (<= (magnus-review-archived-at review)
+                       (magnus-review-updated-at review)))
         (magnus-review--signal "Archived review lacks archive timestamp"))
     (when (magnus-review-archived-at review)
       (magnus-review--signal "Open review has archive timestamp")))
   (when (and (magnus-review-session-id review)
              (not (and (stringp (magnus-review-session-id review))
-                       (not (string-empty-p
-                             (magnus-review-session-id review))))))
+                       (<= 1 (length (magnus-review-session-id review)) 1000))))
     (magnus-review--signal "Invalid successful provider session ID"))
+  (unless (proper-list-p (magnus-review-rounds review))
+    (magnus-review--signal "Review rounds must be a proper list"))
   (let ((number 0))
     (dolist (round (magnus-review-rounds review))
-      (unless (= (magnus-review-round-number round) (cl-incf number))
+      (unless (and (magnus-review-round-p round)
+                   (= (magnus-review-scope-number round) (cl-incf number)))
         (magnus-review--signal "Review rounds are not sequential"))
-      (unless (and (magnus-review--valid-oid-p
-                    (magnus-review-round-base-oid round))
-                   (magnus-review--valid-oid-p
-                    (magnus-review-round-head-oid round))
-                   (not (string= (magnus-review-round-base-oid round)
-                                 (magnus-review-round-head-oid round))))
+      (unless (and (magnus-review--canonical-oid-p
+                    (magnus-review-scope-base-oid round))
+                   (magnus-review--canonical-oid-p
+                    (magnus-review-scope-head-oid round))
+                   (not (string= (magnus-review-scope-base-oid round)
+                                 (magnus-review-scope-head-oid round))))
         (magnus-review--signal "Round %d has invalid Git scope" number))
-      (unless (and (numberp (magnus-review-round-created-at round))
-                   (numberp (magnus-review-round-completed-at round))
-                   (<= (magnus-review-round-created-at round)
-                       (magnus-review-round-completed-at round)))
+      (unless (and (magnus-review--valid-timestamp-p
+                    (magnus-review-scope-created-at round))
+                   (magnus-review--valid-timestamp-p
+                    (magnus-review-round-completed-at round))
+                   (<= (magnus-review-scope-created-at round)
+                       (magnus-review-round-completed-at round))
+                   (<= (magnus-review-round-completed-at round)
+                       (magnus-review-updated-at review)))
         (magnus-review--signal "Round %d has invalid timestamps" number))
       (unless (and (memq (magnus-review-round-verdict round)
                          magnus-review--verdict-states)
                    (memq (magnus-review-round-read-state round)
                          magnus-review--read-states))
         (magnus-review--signal "Round %d is not successfully published"
-                               number))))
+                               number))
+      (unless (and (integerp (magnus-review-round-finding-count round))
+                   (>= (magnus-review-round-finding-count round) 0)
+                   (magnus-review--valid-sha256-p
+                    (magnus-review-round-result-sha256 round))
+                   (magnus-review--valid-sha256-p
+                    (magnus-review-round-patch-sha256 round))
+                   (magnus-review--valid-sha256-p
+                    (magnus-review-round-name-status-sha256 round)))
+        (magnus-review--signal "Round %d has invalid artifact integrity" number))))
   review)
 
-(defun magnus-review-save (review)
-  "Persist completed REVIEW atomically and privately.
-Empty drafts are intentionally not persistable."
+(defun magnus-review--disk-review-locked (review)
+  "Return REVIEW's strict manifest object while its lineage lock is held."
+  (let ((manifest (magnus-review-manifest-path review)))
+    (when (file-exists-p manifest)
+      (magnus-review--from-json
+       (magnus-review--read-json-file manifest)
+       (magnus-review-id review) (magnus-review-project-hash review)))))
+
+(defun magnus-review--assert-current-revision-locked (review)
+  "Require REVIEW to match its durable revision while write-locked."
+  (let ((disk (magnus-review--disk-review-locked review))
+        (expected (magnus-review-revision review)))
+    (unless (if disk
+                (= expected (magnus-review-revision disk))
+              (= expected 0))
+      (signal 'magnus-review-stale-error
+              (list
+               (format
+                "Review %s changed in another Emacs; reload it before retrying"
+                (magnus-review-id review)))))
+    disk))
+
+(defun magnus-review--save-locked (review)
+  "Persist REVIEW while its lineage lock is held and return it.
+No operation after the atomic manifest rename is allowed to signal."
   (unless (magnus-review-rounds review)
     (magnus-review--signal "Cannot persist a review without a completed round"))
   (magnus-review--validate-invariants review)
-  (magnus-review--ensure-review-directories review)
-  (let ((json-encoding-pretty-print nil))
+  (let ((next-revision (1+ (magnus-review-revision review))))
     (magnus-review--atomic-write-string
      (magnus-review-manifest-path review)
-     (concat (json-serialize (magnus-review--to-json review)
+     (concat (json-serialize (magnus-review--to-json review next-revision)
                              :null-object nil
                              :false-object :json-false)
-             "\n")))
-  (unless (memq review magnus-reviews)
-    (push review magnus-reviews))
+             "\n"))
+    ;; This assignment is deliberately the only action after durable rename.
+    (setf (magnus-review-revision review) next-revision))
+  review)
+
+(defun magnus-review-save (review)
+  "Persist completed current REVIEW with stale-writer detection."
+  (let ((current (magnus-review-resolve-current review)))
+    (unless (eq current review)
+      (signal 'magnus-review-stale-error
+              (list "Review object was replaced; resolve it before saving"))))
+  (magnus-review--call-with-lineage-lock
+   review
+   (lambda ()
+     (magnus-review--assert-current-revision-locked review)
+     (magnus-review--save-locked review)))
   (magnus-review--run-changed-hooks)
   review)
 
@@ -1463,6 +1878,107 @@ Empty drafts are intentionally not persistable."
     (json-parse-buffer :object-type 'alist :array-type 'list
                        :null-object nil :false-object :json-false)))
 
+(defun magnus-review-read-verified-artifact (review round kind)
+  "Return exact verified bytes for completed REVIEW ROUND artifact KIND.
+KIND is one of `result', `patch', or `name-status'."
+  (unless (and (magnus-review-p review) (magnus-review-round-p round))
+    (magnus-review--signal "Verified artifacts require a completed round"))
+  (pcase kind
+    ('result
+     (magnus-review--verify-bytes
+      (magnus-review--read-artifact-bytes
+       (magnus-review-round-result-path review round)
+       "result" magnus-review-max-result-bytes)
+      (magnus-review-round-result-sha256 round) "result"))
+    ('patch
+     (magnus-review--verify-bytes
+      (magnus-review--read-artifact-bytes
+       (magnus-review-round-patch-path review round)
+       "patch" magnus-review-max-evidence-bytes)
+      (magnus-review-round-patch-sha256 round) "patch"))
+    ('name-status
+     (magnus-review--verify-bytes
+      (magnus-review--read-artifact-bytes
+       (magnus-review-round-name-status-path review round)
+       "name-status" magnus-review-max-evidence-bytes)
+      (magnus-review-round-name-status-sha256 round) "name-status"))
+    (_ (magnus-review--signal "Unknown review artifact kind: %S" kind))))
+
+(defun magnus-review--result-from-verified-bytes (review round bytes)
+  "Parse and validate verified result BYTES for REVIEW ROUND."
+  (let ((envelope
+         (with-temp-buffer
+           (let ((coding-system-for-read 'utf-8-unix))
+             (insert (decode-coding-string bytes 'utf-8-unix)))
+           (goto-char (point-min))
+           (json-parse-buffer :object-type 'alist :array-type 'array
+                              :null-object nil :false-object :json-false))))
+    (magnus-review--require-object-shape
+     envelope
+     '(artifact_schema_version review_id round_number base_oid head_oid
+                               created_at result)
+     "result envelope")
+    (unless (eql (alist-get 'artifact_schema_version envelope) 1)
+      (magnus-review--signal "Unsupported review result artifact schema"))
+    (unless (equal (alist-get 'review_id envelope)
+                   (magnus-review-id review))
+      (magnus-review--signal "Review result belongs to another lineage"))
+    (unless (eql (alist-get 'round_number envelope)
+                 (magnus-review-scope-number round))
+      (magnus-review--signal "Review result has the wrong round number"))
+    (dolist (entry
+             `((base_oid . ,(magnus-review-scope-base-oid round))
+               (head_oid . ,(magnus-review-scope-head-oid round))))
+      (unless (equal (alist-get (car entry) envelope) (cdr entry))
+        (magnus-review--signal "Review result has the wrong %s" (car entry))))
+    (magnus-review--require-timestamp
+     (alist-get 'created_at envelope) "result creation time")
+    (let* ((result (alist-get 'result envelope))
+           (verdict (and (listp result) (alist-get 'verdict result)))
+           (findings-entry (and (listp result) (assq 'findings result)))
+           (findings (cdr findings-entry))
+           (verdict-symbol
+            (pcase verdict
+              ("approve" 'approve)
+              ("comment" 'comment)
+              ("request_changes" 'changes-requested)
+              (_ nil))))
+      (unless (and (listp result) (assq 'verdict result)
+                   findings-entry (vectorp findings))
+        (magnus-review--signal "Review result has an invalid canonical body"))
+      (unless (eq verdict-symbol (magnus-review-round-verdict round))
+        (magnus-review--signal "Review result verdict disagrees with manifest"))
+      (unless (= (length findings)
+                 (magnus-review-round-finding-count round))
+        (magnus-review--signal
+         "Review result finding count disagrees with manifest"))
+      result)))
+
+(defun magnus-review-read-verified-result (review round)
+  "Return REVIEW ROUND's canonical result after exact-byte verification."
+  (let ((bytes (magnus-review-read-verified-artifact review round 'result)))
+    (magnus-review--result-from-verified-bytes review round bytes)))
+
+(defun magnus-review-read-verified-artifacts (review round)
+  "Return one verified artifact bundle for current completed REVIEW ROUND.
+The plist contains `:result-bytes', parsed `:result', `:patch', and
+`:name-status'."
+  (pcase-let* ((`(,review . ,round)
+                (magnus-review-resolve-round review round))
+               (result-bytes
+                (magnus-review-read-verified-artifact review round 'result))
+               (patch
+                (magnus-review-read-verified-artifact review round 'patch))
+               (name-status
+                (magnus-review-read-verified-artifact
+                 review round 'name-status)))
+    (list :result-bytes result-bytes
+          :result
+          (magnus-review--result-from-verified-bytes
+           review round result-bytes)
+          :patch patch
+          :name-status name-status)))
+
 (defun magnus-review-load-file (file &optional expected-id expected-hash)
   "Load one strict completed-lineage manifest FILE and register it."
   (let ((review
@@ -1470,6 +1986,16 @@ Empty drafts are intentionally not persistable."
           (magnus-review--read-json-file file) expected-id expected-hash)))
     (unless (magnus-review-rounds review)
       (magnus-review--signal "Durable review has no completed rounds"))
+    (when (eq (magnus-review-lifecycle review) 'open)
+      (when-let ((existing
+                  (car
+                   (magnus-review--open-for-author-matches
+                    (magnus-review-project-root review)
+                    (magnus-review-author-instance-id review)
+                    (magnus-review-id review)))))
+        (magnus-review--signal
+         "Author %s already has loaded open review %s in this project"
+         (magnus-review-author-name review) (magnus-review-id existing))))
     (when-let ((existing (magnus-review-get (magnus-review-id review))))
       (unless (string= (magnus-review-project-hash existing)
                        (magnus-review-project-hash review))
@@ -1477,6 +2003,33 @@ Empty drafts are intentionally not persistable."
       (setq magnus-reviews (delq existing magnus-reviews)))
     (push review magnus-reviews)
     review))
+
+(defun magnus-review-refresh-from-disk (review)
+  "Return current REVIEW, replacing it only when disk has a newer revision.
+This is the narrow refresh operation for long-lived readers; it never resets
+the complete review registry."
+  (setq review (magnus-review-resolve-current review))
+  (let ((manifest (magnus-review-manifest-path review)))
+    (if (not (file-exists-p manifest))
+        (if (= (magnus-review-revision review) 0)
+            review
+          (signal 'magnus-review-stale-error
+                  (list "Durable review manifest disappeared")))
+      (let ((disk
+             (magnus-review--from-json
+              (magnus-review--read-json-file manifest)
+              (magnus-review-id review) (magnus-review-project-hash review))))
+        (cond
+         ((< (magnus-review-revision disk) (magnus-review-revision review))
+          (signal 'magnus-review-stale-error
+                  (list "Review manifest revision moved backwards")))
+         ((= (magnus-review-revision disk) (magnus-review-revision review))
+          review)
+         (t
+          (setq magnus-reviews (delq review magnus-reviews))
+          (push disk magnus-reviews)
+          (magnus-review--run-changed-hooks)
+          disk))))))
 
 (defun magnus-review-load-all ()
   "Load strict completed review lineages.

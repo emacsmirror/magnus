@@ -3,7 +3,7 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'json)
-(require 'magnus-background)
+(require 'magnus-headless)
 (require 'magnus-review)
 (require 'magnus-review-controller)
 
@@ -56,7 +56,6 @@
      :model "review-model"
      :effort 'high
      :task "Review the committed implementation"
-     :metadata nil
      :lifecycle 'open
      :created-at now
      :updated-at now
@@ -64,15 +63,24 @@
 
 (defun magnus-test-review--round (number base head &optional completed)
   "Return round NUMBER for BASE..HEAD, completed when COMPLETED is non-nil."
+  (if completed
+      (magnus-review-round--create
+       :number number :base-oid base :head-oid head
+       :created-at (float-time) :completed-at (float-time)
+       :verdict 'comment :read-state 'unread :finding-count 0)
+    (magnus-review-candidate--create
+     :number number :base-oid base :head-oid head
+     :created-at (float-time))))
+
+(defun magnus-test-review--completed-candidate (candidate)
+  "Return a completed-round fixture with CANDIDATE's immutable scope."
   (magnus-review-round--create
-   :number number
-   :base-oid base
-   :head-oid head
-   :created-at (float-time)
-   :completed-at (and completed (float-time))
-   :verdict (and completed 'comment)
-   :read-state (and completed 'unread)
-   :metadata nil))
+   :number (magnus-review-scope-number candidate)
+   :base-oid (magnus-review-scope-base-oid candidate)
+   :head-oid (magnus-review-scope-head-oid candidate)
+   :created-at (magnus-review-scope-created-at candidate)
+   :completed-at (float-time) :verdict 'comment :read-state 'unread
+   :finding-count 0))
 
 (cl-defun magnus-test-review--raw-result
     (base head &key (verdict "comment") (summary "Careful review")
@@ -110,18 +118,25 @@
 
 (defun magnus-test-review--store-result (review round result)
   "Store canonical RESULT as ROUND's controller envelope."
-  (let ((metadata
-         (copy-tree (magnus-review-round-metadata round))))
-    (setf (alist-get 'finding_count metadata)
+  (let ((bytes
+         (magnus-review-controller--json
+          (magnus-review-controller--result-envelope review round result))))
+    (setf (magnus-review-round-finding-count round)
           (length (append (alist-get 'findings result) nil))
-          (alist-get 'result_sha256 metadata)
-          (magnus-review-controller--result-digest result)
-          (magnus-review-round-metadata round) metadata))
-  (make-directory (magnus-review-round-directory review round) t)
-  (with-temp-file (magnus-review-round-result-path review round)
-    (insert
-     (magnus-review-controller--json
-      (magnus-review-controller--result-envelope review round result)))))
+          (magnus-review-round-result-sha256 round)
+          (secure-hash 'sha256 bytes))
+    (make-directory (magnus-review-round-directory review round) t)
+    (with-temp-file (magnus-review-round-result-path review round)
+      (insert bytes))))
+
+(defun magnus-test-review--refresh-result-digest (review round)
+  "Pin ROUND to the exact result artifact bytes currently stored for REVIEW."
+  (setf (magnus-review-round-result-sha256 round)
+        (secure-hash
+         'sha256
+         (magnus-review--read-artifact-bytes
+          (magnus-review-round-result-path review round)
+          "result" magnus-review-max-result-bytes))))
 
 (defun magnus-test-review--prepare-publication-evidence (review round)
   "Write the two immutable evidence files required to publish ROUND."
@@ -129,7 +144,11 @@
    review (magnus-review-round-patch-path review round) "" 'utf-8-unix t)
   (magnus-review-write-artifact
    review (magnus-review-round-name-status-path review round) ""
-   'utf-8-unix t))
+   'utf-8-unix t)
+  (setf (magnus-review-candidate-patch-sha256 round)
+        (secure-hash 'sha256 "")
+        (magnus-review-candidate-name-status-sha256 round)
+        (secure-hash 'sha256 "")))
 
 (ert-deftest magnus-review-result-normalization-assigns-stable-finding-ids ()
   (let* ((root (make-temp-file "magnus-review-normalize-" t))
@@ -221,23 +240,25 @@
         (progn
           (let ((err (should-error
                       (magnus-review-controller--history review round-two))))
-            (should (string-match-p "Cannot read completed review round 1"
+            (should (string-match-p "Completed review round 1 is invalid"
                                     (error-message-string err))))
           (make-directory (file-name-directory path) t)
           (with-temp-file path (insert "{"))
+          (magnus-test-review--refresh-result-digest review round-one)
           (let ((err (should-error
                       (magnus-review-controller--history review round-two))))
-            (should (string-match-p "Cannot read completed review round 1"
+            (should (string-match-p "Completed review round 1 is invalid"
                                     (error-message-string err))))
           (let ((envelope
                  (magnus-review-controller--result-envelope
                   review round-one result)))
             (setf (alist-get 'review_id envelope) "another-review")
             (with-temp-file path
-              (insert (magnus-review-controller--json envelope))))
+              (insert (magnus-review-controller--json envelope)))
+            (magnus-test-review--refresh-result-digest review round-one))
           (let ((err (should-error
                       (magnus-review-controller--history review round-two))))
-            (should (string-match-p "different review"
+            (should (string-match-p "another lineage"
                                     (error-message-string err))))
           (magnus-test-review--store-result review round-one result)
           (should (equal (magnus-review-controller--history review round-two)
@@ -259,7 +280,8 @@
               (insert
                (magnus-review-controller--json
                 (magnus-review-controller--result-envelope
-                 review round-one tampered)))))
+                 review round-one tampered))))
+            (magnus-test-review--refresh-result-digest review round-one))
           (let ((err (should-error
                       (magnus-review-controller--history review round-two))))
             (should (string-match-p "finding count disagrees"
@@ -270,7 +292,8 @@
               (insert
                (magnus-review-controller--json
                 (magnus-review-controller--result-envelope
-                 review round-one tampered)))))
+                 review round-one tampered))))
+            (magnus-test-review--refresh-result-digest review round-one))
           (let ((err (should-error
                       (magnus-review-controller--history review round-two))))
             (should (string-match-p "verdict disagrees"
@@ -394,6 +417,41 @@
     (should-not
      (magnus-review-controller--parse-scope-response text "absent"))))
 
+(ert-deftest magnus-review-request-context-refuses-coordination-task-drift ()
+  (let* ((root (make-temp-file "magnus-review-task-drift-" t))
+         (author
+          (magnus-instance--create
+           :id "author-id" :name "quick-wren" :directory root))
+         (review (magnus-test-review--review root))
+         (magnus-reviews (list review)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'magnus-review-git-root)
+                   (lambda (_directory) root))
+                  ((symbol-function 'magnus-review-controller--task)
+                   (lambda (_author _root) "A newly reported task")))
+          (let ((err (should-error
+                      (magnus-review-request-context author)
+                      :type 'user-error)))
+            (should (string-match-p "already has an open review"
+                                    (error-message-string err)))
+            (should (string-match-p "archive review keen-owl"
+                                    (error-message-string err)))))
+      (delete-directory root t))))
+
+(ert-deftest magnus-review-request-context-refuses-headless-author ()
+  (let ((author
+         (magnus-instance--create
+          :id "headless-author" :name "batch-owl" :directory "/tmp"
+          :kind 'headless)))
+    (cl-letf (((symbol-function 'magnus-review-git-root)
+               (lambda (_directory)
+                 (ert-fail "headless author reached Git scope discovery"))))
+      (let ((err (should-error
+                  (magnus-review-request-context author)
+                  :type 'user-error)))
+        (should (string-match-p "Headless task batch-owl"
+                                (error-message-string err)))))))
+
 (ert-deftest magnus-review-canonical-scope-accepts-reachable-commits-only ()
   (pcase-let* ((`(,root ,base ,head ,_tip)
                  (magnus-test-review--repository))
@@ -415,7 +473,7 @@
            :type 'user-error))
       (delete-directory root t))))
 
-(ert-deftest magnus-review-scope-poll-prepares-and-submits-background-candidate ()
+(ert-deftest magnus-review-scope-poll-prepares-and-starts-direct-candidate ()
   (let* ((root (make-temp-file "magnus-review-poll-" t))
          (review (magnus-test-review--review root))
          (round (magnus-test-review--round
@@ -423,11 +481,10 @@
          (nonce "scope-nonce")
          (runtime
           (magnus-review-controller--make-runtime
-           :review-id (magnus-review-id review)
            :phase 'asking-scope
            :nonce nonce
            :cursor 'fixture-cursor
-           :deadline (+ (float-time) 60)))
+           :deadline (cons 'response (+ (float-time) 60))))
          (magnus-review-controller--runtimes (make-hash-table :test #'equal))
          (magnus-reviews (list review))
          prepared submission)
@@ -449,12 +506,14 @@
                 round))
              ((symbol-function 'magnus-review-ensure-checkout)
               (lambda (&rest _arguments) root))
-             ((symbol-function 'magnus-background-submit)
-              (lambda (key provider request &optional callbacks)
-                (setq submission (list key provider request callbacks))
-                (magnus-background--make-job :key key :state 'queued))))
+             ((symbol-function 'magnus-headless-start)
+              (lambda (provider request &optional callbacks)
+                (setq submission (list nil provider request callbacks))
+                'review-process))
+             ((symbol-function 'run-with-timer)
+              (lambda (&rest _arguments) 'review-timeout)))
           (magnus-review-controller--poll-scope
-           (magnus-review-id review) nonce)
+           (magnus-review-id review) runtime)
           (should (equal prepared
                          (list review magnus-test-review--oid-a
                                magnus-test-review--oid-b)))
@@ -468,10 +527,12 @@
             (should-not (plist-get request :session-id)))
           (should-not (magnus-review-rounds review))
           (should (eq (magnus-review-controller-runtime-round runtime) round))
-          (should (eq (magnus-review-controller-runtime-phase runtime) 'queued)))
+          (should (eq (magnus-review-controller-runtime-phase runtime) 'running))
+          (should (eq (magnus-review-controller-runtime-process runtime)
+                      'review-process)))
       (delete-directory root t))))
 
-(ert-deftest magnus-review-scope-timeout-starts-only-after-queued-delivery ()
+(ert-deftest magnus-review-scope-deadline-extends-once-after-queued-delivery ()
   (let* ((root (make-temp-file "magnus-review-delivery-" t))
          (review (magnus-test-review--review root))
          (author
@@ -480,7 +541,9 @@
            :provider 'claude :status 'running))
          (magnus-reviews (list review))
          (magnus-review-controller--runtimes (make-hash-table :test #'equal))
-         receipt delivery-scope runtime cancelled-timers cancelled-scopes)
+         (now 100.0)
+         receipt delivery-scope runtime initial-deadline response-deadline
+         cancelled-timers cancelled-scopes)
     (unwind-protect
         (cl-letf
             (((symbol-function
@@ -494,13 +557,16 @@
              ((symbol-function 'magnus-review-controller--send)
               (lambda (_instance _text accepted scope)
                 (setq receipt accepted delivery-scope scope)
+                (should (eq (magnus-review-controller-runtime-timer scope)
+                            'scope-poll-timer))
                 'queued))
+             ((symbol-function 'float-time) (lambda (&optional _time) now))
              ((symbol-function 'run-with-timer)
               (lambda (_seconds repeat &rest _arguments)
-                (if repeat 'scope-poll-timer 'scope-delivery-timer)))
+                (should repeat)
+                'scope-poll-timer))
              ((symbol-function 'timerp)
-              (lambda (timer)
-                (memq timer '(scope-delivery-timer scope-poll-timer))))
+              (lambda (timer) (eq timer 'scope-poll-timer)))
              ((symbol-function 'cancel-timer)
               (lambda (timer) (push timer cancelled-timers)))
              ((symbol-function 'magnus-terminal-cancel-scope)
@@ -510,25 +576,33 @@
           (setq runtime (magnus-review-controller--runtime review))
           (should (eq delivery-scope runtime))
           (should (functionp receipt))
-          (should-not (magnus-review-controller-runtime-deadline runtime))
-          (should-not (magnus-review-controller-runtime-timer runtime))
-          (should (eq
-                   (magnus-review-controller-runtime-delivery-timer runtime)
-                   'scope-delivery-timer))
-          (funcall receipt)
-          (should-not
-           (magnus-review-controller-runtime-delivery-timer runtime))
-          (should (numberp
-                   (magnus-review-controller-runtime-deadline runtime)))
+          (setq initial-deadline
+                (magnus-review-controller-runtime-deadline runtime))
+          (should (eq (car initial-deadline) 'delivery))
+          (should (= (cdr initial-deadline)
+                     (+ now magnus-review-delivery-timeout)))
           (should (eq (magnus-review-controller-runtime-timer runtime)
                       'scope-poll-timer))
+          (setq now 200.0)
+          (funcall receipt)
+          (setq response-deadline
+                (magnus-review-controller-runtime-deadline runtime))
+          (should (eq (car response-deadline) 'response))
+          (should (= (cdr response-deadline)
+                     (+ now magnus-review-scope-timeout)))
+          ;; A duplicate synchronous receipt cannot extend the same query again.
+          (setq now 300.0)
+          (funcall receipt)
+          (should (eq (magnus-review-controller-runtime-deadline runtime)
+                      response-deadline))
           (magnus-review-interrupt review)
-          (should (memq 'scope-delivery-timer cancelled-timers))
           (should (memq 'scope-poll-timer cancelled-timers))
           (should (memq runtime cancelled-scopes))
           ;; A delayed receipt cannot revive interrupted ownership.
           (funcall receipt)
           (should-not (magnus-review-controller-runtime-timer runtime))
+          (should (eq (magnus-review-controller-runtime-deadline runtime)
+                      response-deadline))
           (should (eq (magnus-review-controller-runtime-phase runtime)
                       'interrupted)))
       (delete-directory root t))))
@@ -538,9 +612,8 @@
          (review (magnus-test-review--review root))
          (runtime
           (magnus-review-controller--make-runtime
-           :review-id (magnus-review-id review)
            :phase 'asking-scope :nonce "delivery-nonce" :cursor 'cursor
-           :delivery-timer 'delivery-watchdog))
+           :timer 'scope-poll :deadline '(delivery . 1.0)))
          (magnus-reviews (list review))
          (magnus-review-controller--runtimes (make-hash-table :test #'equal))
          cancelled-scope)
@@ -549,15 +622,15 @@
     (unwind-protect
         (cl-letf (((symbol-function 'magnus-terminal-cancel-scope)
                    (lambda (scope) (setq cancelled-scope scope)))
+                  ((symbol-function 'float-time) (lambda (&optional _time) 2.0))
                   ((symbol-function 'magnus-review-controller--changed)
                    #'ignore))
-          (magnus-review-controller--scope-delivery-timeout
-           (magnus-review-id review) "delivery-nonce" runtime)
+          (magnus-review-controller--poll-scope
+           (magnus-review-id review) runtime)
           (should (eq (magnus-review-controller-runtime-phase runtime)
                       'failed))
           (should (eq cancelled-scope runtime))
-          (should-not
-           (magnus-review-controller-runtime-delivery-timer runtime))
+          (should-not (magnus-review-controller-runtime-timer runtime))
           (should (string-match-p
                    "did not accept"
                    (magnus-review-controller-runtime-error runtime))))
@@ -566,26 +639,36 @@
 (ert-deftest magnus-review-scope-poll-scheduler-failure-is-retryable ()
   (let* ((root (make-temp-file "magnus-review-poll-failure-" t))
          (review (magnus-test-review--review root))
-         (runtime
-          (magnus-review-controller--make-runtime
-           :review-id (magnus-review-id review)
-           :phase 'asking-scope :nonce "poll-nonce" :cursor 'cursor))
+         (author
+          (magnus-instance--create
+           :id "author-id" :name "quick-wren" :directory root
+           :provider 'claude :status 'running))
          (magnus-reviews (list review))
-         (magnus-review-controller--runtimes (make-hash-table :test #'equal)))
-    (puthash (magnus-review-id review) runtime
-             magnus-review-controller--runtimes)
+         (magnus-review-controller--runtimes (make-hash-table :test #'equal))
+         runtime sent)
     (unwind-protect
-        (cl-letf (((symbol-function 'run-with-timer)
+        (cl-letf (((symbol-function
+                    'magnus-review-controller--require-committed-work)
+                   #'ignore)
+                  ((symbol-function
+                    'magnus-review-controller--instance-running-p)
+                   (lambda (_instance) t))
+                  ((symbol-function 'magnus-trace-cursor-create)
+                   (lambda (_instance) 'cursor))
+                  ((symbol-function 'magnus-review-controller--send)
+                   (lambda (&rest _arguments) (setq sent t) t))
+                  ((symbol-function 'run-with-timer)
                    (lambda (&rest _arguments) (error "timer unavailable")))
                   ((symbol-function 'magnus-terminal-cancel-scope) #'ignore)
                   ((symbol-function 'magnus-review-controller--changed)
                    #'ignore))
-          (should-not
-           (magnus-review-controller--scope-delivery-accepted
-            (magnus-review-id review) "poll-nonce" runtime))
+          (magnus-review-controller--begin-scope-query review author)
+          (setq runtime (magnus-review-controller--runtime review))
+          (should-not sent)
           (should (eq (magnus-review-controller-runtime-phase runtime)
                       'failed))
-          (should-not (magnus-review-controller-runtime-deadline runtime))
+          (should (eq (car (magnus-review-controller-runtime-deadline runtime))
+                      'delivery))
           (should (string-match-p
                    "timer unavailable"
                    (magnus-review-controller-runtime-error runtime))))
@@ -598,7 +681,6 @@
                  1 magnus-test-review--oid-a magnus-test-review--oid-b))
          (runtime
           (magnus-review-controller--make-runtime
-           :review-id (magnus-review-id review)
            :phase 'failed :round round :error "failed"))
          (magnus-review-controller--runtimes (make-hash-table :test #'equal))
          started cancelled)
@@ -609,20 +691,22 @@
                    (lambda (candidate candidate-runtime candidate-round)
                      (setq started
                            (list candidate candidate-runtime candidate-round))
-                     (setf (magnus-review-controller-runtime-job-key
-                            candidate-runtime)
-                           '(fixture-job)))))
+                     (setf (magnus-review-controller-runtime-phase
+                            candidate-runtime) 'running
+                           (magnus-review-controller-runtime-process
+                            candidate-runtime) 'fixture-process))))
           (magnus-review-retry review)
           (should (equal started (list review runtime round)))
-          (should (eq (magnus-review-controller-runtime-phase runtime) 'queued))
+          (should (eq (magnus-review-controller-runtime-phase runtime) 'running))
           (should-not (magnus-review-rounds review))
-          (cl-letf (((symbol-function 'magnus-background-cancel)
-                     (lambda (key) (setq cancelled key) 1)))
+          (cl-letf (((symbol-function 'magnus-headless-cancel)
+                     (lambda (process &optional _force)
+                       (setq cancelled process))))
             (magnus-review-interrupt review))
-          (should (equal cancelled '(fixture-job)))
+          (should (eq cancelled 'fixture-process))
           (should (eq (magnus-review-controller-runtime-phase runtime)
                       'interrupted))
-          (should-not (magnus-review-controller-runtime-job runtime))
+          (should-not (magnus-review-controller-runtime-process runtime))
           (should-not (magnus-review-rounds review)))
       (delete-directory root t))))
 
@@ -648,7 +732,6 @@
           (alist-get 'id (aref (alist-get 'findings result-one) 0)))
          (runtime
           (magnus-review-controller--make-runtime
-           :review-id (magnus-review-id review)
            :phase 'failed :round round-two :error "resume failed"))
          (magnus-review-controller--runtimes (make-hash-table :test #'equal))
          (magnus-reviews (list review))
@@ -661,19 +744,22 @@
         (cl-letf
             (((symbol-function 'magnus-review-ensure-checkout)
               (lambda (&rest _arguments) root))
-             ((symbol-function 'magnus-background-submit)
-              (lambda (key provider request &optional callbacks)
-                (setq submission (list key provider request callbacks))
-                (magnus-background--make-job :key key :state 'queued))))
+             ((symbol-function 'magnus-headless-start)
+              (lambda (provider request &optional callbacks)
+                (setq submission (list nil provider request callbacks))
+                'fresh-process))
+             ((symbol-function 'run-with-timer)
+              (lambda (&rest _arguments) 'review-timeout)))
           (magnus-review-restart-session review)
           (let ((request (nth 2 submission)))
             (should-not (plist-get request :session-id))
             (should (equal (plist-get request :name) "keen-owl"))
             (should (string-match-p (regexp-quote finding-id)
                                     (plist-get request :prompt))))
-          (should (magnus-review-controller-runtime-fresh-session-p runtime))
           (should (eq (magnus-review-controller-runtime-phase runtime)
-                      'queued))
+                      'running))
+          (should (eq (magnus-review-controller-runtime-process runtime)
+                      'fresh-process))
           (should (equal (magnus-review-session-id review)
                          "old-reviewer-session")))
       (delete-directory root t)
@@ -688,8 +774,7 @@
                  1 magnus-test-review--oid-a magnus-test-review--oid-b))
          (runtime
           (magnus-review-controller--make-runtime
-           :review-id (magnus-review-id review) :phase 'running
-           :round round :job-key '(success-job)))
+           :phase 'running :round round :process 'success-process))
          (magnus-review-controller--runtimes (make-hash-table :test #'equal))
          (magnus-reviews (list review)))
     (puthash (magnus-review-id review) runtime
@@ -703,8 +788,8 @@
                      #'ignore)
                     ((symbol-function 'magnus-review-controller--notify)
                      #'ignore))
-            (magnus-review-controller--complete-job
-             (magnus-review-id review) '(success-job)
+            (magnus-review-controller--complete-process
+             (magnus-review-id review) runtime 'success-process
              (list
               :success-p t
               :session-id "reviewer-session-one"
@@ -713,7 +798,14 @@
                magnus-test-review--oid-a magnus-test-review--oid-b
                :verdict "approve" :findings nil))))
           (should (= (length (magnus-review-rounds review)) 1))
-          (should (eq (magnus-review-latest-round review) round))
+          (let ((completed (magnus-review-latest-round review)))
+            (should (magnus-review-round-p completed))
+            (should (= (magnus-review-scope-number completed)
+                       (magnus-review-scope-number round)))
+            (should (equal (magnus-review-scope-base-oid completed)
+                           (magnus-review-scope-base-oid round)))
+            (should (equal (magnus-review-scope-head-oid completed)
+                           (magnus-review-scope-head-oid round))))
           (should (equal (magnus-review-session-id review)
                          "reviewer-session-one"))
           (should-not (gethash (magnus-review-id review)
@@ -730,8 +822,7 @@
                  1 magnus-test-review--oid-a magnus-test-review--oid-b))
          (runtime
           (magnus-review-controller--make-runtime
-           :review-id (magnus-review-id review) :phase 'running
-           :round round :job-key '(post-publish-job)))
+           :phase 'running :round round :process 'post-publish-process))
          (magnus-review-controller--runtimes (make-hash-table :test #'equal))
          (magnus-reviews (list review)))
     (puthash (magnus-review-id review) runtime
@@ -747,8 +838,8 @@
                      (lambda (&rest _arguments) (error "bell failed")))
                     ((symbol-function 'magnus-review-controller--changed)
                      (lambda () (error "refresh failed"))))
-            (magnus-review-controller--complete-job
-             (magnus-review-id review) '(post-publish-job)
+            (magnus-review-controller--complete-process
+             (magnus-review-id review) runtime 'post-publish-process
              (list
               :success-p t :session-id "durable-reviewer-session"
               :structured-result
@@ -780,12 +871,13 @@
           (magnus-test-review--raw-result
            magnus-test-review--oid-a magnus-test-review--oid-b
            :verdict "approve" :summary "Corrected candidate result"))
-         (real-save (symbol-function 'magnus-review-save))
+         (magnus-reviews (list review))
+         (real-save (symbol-function 'magnus-review--save-locked))
          (save-count 0))
     (unwind-protect
         (progn
           (magnus-test-review--prepare-publication-evidence review round)
-          (cl-letf (((symbol-function 'magnus-review-save)
+          (cl-letf (((symbol-function 'magnus-review--save-locked)
                      (lambda (candidate)
                        (cl-incf save-count)
                        (if (= save-count 1)
@@ -801,11 +893,9 @@
           (should (= (length (magnus-review-rounds review)) 1))
           (should (equal (magnus-review-session-id review)
                          "reviewer-session"))
-          (let* ((envelope
-                  (magnus-review-controller--read-json
-                   (magnus-review-round-result-path review round)))
-                 (result
-                  (magnus-review-controller--result-body envelope)))
+          (let ((result
+                 (magnus-review-read-verified-result
+                  review (magnus-review-latest-round review))))
             (should (equal (alist-get 'summary result)
                            "Corrected candidate result")))
           (with-temp-buffer
@@ -824,8 +914,7 @@
                    1 magnus-test-review--oid-a magnus-test-review--oid-b))
            (runtime
             (magnus-review-controller--make-runtime
-             :review-id (magnus-review-id review) :phase 'running
-             :round round :job-key '(candidate-job)))
+             :phase 'running :round round :process 'candidate-process))
            (magnus-review-controller--runtimes
             (make-hash-table :test #'equal))
            (magnus-reviews (list review))
@@ -835,8 +924,8 @@
       (unwind-protect
           (cl-letf (((symbol-function 'magnus-review-controller--publish-result)
                      (lambda (&rest _arguments) (setq publish-called t))))
-            (magnus-review-controller--complete-job
-             (magnus-review-id review) '(candidate-job)
+            (magnus-review-controller--complete-process
+             (magnus-review-id review) runtime 'candidate-process
              (list
               :success-p t
               :session-id session-id
@@ -865,8 +954,7 @@
                    1 magnus-test-review--oid-a magnus-test-review--oid-b))
            (runtime
             (magnus-review-controller--make-runtime
-             :review-id (magnus-review-id review) :phase 'running
-             :round round :job-key '(candidate-job)))
+             :phase 'running :round round :process 'candidate-process))
            (magnus-review-controller--runtimes
             (make-hash-table :test #'equal))
            (magnus-reviews (list review)))
@@ -875,8 +963,8 @@
       (unwind-protect
           (cl-letf (((symbol-function 'magnus-review-controller--patch)
                      (lambda (&rest _arguments) "")))
-            (magnus-review-controller--complete-job
-             (magnus-review-id review) '(candidate-job) result)
+            (magnus-review-controller--complete-process
+             (magnus-review-id review) runtime 'candidate-process result)
             (should-not (magnus-review-rounds review))
             (should-not (magnus-review-session-id review))
             (should (eq (magnus-review-controller-runtime-phase runtime)
@@ -895,20 +983,23 @@
          (round-three (magnus-test-review--round
                        3 magnus-test-review--oid-c magnus-test-review--oid-d))
          (runtime-one (magnus-review-controller--make-runtime
-                       :review-id (magnus-review-id review) :round round-one))
+                       :round round-one))
          (runtime-two (magnus-review-controller--make-runtime
-                       :review-id (magnus-review-id review) :round round-two))
+                       :round round-two))
          (runtime-three (magnus-review-controller--make-runtime
-                         :review-id (magnus-review-id review) :round round-three))
+                         :round round-three))
+         (process-count 0)
          submissions)
     (unwind-protect
         (cl-letf
             (((symbol-function 'magnus-review-ensure-checkout)
               (lambda (&rest _arguments) root))
-             ((symbol-function 'magnus-background-submit)
-              (lambda (key provider request &optional callbacks)
-                (push (list key provider request callbacks) submissions)
-                (magnus-background--make-job :key key :state 'queued))))
+             ((symbol-function 'magnus-headless-start)
+              (lambda (provider request &optional callbacks)
+                (push (list nil provider request callbacks) submissions)
+                (intern (format "review-process-%d" (cl-incf process-count)))))
+             ((symbol-function 'run-with-timer)
+              (lambda (&rest _arguments) 'review-timeout)))
           ;; Round one has no session or prior ledger.
           (magnus-review-controller--start-round review runtime-one round-one)
           (let ((request (nth 2 (car submissions))))
@@ -930,10 +1021,9 @@
                  (findings-one (alist-get 'findings result-one))
                  (race-id (alist-get 'id (aref findings-one 0)))
                  (error-id (alist-get 'id (aref findings-one 1))))
-            (setf (magnus-review-round-completed-at round-one) (float-time)
-                  (magnus-review-round-verdict round-one) 'comment
-                  (magnus-review-round-read-state round-one) 'unread
-                  (magnus-review-rounds review) (list round-one)
+            (setq round-one
+                  (magnus-test-review--completed-candidate round-one))
+            (setf (magnus-review-rounds review) (list round-one)
                   (magnus-review-session-id review) "reviewer-session-one")
             (magnus-test-review--store-result review round-one result-one)
 
@@ -965,10 +1055,9 @@
               (should
                (equal (alist-get 'id (aref (alist-get 'findings result-two) 0))
                       race-id))
-              (setf (magnus-review-round-completed-at round-two) (float-time)
-                    (magnus-review-round-verdict round-two) 'comment
-                    (magnus-review-round-read-state round-two) 'unread
-                    (magnus-review-rounds review) (list round-one round-two)
+              (setq round-two
+                    (magnus-test-review--completed-candidate round-two))
+              (setf (magnus-review-rounds review) (list round-one round-two)
                     (magnus-review-session-id review) "reviewer-session-two")
               (magnus-test-review--store-result review round-two result-two)
 
@@ -1000,8 +1089,7 @@
                  1 magnus-test-review--oid-a magnus-test-review--oid-b))
          (runtime
           (magnus-review-controller--make-runtime
-           :review-id (magnus-review-id review) :phase 'running
-           :round round :job-key '(replacement-job)))
+           :phase 'running :round round :process 'replacement-process))
          (magnus-review-controller--runtimes (make-hash-table :test #'equal))
          (magnus-reviews (list review))
          published)
@@ -1010,8 +1098,8 @@
     (unwind-protect
         (cl-letf (((symbol-function 'magnus-review-controller--publish-result)
                    (lambda (&rest _arguments) (setq published t))))
-          (magnus-review-controller--complete-job
-           (magnus-review-id review) '(stale-job)
+          (magnus-review-controller--complete-process
+           (magnus-review-id review) runtime 'stale-process
            '(:success-p t :structured-result ((schema_version . 1))))
           (should-not published)
           (should (eq (gethash (magnus-review-id review)
@@ -1031,7 +1119,6 @@
            root (list completed-round) "completed-review"))
          (runtime
           (magnus-review-controller--make-runtime
-           :review-id (magnus-review-id draft)
            :phase 'failed :error "scope failed"))
          (magnus-reviews (list draft lineage))
          (magnus-review-controller--runtimes (make-hash-table :test #'equal))
@@ -1058,17 +1145,16 @@
                  1 magnus-test-review--oid-a magnus-test-review--oid-b))
          (scope
           (magnus-review-controller--make-runtime
-           :review-id "scope" :phase 'asking-scope :timer 'scope-timer))
+           :phase 'asking-scope :timer 'scope-timer))
          (job
           (magnus-review-controller--make-runtime
-           :review-id (magnus-review-id review) :phase 'running
-           :round round :job-key '(job-key)))
+           :phase 'running :round round :process 'job-process))
          (magnus-review-controller--runtimes (make-hash-table :test #'equal))
          (magnus-review-runtime-state-function
           #'magnus-review-controller--runtime-state)
          (magnus-review-controller--shutting-down nil)
          (magnus-reviews (list review))
-         cancelled-timer cancelled-job cleaned terminal-scopes)
+         cancelled-timer cancelled-process cleaned terminal-scopes)
     (puthash "scope" scope magnus-review-controller--runtimes)
     (puthash (magnus-review-id review) job
              magnus-review-controller--runtimes)
@@ -1077,8 +1163,9 @@
                    (lambda (value) (eq value 'scope-timer)))
                   ((symbol-function 'cancel-timer)
                    (lambda (timer) (setq cancelled-timer timer)))
-                  ((symbol-function 'magnus-background-cancel)
-                   (lambda (key) (setq cancelled-job key) 1))
+                  ((symbol-function 'magnus-headless-cancel)
+                   (lambda (process &optional _force)
+                     (setq cancelled-process process)))
                   ((symbol-function 'magnus-review-controller--discard-candidate)
                    (lambda (candidate candidate-round)
                      (setq cleaned (list candidate candidate-round))))
@@ -1088,7 +1175,7 @@
           (should (= (hash-table-count
                       magnus-review-controller--runtimes) 0))
           (should (eq cancelled-timer 'scope-timer))
-          (should (equal cancelled-job '(job-key)))
+          (should (eq cancelled-process 'job-process))
           (should (equal cleaned (list review round)))
           (should (memq scope terminal-scopes))
           (should (memq job terminal-scopes))

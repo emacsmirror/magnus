@@ -29,23 +29,26 @@
 (require 'subr-x)
 (require 'magnus-review)
 
-(defvar magnus-review-max-evidence-bytes)
+(declare-function magnus-review-actions "magnus-transient" (review round))
 
 ;;; Canonical result artifacts
 
-(defun magnus-review-ui--read-result (review round)
-  "Read REVIEW ROUND's canonical structured JSON result."
-  (let ((path (magnus-review-round-result-path review round)))
-    (when (file-readable-p path)
-      (condition-case err
-          (with-temp-buffer
-            (insert-file-contents path)
-            (json-parse-buffer :object-type 'plist
-                               :array-type 'list
-                               :null-object nil
-                               :false-object nil))
-        (error
-         (list :magnus_review_ui_error (error-message-string err)))))))
+(defun magnus-review-ui--decode-result-bytes (bytes)
+  "Decode verified unibyte result BYTES for presentation."
+  (json-parse-string
+   (decode-coding-string bytes 'utf-8-unix)
+   :object-type 'plist :array-type 'list
+   :null-object nil :false-object nil))
+
+(defun magnus-review-ui--load-artifacts (review round)
+  "Return REVIEW ROUND's domain-verified presentation bundle."
+  (condition-case err
+      (let ((bundle (magnus-review-read-verified-artifacts review round)))
+        (plist-put (copy-sequence bundle) :ui-result
+                   (magnus-review-ui--decode-result-bytes
+                    (plist-get bundle :result-bytes))))
+    (error
+     (list :magnus_review_ui_error (error-message-string err)))))
 
 (defun magnus-review-ui--result-body (result)
   "Return the canonical review payload within RESULT's envelope."
@@ -68,21 +71,6 @@
   (magnus-review-ui--result-field result :findings))
 
 ;;; Customization and faces
-
-(defcustom magnus-review-ui-mark-read-function #'magnus-review-mark-read
-  "Function called with REVIEW and ROUND when a round is displayed.
-
-The function should be idempotent.  Set this to nil to manage unread state
-outside the reader."
-  :type '(choice (const :tag "Do not mark read" nil) function)
-  :group 'magnus)
-
-(defcustom magnus-review-ui-action-function nil
-  "Function called with REVIEW and ROUND when `?' is pressed.
-
-The review transient should set this to its dispatcher."
-  :type '(choice (const :tag "No action dispatcher" nil) function)
-  :group 'magnus)
 
 (defface magnus-review-ui-title
   '((t :inherit magit-section-heading :weight bold :height 1.15))
@@ -158,9 +146,13 @@ The review transient should set this to its dispatcher."
 
 (defvar-local magnus-review-ui--review nil)
 (defvar-local magnus-review-ui--round nil)
+(defvar-local magnus-review-ui--review-id nil)
+(defvar-local magnus-review-ui--round-number nil)
+(defvar-local magnus-review-ui--round-base-oid nil)
+(defvar-local magnus-review-ui--round-head-oid nil)
+(defvar-local magnus-review-ui--artifacts nil)
 (defvar-local magnus-review-ui--result nil)
 (defvar-local magnus-review-ui--diff-error nil)
-(defvar-local magnus-review-ui--marked-read-rounds nil)
 
 (defvar magnus-review-ui-mode-map
   (let ((map (make-sparse-keymap)))
@@ -171,7 +163,7 @@ The review transient should set this to its dispatcher."
     (define-key map (kbd "P") #'magnus-review-ui-previous-finding)
     (define-key map (kbd "RET") #'magnus-review-ui-visit-snapshot)
     (define-key map (kbd "e") #'magnus-review-ui-visit-current-file)
-    (define-key map (kbd "TAB") #'magit-section-cycle)
+    (define-key map (kbd "TAB") #'magit-section-toggle)
     (define-key map (kbd "[") #'magnus-review-ui-previous-round)
     (define-key map (kbd "]") #'magnus-review-ui-next-round)
     (define-key map (kbd "?") #'magnus-review-ui-actions)
@@ -332,33 +324,22 @@ Signal an error containing Git's diagnostic when the command fails."
           (push file collapsed))))
     (nreverse collapsed)))
 
-(defun magnus-review-ui--artifact-bytes (path kind)
-  "Read exact bytes from regular, non-symlink evidence PATH named KIND."
-  (when (or (file-symlink-p path) (not (file-regular-p path)))
-    (error "Review %s evidence is unavailable or unsafe: %s" kind path))
-  (let* ((attributes (file-attributes path 'string))
-         (size (file-attribute-size attributes))
-         (limit magnus-review-max-evidence-bytes))
-    (when (> size limit)
-      (error "Review %s evidence exceeds the configured size limit" kind))
-    (with-temp-buffer
-      (set-buffer-multibyte nil)
-      (let ((coding-system-for-read 'no-conversion))
-        (insert-file-contents-literally path))
-      (buffer-string))))
-
-(defun magnus-review-ui--persisted-evidence (review round)
-  "Return canonical persisted patch and name-status text for REVIEW ROUND."
+(defun magnus-review-ui--persisted-evidence (_review _round)
+  "Return canonical evidence from the current verified artifact bundle."
+  (when-let ((failure
+              (plist-get magnus-review-ui--artifacts
+                         :magnus_review_ui_error)))
+    (error "%s" failure))
+  (unless magnus-review-ui--artifacts
+    (error "Review artifacts have not been verified"))
   (list
    :patch
    (decode-coding-string
-    (magnus-review-ui--artifact-bytes
-     (magnus-review-round-patch-path review round) "patch")
+    (plist-get magnus-review-ui--artifacts :patch)
     'utf-8-unix)
    :name-status
    (decode-coding-string
-    (magnus-review-ui--artifact-bytes
-     (magnus-review-round-name-status-path review round) "name-status")
+    (plist-get magnus-review-ui--artifacts :name-status)
     'utf-8-unix)))
 
 (defun magnus-review-ui--path-from-header (line prefix)
@@ -631,8 +612,11 @@ Return a plist containing equal-tested hash tables under `:inline' and
     (_ 'magnus-review-ui-metadata)))
 
 (defun magnus-review-ui--display-value (value &optional fallback)
-  "Return VALUE as non-empty display text, or FALLBACK."
-  (let ((text (magnus-review-ui--string value)))
+  "Return VALUE as non-empty single-line display text, or FALLBACK."
+  (let* ((raw (magnus-review-ui--string value))
+         (text (and raw
+                    (string-trim
+                     (replace-regexp-in-string "[[:cntrl:]]+" " " raw)))))
     (if (and text (not (string-empty-p text))) text fallback)))
 
 (defun magnus-review-ui--insert-header (files)
@@ -672,7 +656,8 @@ Return a plist containing equal-tested hash tables under `:inline' and
     (insert (propertize (upcase verdict)
                         'face (magnus-review-ui--verdict-face verdict)))
     (insert "\n")
-    (when-let ((task (magnus-review-task review)))
+    (when-let ((task (magnus-review-ui--display-value
+                      (magnus-review-task review))))
       (insert (propertize (format "Task: %s\n" task)
                           'face 'magnus-review-ui-metadata)))
     (insert "\n")))
@@ -954,11 +939,50 @@ Return a plist containing equal-tested hash tables under `:inline' and
 
 (defun magnus-review-ui-current-review ()
   "Return the review displayed in the current reader buffer."
-  magnus-review-ui--review)
+  (if magnus-review-ui--review-id
+      (car (magnus-review-ui--resolve-identity))
+    magnus-review-ui--review))
 
 (defun magnus-review-ui-current-round ()
   "Return the review round displayed in the current reader buffer."
-  magnus-review-ui--round)
+  (if magnus-review-ui--review-id
+      (cdr (magnus-review-ui--resolve-identity))
+    magnus-review-ui--round))
+
+(defun magnus-review-ui--remember-identity (review round)
+  "Remember stable identity for resolved REVIEW and ROUND."
+  (setq-local magnus-review-ui--review review
+              magnus-review-ui--round round
+              magnus-review-ui--review-id (magnus-review-id review)
+              magnus-review-ui--round-number
+              (magnus-review-round-number round)
+              magnus-review-ui--round-base-oid
+              (magnus-review-round-base-oid round)
+              magnus-review-ui--round-head-oid
+              (magnus-review-round-head-oid round)))
+
+(defun magnus-review-ui--resolve-identity (&optional refresh-from-disk)
+  "Resolve the current buffer's review identity.
+When REFRESH-FROM-DISK is non-nil, first accept a strictly newer manifest."
+  (unless (and (stringp magnus-review-ui--review-id)
+               (integerp magnus-review-ui--round-number))
+    (user-error "This buffer is not associated with a review round"))
+  (let ((review (magnus-review-get magnus-review-ui--review-id)))
+    (unless review
+      (user-error "Review is no longer loaded: %s"
+                  magnus-review-ui--review-id))
+    (when refresh-from-disk
+      (setq review (magnus-review-refresh-from-disk review)))
+    (pcase-let ((`(,review . ,round)
+                 (magnus-review-resolve-round
+                  review magnus-review-ui--round-number)))
+      (unless (and (string= magnus-review-ui--round-base-oid
+                            (magnus-review-round-base-oid round))
+                   (string= magnus-review-ui--round-head-oid
+                            (magnus-review-round-head-oid round)))
+        (error "Completed review round identity changed"))
+      (magnus-review-ui--remember-identity review round)
+      (cons review round))))
 
 (defun magnus-review-ui--select-round (review round)
   "Resolve ROUND, which may be an object or number, within REVIEW."
@@ -986,6 +1010,7 @@ Return a plist containing equal-tested hash tables under `:inline' and
 ROUND may be a round object, a round number, or nil for the latest round.
 Display uses `pop-to-buffer', so `display-buffer-alist' remains in control and
 Magnus never manufactures a window layout."
+  (setq review (magnus-review-resolve-current review))
   (let ((selected (magnus-review-ui--select-round review round)))
     (unless selected
       (user-error "Review has no completed rounds to display"))
@@ -993,63 +1018,63 @@ Magnus never manufactures a window layout."
       (with-current-buffer buffer
         (unless (derived-mode-p 'magnus-review-ui-mode)
           (magnus-review-ui-mode))
-        (setq-local magnus-review-ui--review review)
-        (setq-local magnus-review-ui--round selected)
+        (magnus-review-ui--remember-identity review selected)
         (when-let ((root (magnus-review-project-root review)))
           (setq default-directory (file-name-as-directory root)))
         (magnus-review-ui-refresh))
       (pop-to-buffer buffer))))
 
 (defun magnus-review-ui--mark-read ()
-  "Mark the displayed round read using the configured callback."
-  (let ((number (magnus-review-round-number magnus-review-ui--round)))
-    ;; A missing or corrupt structured result is an error view, not a read
-    ;; review.  Preserve the unread indicator so Hrishi can return after the
-    ;; controller repairs or retries the round.
-    (unless (or (null magnus-review-ui--result)
-                (magnus-review-ui--result-error magnus-review-ui--result)
-                (member number magnus-review-ui--marked-read-rounds))
-      (when (and magnus-review-ui-mark-read-function
-                 (functionp magnus-review-ui-mark-read-function))
-        (let ((succeeded nil))
-          (condition-case err
-              (progn
-                (funcall magnus-review-ui-mark-read-function
-                         magnus-review-ui--review magnus-review-ui--round)
-                (setq succeeded t))
-            (error
-             (message "Magnus could not mark review round read: %s"
-                      (error-message-string err))))
-          (when succeeded
-            (push number magnus-review-ui--marked-read-rounds)))))))
+  "Mark the displayed round read after every artifact rendered successfully."
+  ;; A missing, corrupt, or scope-inconsistent view is not a read review.
+  (unless (or (null magnus-review-ui--result)
+              (magnus-review-ui--result-error magnus-review-ui--result)
+              magnus-review-ui--diff-error)
+    (condition-case err
+        (magnus-review-mark-read
+         magnus-review-ui--review magnus-review-ui--round)
+      (error
+       (message "Magnus could not mark review round read: %s"
+                (error-message-string err))))))
 
-(defun magnus-review-ui-refresh ()
-  "Refresh the current review reader from its immutable Git objects."
-  (interactive)
-  (unless (and magnus-review-ui--review magnus-review-ui--round)
-    (user-error "This buffer is not associated with a review round"))
-  (setq magnus-review-ui--result
-        (magnus-review-ui--read-result
-         magnus-review-ui--review magnus-review-ui--round))
-  (let ((files
-         (condition-case err
-             (prog1 (magnus-review-ui--load-diff
-                     magnus-review-ui--review magnus-review-ui--round)
-               (setq magnus-review-ui--diff-error nil))
-           (error
-            (setq magnus-review-ui--diff-error (error-message-string err))
-            nil)))
-        (inhibit-read-only t))
-    (erase-buffer)
-    (save-excursion
-      (magnus-review-ui--render files))
-    (goto-char (point-min))
-    (set-buffer-modified-p nil))
+(defun magnus-review-ui-refresh (&optional refresh-from-disk)
+  "Refresh the current review reader.
+When REFRESH-FROM-DISK is non-nil, re-read a strictly newer manifest first."
+  (interactive (list t))
+  (let* ((old-section (and magit-root-section (magit-current-section)))
+         (old-relative
+          (and old-section
+               (magit-section-get-relative-position old-section))))
+    (magnus-review-ui--resolve-identity refresh-from-disk)
+    (setq magnus-review-ui--artifacts
+          (magnus-review-ui--load-artifacts
+           magnus-review-ui--review magnus-review-ui--round)
+          magnus-review-ui--result
+          (or (plist-get magnus-review-ui--artifacts :ui-result)
+              (and (plist-get magnus-review-ui--artifacts
+                              :magnus_review_ui_error)
+                   magnus-review-ui--artifacts)))
+    (let* ((files
+            (condition-case err
+                (prog1 (magnus-review-ui--load-diff
+                        magnus-review-ui--review magnus-review-ui--round)
+                  (setq magnus-review-ui--diff-error nil))
+              (error
+               (setq magnus-review-ui--diff-error (error-message-string err))
+               nil)))
+           (inhibit-read-only t))
+      (erase-buffer)
+      (save-excursion
+        (magnus-review-ui--render files))
+      (if old-section
+          (apply #'magit-section-goto-successor old-section old-relative)
+        (goto-char (point-min)))
+      (set-buffer-modified-p nil)))
   (magnus-review-ui--mark-read))
 
 (defun magnus-review-ui--revert (_ignore-auto _noconfirm)
   "Revert the current review reader buffer."
-  (magnus-review-ui-refresh))
+  (magnus-review-ui-refresh t))
 
 ;;; Navigation and actions
 
@@ -1224,7 +1249,8 @@ object, ensuring that the displayed source and line number always agree."
          (target (and position (+ position delta))))
     (unless (and target (>= target 0) (< target (length rounds)))
       (user-error "No %s review round" (if (< delta 0) "previous" "next")))
-    (setq magnus-review-ui--round (nth target rounds))
+    (magnus-review-ui--remember-identity
+     magnus-review-ui--review (nth target rounds))
     (magnus-review-ui-refresh)
     (message "Review round %s"
              (magnus-review-round-number magnus-review-ui--round))))
@@ -1240,13 +1266,12 @@ object, ensuring that the displayed source and line number always agree."
   (magnus-review-ui--move-round 1))
 
 (defun magnus-review-ui-actions ()
-  "Invoke the configured review action dispatcher."
+  "Invoke review actions for the current resolved review and round."
   (interactive)
-  (if (and magnus-review-ui-action-function
-           (functionp magnus-review-ui-action-function))
-      (funcall magnus-review-ui-action-function
-               magnus-review-ui--review magnus-review-ui--round)
-    (user-error "No Magnus review action dispatcher is configured")))
+  (unless (fboundp 'magnus-review-actions)
+    (require 'magnus-transient))
+  (pcase-let ((`(,review . ,round) (magnus-review-ui--resolve-identity)))
+    (magnus-review-actions review round)))
 
 (provide 'magnus-review-ui)
 ;;; magnus-review-ui.el ends here
