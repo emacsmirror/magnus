@@ -10,6 +10,19 @@
 (defconst magnus-test-transient--head-oid
   "2222222222222222222222222222222222222222")
 
+(defun magnus-test-transient--suffix-runs-command-p (prefix key command)
+  "Return non-nil when PREFIX maps KEY to COMMAND.
+Use Transient's public lookup contract instead of depending on the private
+layout representation, which differs between supported Transient releases."
+  (equal (transient-get-suffix prefix key)
+         (transient-get-suffix prefix command)))
+
+(defun magnus-test-transient--suffix-object (prefix command)
+  "Return PREFIX's initialized suffix object for COMMAND."
+  (cl-find-if (lambda (suffix)
+                (eq (oref suffix command) command))
+              (transient-suffixes prefix)))
+
 (defun magnus-test-transient--round (&optional number)
   "Return a completed review round numbered NUMBER."
   (magnus-review-round--create
@@ -88,12 +101,12 @@
     (should (equal arguments '("/project" nil codex nil)))))
 
 (ert-deftest magnus-transient-review-menus-expose-the-complete-workflow ()
-  (let ((main (transient-get-suffix 'magnus-dispatch "v"))
-        (request (transient-get-suffix 'magnus-review-request-menu "RET")))
-    (should (eq (plist-get (nth 2 main) :command)
-                'magnus-review-request-dispatch))
-    (should (eq (plist-get (nth 2 request) :command)
-                'magnus-transient-request-review)))
+  (should
+   (magnus-test-transient--suffix-runs-command-p
+    'magnus-dispatch "v" 'magnus-review-request-dispatch))
+  (should
+   (magnus-test-transient--suffix-runs-command-p
+    'magnus-review-request-menu "RET" 'magnus-transient-request-review))
   (dolist
       (entry
        '(("RET" magnus-transient-review-open
@@ -109,13 +122,16 @@
           "Interrupt active work" magnus-transient--review-interrupt-inapt-p)
          ("k" magnus-transient-review-archive
           "Archive" magnus-transient--review-archive-inapt-p)))
+    (should
+     (magnus-test-transient--suffix-runs-command-p
+      'magnus-review-actions-menu (car entry) (cadr entry)))
     (let ((suffix
-           (transient-get-suffix 'magnus-review-actions-menu (car entry))))
-      (should (eq (plist-get (nth 2 suffix) :command) (nth 1 entry)))
+           (magnus-test-transient--suffix-object
+            'magnus-review-actions-menu (cadr entry))))
+      (should suffix)
       (when (nth 2 entry)
-        (should (equal (plist-get (nth 2 suffix) :description)
-                       (nth 2 entry))))
-      (should (eq (plist-get (nth 2 suffix) :inapt-if) (nth 3 entry)))))
+        (should (equal (oref suffix description) (nth 2 entry))))
+      (should (eq (oref suffix inapt-if) (nth 3 entry)))))
   (should (equal (magnus-transient--review-rereview-description)
                  "Ask author for the next committed round")))
 

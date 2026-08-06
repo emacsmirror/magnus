@@ -85,10 +85,11 @@ ARGUMENTS are passed to `magnus-review--create'."
   (should-not (lookup-key magnus-status-mode-map (kbd "J")))
   (should (eq (lookup-key magnus-status-mode-map (kbd "C"))
               'magnus-status-coordination))
-  (let ((coordination (transient-get-suffix 'magnus-dispatch "C")))
-    (should-error (transient-get-suffix 'magnus-dispatch "J"))
-    (should (eq (plist-get (nth 2 coordination) :command)
-                'magnus-status-coordination))))
+  (should-error (transient-get-suffix 'magnus-dispatch "J"))
+  (should
+   (equal (transient-get-suffix 'magnus-dispatch "C")
+          (transient-get-suffix 'magnus-dispatch
+                                'magnus-status-coordination))))
 
 (ert-deftest magnus-status-manual-refresh-polls-markdown-coordination ()
   (let ((magnus-buffer-name " *magnus-manual-refresh-test*")
