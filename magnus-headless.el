@@ -448,8 +448,20 @@ subsequent records in OUTPUT from being decoded."
                           ('terminal terminal)
                           ('structured-result structured-p)))
                       success-requires)
-                     (zerop
-                      (or (process-get process 'magnus-headless-error-count) 0)))
+                     ;; Consumer callbacks are observers of provider progress.
+                     ;; Their failure remains visible below, but cannot turn a
+                     ;; valid provider result into a failed provider attempt.
+                     (not (or decode-errors
+                              provider-errors
+                              (> (or (plist-get dropped-errors :decode-errors)
+                                     0)
+                                 0)
+                              (> (or (plist-get dropped-errors :provider-errors)
+                                     0)
+                                 0)
+                              (> (or (plist-get dropped-errors :other-errors)
+                                     0)
+                                 0))))
      :status status
      :exit-status exit-status
      :process-event (process-get process 'magnus-headless-process-event)

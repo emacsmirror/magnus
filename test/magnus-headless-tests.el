@@ -400,7 +400,7 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
                        (lambda (_process value) (setq completion value)))))
           (magnus-test-headless--wait (lambda () completion))
           (should (plist-get completion :structured-result-present-p))
-          (should-not (plist-get completion :success-p))
+          (should (plist-get completion :success-p))
           (should (= (length (plist-get completion :callback-errors)) 1))
           (should (eq (plist-get (car errors) :kind) 'callback-error)))
       (when (and process (process-live-p process))
@@ -482,7 +482,11 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
 
 (ert-deftest magnus-claude-review-spec-is-resumable-and-read-only ()
   (let* ((process-environment
-          (cons "CLAUDECODE=nested" process-environment))
+          '("CLAUDECODE=nested"
+            "ANTHROPIC_API_KEY=keep-claude-auth"
+            "CODEX_API_KEY=remove-codex-auth"
+            "OPENAI_API_KEY=remove-openai-auth"
+            "KEEP=yes"))
          (request (list :prompt "Review it"
                         :name "wise-deer"
                         :model "claude-test"
@@ -511,6 +515,13 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
     (should-not (cl-find-if
                  (lambda (entry) (string-prefix-p "CLAUDECODE=" entry))
                  (plist-get fresh :environment)))
+    (should (member "ANTHROPIC_API_KEY=keep-claude-auth"
+                    (plist-get fresh :environment)))
+    (should (member "KEEP=yes" (plist-get fresh :environment)))
+    (should-not (member "CODEX_API_KEY=remove-codex-auth"
+                        (plist-get fresh :environment)))
+    (should-not (member "OPENAI_API_KEY=remove-openai-auth"
+                        (plist-get fresh :environment)))
     (should (member "--resume" resumed-command))
     (should (member "resume-me" resumed-command))
     (should-not (member "--session-id" resumed-command))))
@@ -580,7 +591,15 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
     (should (= (plist-get result :cost-usd) 0.125))))
 
 (ert-deftest magnus-codex-review-spec-uses-resumable-exec-session ()
-  (let ((schema-file (make-temp-file "magnus-codex-schema-")))
+  (let ((schema-file (make-temp-file "magnus-codex-schema-"))
+        (process-environment
+         '("CODEX_HOME=/tmp/codex-home"
+           "CODEX_API_KEY=keep-codex-auth"
+           "CODEX_THREAD_ID=remove-parent-thread"
+           "CODEX_SANDBOX=remove-parent-sandbox"
+           "ANTHROPIC_API_KEY=remove-anthropic-auth"
+           "CLAUDE_CODE_OAUTH_TOKEN=remove-claude-auth"
+           "KEEP=yes")))
     (unwind-protect
         (let* ((request (list :directory default-directory
                               :prompt "Review it"
@@ -623,6 +642,19 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
           (should-not (member "--ephemeral" resumed-command))
           (should (equal (plist-get fresh :success-requires)
                          '(terminal structured-result)))
+          (should (member "CODEX_HOME=/tmp/codex-home"
+                          (plist-get fresh :environment)))
+          (should (member "CODEX_API_KEY=keep-codex-auth"
+                          (plist-get fresh :environment)))
+          (should (member "KEEP=yes" (plist-get fresh :environment)))
+          (should-not (member "CODEX_THREAD_ID=remove-parent-thread"
+                              (plist-get fresh :environment)))
+          (should-not (member "CODEX_SANDBOX=remove-parent-sandbox"
+                              (plist-get fresh :environment)))
+          (should-not (member "ANTHROPIC_API_KEY=remove-anthropic-auth"
+                              (plist-get fresh :environment)))
+          (should-not (member "CLAUDE_CODE_OAUTH_TOKEN=remove-claude-auth"
+                              (plist-get fresh :environment)))
           (should (equal (plist-get resumed :session-id) "thread-resume")))
       (delete-file schema-file))))
 

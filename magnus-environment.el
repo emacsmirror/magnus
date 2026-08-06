@@ -55,5 +55,25 @@ or earlier values with the same NAME.  Neither input list is modified."
                      result)))))
     result))
 
+(defun magnus-environment-without (environment names prefixes)
+  "Return ENVIRONMENT without variables matching NAMES or PREFIXES.
+NAMES contains exact variable names.  PREFIXES contains variable-name
+prefixes.  The original environment is never modified."
+  (unless (and (listp environment)
+               (cl-every #'stringp names)
+               (cl-every #'stringp prefixes))
+    (signal 'wrong-type-argument
+            (list 'list-of-strings-p (list environment names prefixes))))
+  (cl-remove-if
+   (lambda (entry)
+     (when (and (stringp entry)
+                (string-match "\\`\\([^=]+\\)=" entry))
+       (let ((name (match-string 1 entry)))
+         (or (member name names)
+             (cl-some (lambda (prefix)
+                        (string-prefix-p prefix name))
+                      prefixes)))))
+   environment))
+
 (provide 'magnus-environment)
 ;;; magnus-environment.el ends here

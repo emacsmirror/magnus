@@ -18,6 +18,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'subr-x)
+(require 'magnus-environment)
 (require 'magnus-provider)
 
 (defvar magnus-claude-executable "claude"
@@ -61,8 +62,12 @@
 
 (defun magnus-claude--headless-environment ()
   "Return an environment suitable for a nested Claude headless process."
-  (cl-remove-if (lambda (entry) (string-prefix-p "CLAUDECODE=" entry))
-                process-environment))
+  (magnus-environment-without
+   process-environment
+   '("CLAUDECODE")
+   ;; A Claude child needs Claude authentication, but should not inherit
+   ;; credentials or runner identity from a parent Codex process.
+   '("OPENAI_" "CODEX_")))
 
 (defun magnus-claude-headless-review-spec (request)
   "Return a Claude headless launch specification for REQUEST."

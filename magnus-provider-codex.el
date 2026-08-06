@@ -18,6 +18,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'subr-x)
+(require 'magnus-environment)
 (require 'magnus-instances)
 (require 'magnus-onboarding)
 (require 'magnus-provider)
@@ -644,6 +645,15 @@ duplicated in `event_msg' records, and raw reasoning content is encrypted."
    ((stringp value) value)
    (t (format "%s" value))))
 
+(defun magnus-codex--headless-environment ()
+  "Return an isolated environment for a nested Codex headless process."
+  (magnus-environment-without
+   process-environment
+   '("CLAUDECODE" "CODEX_THREAD_ID" "CODEX_CI")
+   ;; Preserve CODEX_HOME and Codex/OpenAI authentication.  Only inherited
+   ;; runner identity and opposite-provider credentials are removed.
+   '("ANTHROPIC_" "CLAUDE_CODE_" "CODEX_SANDBOX")))
+
 (defun magnus-codex--make-headless-review-decoder ()
   "Return a stateful decoder for one Codex review process.
 
@@ -708,6 +718,7 @@ the turn completes, so each process needs an independent last-message cell."
         ;; and PROMPT, then validates the echoed object IDs, so the built-in
         ;; review target machinery would be redundant.
         (list prompt)))
+     :environment (magnus-codex--headless-environment)
      :decoder (magnus-codex--make-headless-review-decoder)
      :success-requires '(terminal structured-result)
      :session-id session-id
