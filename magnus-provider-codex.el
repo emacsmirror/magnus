@@ -644,6 +644,27 @@ duplicated in `event_msg' records, and raw reasoning content is encrypted."
    ((stringp value) value)
    (t (format "%s" value))))
 
+(defun magnus-codex--make-headless-review-decoder ()
+  "Return a stateful decoder for one Codex review process.
+
+`codex exec --json' may emit more than one completed agent message during a
+turn.  Codex itself defines the final response as the last such message when
+the turn completes, so each process needs an independent last-message cell."
+  (let ((last-message nil))
+    (lambda (event request)
+      (let* ((type (alist-get 'type event))
+             (item (alist-get 'item event))
+             (item-type (and (listp item) (alist-get 'type item)))
+             (text (and (equal item-type "agent_message")
+                        (alist-get 'text item))))
+        (when (and (equal type "item.completed")
+                   (equal item-type "agent_message")
+                   (stringp text))
+          (setq last-message text))
+        (magnus-codex-headless-decode-event
+         event request
+         (and (equal type "turn.completed") last-message))))))
+
 (defun magnus-codex-headless-review-spec (request)
   "Return a Codex headless launch specification for REQUEST."
   (let* ((session-id (plist-get request :session-id))
@@ -687,7 +708,7 @@ duplicated in `event_msg' records, and raw reasoning content is encrypted."
         ;; and PROMPT, then validates the echoed object IDs, so the built-in
         ;; review target machinery would be redundant.
         (list prompt)))
-     :decoder #'magnus-codex-headless-decode-event
+     :decoder (magnus-codex--make-headless-review-decoder)
      :success-requires '(terminal structured-result)
      :session-id session-id
      :name (and name (format "magnus-codex-review-%s" name)))))
@@ -708,8 +729,11 @@ duplicated in `event_msg' records, and raw reasoning content is encrypted."
                      :null-object nil
                      :false-object nil))
 
-(defun magnus-codex-headless-decode-event (event request)
-  "Normalize one Codex exec JSONL EVENT for REQUEST."
+(defun magnus-codex-headless-decode-event (event request &optional final-message)
+  "Normalize one Codex exec JSONL EVENT for REQUEST.
+FINAL-MESSAGE, when non-nil, is the last agent message selected for a completed
+turn by the process-local decoder returned by
+`magnus-codex--make-headless-review-decoder'."
   (let* ((type (alist-get 'type event))
          (item (alist-get 'item event))
          (item-type (and (listp item) (alist-get 'type item)))
@@ -725,20 +749,20 @@ duplicated in `event_msg' records, and raw reasoning content is encrypted."
             (plist-put canonical :session-id
                        (or (alist-get 'thread_id event)
                            (alist-get 'threadId event)))))
-    ;; With --output-schema, the final agent_message text is the constrained
-    ;; JSON value.  A malformed value is visible to both the raw-event callback
-    ;; and the explicit decode-error channel.
-    (when (and (equal type "item.completed")
-               (equal item-type "agent_message")
+    ;; `codex exec' may emit prose agent messages before its schema-constrained
+    ;; final response.  Codex selects the last agent message at turn completion;
+    ;; parsing earlier messages would turn valid preambles into sticky errors.
+    (when (and (equal type "turn.completed")
                (plist-get request :schema-file))
-      (if (not (stringp text))
+      (if (not (stringp final-message))
           (setq canonical
                 (plist-put canonical :decode-error
-                           "Codex agent_message contains no text"))
+                           "Codex completed without a structured final message"))
         (condition-case err
             (setq canonical
                   (plist-put canonical :structured-result
-                             (magnus-codex--parse-structured-result text)))
+                             (magnus-codex--parse-structured-result
+                              final-message)))
           (error
            (setq canonical
                  (plist-put canonical :decode-error

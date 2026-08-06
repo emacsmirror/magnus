@@ -632,26 +632,53 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
     '(:purpose agent :prompt "Implement it"))
    :type 'user-error))
 
-(ert-deftest magnus-codex-review-decoder-captures-thread-and-result ()
-  (let* ((thread
-          (magnus-codex-headless-decode-event
-           '((type . "thread.started") (thread_id . "codex-thread")) nil))
+(ert-deftest magnus-codex-review-decoder-uses-final-agent-message ()
+  (let* ((decoder (magnus-codex--make-headless-review-decoder))
+         (request '(:schema-file "/tmp/schema.json"))
+         (thread
+          (funcall decoder
+                   '((type . "thread.started")
+                     (thread_id . "codex-thread"))
+                   request))
+         (preamble
+          (funcall decoder
+                   '((type . "item.completed")
+                     (item . ((type . "agent_message")
+                              (text . "I will inspect the evidence first."))))
+                   request))
          (message
-          (magnus-codex-headless-decode-event
-           '((type . "item.completed")
-             (item . ((type . "agent_message")
-                      (text . "{\"verdict\":\"approve\"}"))))
-           '(:schema-file "/tmp/schema.json")))
-         (terminal
-          (magnus-codex-headless-decode-event
-           '((type . "turn.completed")) nil)))
+          (funcall decoder
+                   '((type . "item.completed")
+                     (item . ((type . "agent_message")
+                              (text . "{\"verdict\":\"approve\"}"))))
+                   request))
+         (terminal (funcall decoder '((type . "turn.completed")) request)))
     (should (equal (plist-get thread :session-id) "codex-thread"))
+    (should-not (plist-member preamble :decode-error))
+    (should-not (plist-member preamble :structured-result))
+    (should-not (plist-member message :decode-error))
+    (should-not (plist-member message :structured-result))
     (should (equal (alist-get 'verdict
-                              (plist-get message :structured-result))
+                              (plist-get terminal :structured-result))
                    "approve"))
     (should (equal (plist-get message :text)
                    "{\"verdict\":\"approve\"}"))
     (should (plist-get terminal :terminal))))
+
+(ert-deftest magnus-codex-review-decoder-rejects-prose-only-at-completion ()
+  (let* ((decoder (magnus-codex--make-headless-review-decoder))
+         (request '(:schema-file "/tmp/schema.json")))
+    (funcall decoder
+             '((type . "item.completed")
+               (item . ((type . "agent_message")
+                        (text . "I found several issues."))))
+             request)
+    (let ((terminal (funcall decoder '((type . "turn.completed")) request)))
+      (should (plist-get terminal :terminal))
+      (should (string-match-p
+               "not schema JSON"
+               (plist-get terminal :decode-error)))
+      (should-not (plist-member terminal :structured-result)))))
 
 (provide 'magnus-headless-tests)
 ;;; magnus-headless-tests.el ends here
