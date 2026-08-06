@@ -26,6 +26,9 @@
           ;; are on the load-path for byte-compilation.
           (setq load-prefer-newer t)
           (require 'package)
+          ;; Emacs 29 ships an older Transient.  Compile against the declared
+          ;; package dependency, not whichever built-in happens to be present.
+          (setq package-install-upgrade-built-in t)
           (package-initialize)
           ;; An installed Magnus package may now precede this checkout.  Keep
           ;; byte compilation pinned to the source tree under test; otherwise

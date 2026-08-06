@@ -16,7 +16,7 @@ package-lint:
 		-l test/test-helper.el \
 		-l test/package-lint-check.el
 
-test:
+test: clean
 	@$(EMACS) --batch -Q -L . -L test \
 		-l test/test-helper.el \
 		$(foreach file,$(TEST_FILES),-l $(file)) \

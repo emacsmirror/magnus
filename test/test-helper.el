@@ -1,9 +1,10 @@
 ;;; test-helper.el --- Hermetic test load path for Magnus -*- lexical-binding: t -*-
 
 ;; `emacs -Q' intentionally skips package activation, but Magnus's public
-;; review reader depends on magit-section.  Add installed package directories
-;; to `load-path' without evaluating every package's autoload file: unrelated
-;; broken user packages must not make this repository's tests flaky.
+;; review reader depends on magit-section.  Put installed package directories
+;; ahead of Emacs's built-ins without evaluating every package's autoload file:
+;; unrelated broken user packages must not make this repository's tests flaky,
+;; and an upgraded Transient must win over an older built-in copy.
 
 (require 'package)
 
@@ -23,8 +24,8 @@
             (push entry directories)))))
     directories))
 
-(dolist (directory (magnus-test--package-directories))
-  (add-to-list 'load-path directory t))
+(setq load-path
+      (append (magnus-test--package-directories) load-path))
 
 ;; An installed MELPA Magnus must never shadow the checkout under test.
 (setq load-path
