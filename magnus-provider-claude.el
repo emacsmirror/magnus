@@ -22,7 +22,7 @@
 (require 'magnus-provider)
 
 (defvar magnus-claude-executable "claude"
-  "Path to the Claude Code executable.")
+  "Claude Code executable or command prefix.")
 
 (defconst magnus-claude-review-tools "Read,Glob,Grep"
   "Claude tools visible to a non-interactive reviewer.")
@@ -89,8 +89,8 @@
     (list
      :command
      (append
-      (list magnus-claude-executable
-            "--safe-mode"
+      (magnus-environment-command-prefix magnus-claude-executable "Claude")
+      (list "--safe-mode"
             "--print"
             "--verbose"
             "--output-format" "stream-json"
@@ -130,8 +130,8 @@
     (list
      :command
      (append
-      (list magnus-claude-executable
-            "--print" prompt
+      (magnus-environment-command-prefix magnus-claude-executable "Claude")
+      (list "--print" prompt
             "--verbose"
             "--output-format" "stream-json")
       (when model (list "--model" model))

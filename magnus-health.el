@@ -334,8 +334,7 @@ points. Under 100 characters each. Be fresh and topical."
 The static list remains active while the optional job waits or fails."
   (when (and magnus-health-dashboard-ai-messages
              (not magnus-health-dashboard--generating)
-             (bound-and-true-p magnus-claude-executable)
-             (executable-find magnus-claude-executable))
+             (bound-and-true-p magnus-claude-executable))
     (setq magnus-health-dashboard--generating t
           magnus-health-dashboard--gen-output "")
     (unless

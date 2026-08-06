@@ -70,6 +70,7 @@ optional plist containing :sender and :reason."
   (unless (magnus-instances-valid-name-p name)
     (error "Unsafe Magnus display name for onboarding: %S" name))
   (let ((memory (magnus-onboarding-memory-relative-path name))
+        (busy (format ".claude/agents/%s/busy" name))
         (coordination-file
          (magnus-onboarding--project-path
           directory 'magnus-coord-file ".magnus-coord.md"))
@@ -126,7 +127,11 @@ optional plist containing :sender and :reason."
           "preserve non-obvious discoveries and shared decisions there. Your "
           "display name identifies your entries to teammates; the UUID remains "
           "your durable Magnus identity. Update " memory " in first person as "
-          "your understanding changes.\n\n")
+          "your understanding changes. Create " busy " while you need deep "
+          "focus and remove it when you are available again. Use @mentions in "
+          "the Log for active teammates; write [SUMMON @name] with a reason to "
+          "ask the user to resurrect a dormant expert. Inspect .claude/agents/ "
+          "and read another agent's memory when their prior context is useful.\n\n")
        (concat
         (format "While working, revisit %S when useful and preserve "
                 coordination-file)

@@ -8,11 +8,19 @@
 
 ;;; Commentary:
 
-;; Shared terminal creation and key handling for interactive Magnus providers.
-;; Loading this library does not eagerly load vterm, so provider modules can
-;; expose non-terminal capabilities in batch environments without requiring the
-;; optional package.  Creating a terminal loads vterm before allocating a
-;; buffer.
+;; Shared terminal creation, key handling, and composer ownership for
+;; interactive Magnus providers.  Loading this library does not eagerly load
+;; vterm, so provider modules can expose non-terminal capabilities in batch
+;; environments without requiring the optional package.  Creating a terminal
+;; loads vterm before allocating a buffer.
+;;
+;; Post-launch text followed by Return has exactly one Magnus-side owner: this
+;; module.  Durable callers use `magnus-terminal-submit'.  Replay-capable
+;; external transports use `magnus-terminal-try-submit'.  They may acknowledge
+;; synchronously when it returns `submitted'; when it returns `queued', Magnus
+;; owns a pasted message until the ACCEPTED callback runs.  Such transports must
+;; not call `vterm-send-string' and `vterm-send-return' themselves: a split
+;; transaction can interleave with this module's timers and merge two composers.
 
 ;;; Code:
 
@@ -118,6 +126,10 @@ Map `keyboard-quit' to send ESC because Emacs intercepts the real key."
        (null (process-get process 'magnus-terminal-delivery-queue))
        (not (process-get process 'magnus-terminal-delivery-busy))))
 
+(defun magnus-terminal--selected-buffer-p (buffer)
+  "Return non-nil when BUFFER is in the selected window."
+  (eq buffer (window-buffer (selected-window))))
+
 (defun magnus-terminal--finish-delivery (process entry)
   "Release PROCESS after settling ENTRY, then continue its FIFO."
   (process-put process 'magnus-terminal-delivery-busy nil)
@@ -125,12 +137,36 @@ Map `keyboard-quit' to send ESC because Emacs intercepts the real key."
   (magnus-terminal-drain process)
   (when (and (magnus-terminal-delivery-idle-p process)
              (plist-get entry :idle))
-    (funcall (plist-get entry :idle) process)))
+    (condition-case err
+        (funcall (plist-get entry :idle) process)
+      (error
+       (message "Magnus: terminal idle callback failed: %s"
+                (error-message-string err))))))
+
+(defun magnus-terminal--settle-delivery (process entry)
+  "Reserve PROCESS for ENTRY's settle delay, or release it immediately."
+  (let ((delay (or (plist-get entry :settle-delay) 0)))
+    (if (<= delay 0)
+        (magnus-terminal--finish-delivery process entry)
+      (puthash process t magnus-terminal--delivery-processes)
+      (condition-case err
+          (process-put
+           process 'magnus-terminal-delivery-busy-timer
+           (run-with-timer delay nil
+                           #'magnus-terminal--finish-delivery process entry))
+        (error
+         ;; The composer transaction already succeeded.  A timer allocation
+         ;; failure must release ownership, never make a caller replay text.
+         (message "Magnus: terminal settle timer failed: %s"
+                  (error-message-string err))
+         (magnus-terminal--finish-delivery process entry))))))
 
 (defun magnus-terminal-drain (process)
   "Safely submit PROCESS's next queued terminal message.
 Return `submitted', `queued', or nil.  A queue entry remains pending until
-both bracketed paste and Return succeed."
+both bracketed paste and Return succeed.  Once paste succeeds, the entry
+records that phase and retries only Return; durable text is never pasted twice
+merely because submission failed between those two vterm operations."
   (let* ((queue (and (processp process)
                      (process-get process 'magnus-terminal-delivery-queue)))
          (entry (car queue))
@@ -147,10 +183,12 @@ both bracketed paste and Return succeed."
       (magnus-terminal-release-process process)
       nil)
      ((or (process-get process 'magnus-terminal-delivery-busy)
-          (and (plist-get entry :ready-p)
+          (and (not (eq (plist-get entry :phase) 'pasted))
+               (plist-get entry :ready-p)
                (not (funcall (plist-get entry :ready-p) process))))
       'queued)
-     ((eq buffer (window-buffer (selected-window)))
+     ((and (not (eq (plist-get entry :phase) 'pasted))
+           (magnus-terminal--selected-buffer-p buffer))
       ;; Never append to a composer while the user owns this TUI.
       (magnus-terminal--schedule-delivery process)
       'queued)
@@ -160,11 +198,16 @@ both bracketed paste and Return succeed."
         (condition-case err
             (progn
               ;; Both operations run in one Emacs event, so two automated
-              ;; deliveries cannot interleave.  Pop before ACCEPTED to make a
-              ;; callback unable to submit this exact entry twice.
+              ;; deliveries cannot interleave.  They are still separate vterm
+              ;; side effects: remember a successful paste before attempting
+              ;; Return so a partial failure retries only submission.
               (with-current-buffer buffer
-                (vterm-send-string (plist-get entry :text) t)
+                (unless (eq (plist-get entry :phase) 'pasted)
+                  (vterm-send-string (plist-get entry :text) t)
+                  (setf (plist-get entry :phase) 'pasted))
                 (vterm-send-return))
+              ;; Pop before ACCEPTED to make a callback unable to submit this
+              ;; exact entry twice.
               (process-put process 'magnus-terminal-delivery-queue (cdr queue))
               (when accepted
                 (condition-case receipt-err
@@ -172,14 +215,7 @@ both bracketed paste and Return succeed."
                   (error
                    (message "Magnus: terminal delivery receipt failed: %s"
                             (error-message-string receipt-err)))))
-              (let ((delay (or (plist-get entry :settle-delay) 0)))
-                (if (> delay 0)
-                    (process-put
-                     process 'magnus-terminal-delivery-busy-timer
-                     (run-with-timer delay nil
-                                     #'magnus-terminal--finish-delivery
-                                     process entry))
-                  (magnus-terminal--finish-delivery process entry)))
+              (magnus-terminal--settle-delivery process entry)
               'submitted)
           (error
            (process-put process 'magnus-terminal-delivery-busy nil)
@@ -187,6 +223,73 @@ both bracketed paste and Return succeed."
                     (error-message-string err))
            (magnus-terminal--schedule-delivery process)
            'queued)))))))
+
+(cl-defun magnus-terminal-try-submit
+  (instance text &key ready-p settle-delay accepted idle)
+  "Attempt to submit TEXT to INSTANCE without pre-queueing it.
+Return `submitted' only after bracketed paste and Return both reach vterm;
+return `queued' when paste succeeded but Magnus must retry Return, and return
+nil only before Magnus or vterm accepted TEXT.  READY-P is an optional process
+predicate.  SETTLE-DELAY reserves the composer after submission, ACCEPTED
+runs only after Return succeeds, and IDLE runs with the process once the
+settle period and any older queued work have drained.
+
+This is the public boundary for replay-capable external terminal transports.
+They may retry from their own durable mailbox only when this function returns
+nil.  On `queued', Magnus owns the partial composer transaction and the caller
+must wait for ACCEPTED rather than replaying TEXT.  Transports must never split
+text and Return across separate calls themselves."
+  (unless (stringp text)
+    (signal 'wrong-type-argument (list 'stringp text)))
+  (let* ((buffer (magnus-instance-buffer instance))
+         (process (and (buffer-live-p buffer) (get-buffer-process buffer)))
+         (entry (and process
+                     (list :instance instance :buffer buffer :process process
+                           :text text :accepted accepted :ready-p ready-p
+                           :settle-delay settle-delay :idle idle
+                           :phase 'pending))))
+    (condition-case err
+        (when (and process
+                   (process-live-p process)
+                   (magnus-terminal--delivery-owner-p entry process)
+                   (magnus-terminal-delivery-idle-p process)
+                   (or (null ready-p) (funcall ready-p process))
+                   (not (magnus-terminal--selected-buffer-p buffer)))
+          (process-put process 'magnus-terminal-delivery-busy t)
+          (progn
+            ;; Keep the whole composer transaction inside one Emacs event.
+            (with-current-buffer buffer
+              (vterm-send-string text t)
+              (setf (plist-get entry :phase) 'pasted)
+              (vterm-send-return))
+            (when accepted
+              (condition-case receipt-err
+                  (funcall accepted)
+                (error
+                 (message "Magnus: terminal delivery receipt failed: %s"
+                          (error-message-string receipt-err)))))
+            (magnus-terminal--settle-delivery process entry)
+            'submitted))
+      (error
+       (when (processp process)
+         (process-put process 'magnus-terminal-delivery-busy nil))
+       (if (and entry (eq (plist-get entry :phase) 'pasted))
+           (progn
+             ;; Paste is externally visible and cannot be rolled back.  Take
+             ;; exact-process ownership and retry only Return; returning nil here
+             ;; would instruct a durable transport to duplicate TEXT.
+             (process-put
+              process 'magnus-terminal-delivery-queue
+              (cons entry
+                    (process-get process 'magnus-terminal-delivery-queue)))
+             (puthash process t magnus-terminal--delivery-processes)
+             (message "Magnus: terminal Return deferred after paste: %s"
+                      (error-message-string err))
+             (magnus-terminal--schedule-delivery process)
+             'queued)
+         (message "Magnus: immediate terminal delivery declined: %s"
+                  (error-message-string err))
+         nil)))))
 
 (cl-defun magnus-terminal-submit
     (instance text &optional accepted
@@ -197,6 +300,8 @@ process predicate.  SETTLE-DELAY serializes successive entries; IDLE is called
 with the process after settling.  SCOPE supports selective cancellation.
 DEDUPLICATE coalesces matching TEXT and defaults to non-nil for durable entries
 with ACCEPTED.  Return `submitted' or `queued'."
+  (unless (stringp text)
+    (signal 'wrong-type-argument (list 'stringp text)))
   (let* ((buffer (magnus-instance-buffer instance))
          (process (and (buffer-live-p buffer) (get-buffer-process buffer))))
     (unless (and process (process-live-p process))
@@ -215,7 +320,7 @@ with ACCEPTED.  Return `submitted' or `queued'."
                 (list :instance instance :buffer buffer :process process
                       :text text :accepted accepted
                       :ready-p ready-p :settle-delay settle-delay
-                      :idle idle :scope scope))))
+                      :idle idle :scope scope :phase 'pending))))
       (unless duplicate
         (process-put process 'magnus-terminal-delivery-queue
                      (append queue (list entry)))
@@ -247,7 +352,13 @@ with ACCEPTED.  Return `submitted' or `queued'."
        (process-put
         process 'magnus-terminal-delivery-queue
         (cl-delete-if
-         (lambda (entry) (eq (plist-get entry :scope) scope))
+         (lambda (entry)
+           ;; A pasted entry is no longer cancellable: removing it would leave
+           ;; automated text in the live composer for the user or another
+           ;; writer to unknowingly extend.  Its ownership callback is already
+           ;; fenced by the caller's exact runtime identity.
+           (and (eq (plist-get entry :scope) scope)
+                (not (eq (plist-get entry :phase) 'pasted))))
          (process-get process 'magnus-terminal-delivery-queue)))
        (when (magnus-terminal-delivery-idle-p process)
          (magnus-terminal--cancel-property-timer

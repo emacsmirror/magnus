@@ -191,6 +191,15 @@ still delivered to :on-error, while the result reports how many were omitted."
       (user-error "A non-empty headless prompt is required"))
     (unless (memq purpose magnus-headless--purposes)
       (user-error "Unknown headless purpose: %s" purpose))
+    (when (eq purpose 'review)
+      (dolist (field '(:base :head))
+        (let ((oid (plist-get request field)))
+          (unless (and (stringp oid)
+                       (string-match-p
+                        "\\`\\(?:[[:xdigit:]]\\{40\\}\\|[[:xdigit:]]\\{64\\}\\)\\'"
+                        oid))
+            (user-error "Headless review requires an exact full %s commit ID"
+                        (substring (symbol-name field) 1))))))
     (magnus-environment-validate-bindings
      (plist-get request :environment-bindings))
     (when (and buffer (not (buffer-live-p buffer)))

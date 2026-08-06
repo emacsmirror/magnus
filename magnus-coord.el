@@ -25,10 +25,9 @@
 (require 'magnus-instances)
 (require 'magnus-provider)
 (require 'magnus-background)
+(require 'magnus-terminal)
 
-(declare-function vterm-send-string "vterm")
 (declare-function project-root "project")
-(declare-function vterm-send-return "vterm")
 (defvar magnus-claude-executable)
 (defvar magnus-headless-model)
 (declare-function magnus--strip-thinking-markers "magnus")
@@ -94,7 +93,9 @@ version marker are automatically regenerated.")
   :group 'magnus)
 
 (defcustom magnus-coord-skill-file ".claude/skills/coordinate/SKILL.md"
-  "Path to the coordination skill file (relative to project)."
+  "Legacy coordination skill path, relative to the project.
+Magnus no longer creates or uses this file during normal coordination setup.
+The option remains for callers of `magnus-coord-ensure-skill'."
   :type 'string
   :group 'magnus)
 
@@ -205,12 +206,14 @@ This prevents partial reads when agents write concurrently."
   "Return non-nil when INSTANCE can currently receive a nudge.
 This intentionally avoids requiring `magnus-process', which itself requires
 this module and would create a load-order cycle for standalone callers."
-  (if (magnus-provider-external-p instance)
-      (magnus-provider-call instance 'running-p)
-    (when-let ((buffer (magnus-instance-buffer instance)))
-      (and (buffer-live-p buffer)
-           (get-buffer-process buffer)
-           (process-live-p (get-buffer-process buffer))))))
+  (and
+   (magnus-instance-interactive-p instance)
+   (if (magnus-provider-external-p instance)
+       (magnus-provider-call instance 'running-p)
+     (when-let ((buffer (magnus-instance-buffer instance)))
+       (and (buffer-live-p buffer)
+            (get-buffer-process buffer)
+            (process-live-p (get-buffer-process buffer)))))))
 
 (defun magnus-coord-nudge-agent (instance message &optional source)
   "Nudge INSTANCE by sending MESSAGE through its provider.
@@ -228,24 +231,21 @@ are debounced per `magnus-coord-nudge-debounce'."
                       (format "[From %s]: %s" source message)
                     message)))
         (condition-case err
-            (if (not (magnus-coord--instance-running-p instance))
+            (if (not (magnus-instance-interactive-p instance))
                 (magnus-coord--log-undelivered-nudge
-                 instance text "not running")
-              (if (magnus-provider-external-p instance)
-                  (magnus-provider-call instance 'send text)
-                (let ((buffer (magnus-instance-buffer instance)))
-                  (unless (buffer-live-p buffer)
-                    (error "agent buffer is not live"))
-                  (with-current-buffer buffer
-                    (vterm-send-string text)
-                    (run-with-timer
-                     0.1 nil
-                     (lambda ()
-                       (when (buffer-live-p buffer)
-                         (with-current-buffer buffer
-                           (vterm-send-return))))))))
-              (when (string= source "Magnus")
-                (puthash id (float-time) magnus-coord--last-nudge)))
+                 instance text "headless task has no interactive terminal")
+              (if (not (magnus-coord--instance-running-p instance))
+                  (magnus-coord--log-undelivered-nudge
+                   instance text "not running")
+                (if (magnus-provider-external-p instance)
+                    (magnus-provider-call instance 'send text)
+                  ;; Coordination shares the terminal FIFO with reviews,
+                  ;; onboarding, and external transports.  It must never split
+                  ;; text and Return across independent timer callbacks.
+                  (magnus-terminal-submit
+                   instance text nil :settle-delay 0.1 :scope 'magnus-coord))
+                (when (string= source "Magnus")
+                  (puthash id (float-time) magnus-coord--last-nudge))))
           (error
            (magnus-coord--log-undelivered-nudge
             instance text (error-message-string err))))))))
@@ -445,41 +445,58 @@ Suppressed entirely when AFK or DND is on."
 
 ;;; Log trimming
 
+(defun magnus-coord--trim-log-content (content max-entries)
+  "Return (CHANGED . CONTENT) after bounding Markdown log CONTENT.
+MAX-ENTRIES is the number of newest timestamped Log entries to retain.
+Invalid limits and content without a Log section are returned unchanged."
+  (if (not (and (stringp content)
+                (integerp max-entries)
+                (>= max-entries 0)))
+      (cons nil content)
+    (with-temp-buffer
+      (insert content)
+      (goto-char (point-min))
+      (if (not (re-search-forward "^## Log[[:space:]]*$" nil t))
+          (cons nil content)
+        (let ((section-end
+               (save-excursion
+                 (if (re-search-forward "^## " nil t)
+                     (match-beginning 0)
+                   (point-max))))
+              entries)
+          (while (re-search-forward "^\\[[^]\n]+\\] .+$" section-end t)
+            (let ((start (line-beginning-position))
+                  (end (save-excursion
+                         (forward-line 1)
+                         (when (looking-at "^[[:space:]]*$")
+                           (forward-line 1))
+                         (point))))
+              (push (cons start end) entries)))
+          ;; Log entries are newest-first.  Delete older entries bottom-up so
+          ;; saved positions remain valid.
+          (let ((stale (nthcdr max-entries (nreverse entries))))
+            (if (null stale)
+                (cons nil content)
+              (dolist (range (reverse stale))
+                (delete-region (car range) (cdr range)))
+              (cons t (buffer-string)))))))))
+
 (defun magnus-coord-trim-log (directory)
   "Keep the newest Log entries in DIRECTORY's coordination file.
 Keep at most `magnus-coord-log-max-entries' timestamped entries."
-  (let ((max-entries (magnus-coord--dir-local-value
-                      'magnus-coord-log-max-entries directory)))
-    (when (and (integerp max-entries) (>= max-entries 0))
-      (let ((file (magnus-coord-file-path directory)))
-        (when (file-exists-p file)
-          (with-temp-buffer
-            (insert-file-contents file)
-            (goto-char (point-min))
-            (when (re-search-forward "^## Log[[:space:]]*$" nil t)
-              (let ((section-end
-                     (save-excursion
-                       (if (re-search-forward "^## " nil t)
-                           (match-beginning 0)
-                         (point-max))))
-                    entries)
-                (while (re-search-forward "^\\[[^]\n]+\\] .+$"
-                                          section-end t)
-                  (let ((start (line-beginning-position))
-                        (end (save-excursion
-                               (forward-line 1)
-                               (when (looking-at "^[[:space:]]*$")
-                                 (forward-line 1))
-                               (point))))
-                    (push (cons start end) entries)))
-                ;; Log entries are newest-first. Delete older entries
-                ;; bottom-up so saved positions remain valid.
-                (setq entries (nreverse entries))
-                (let ((stale (nthcdr max-entries entries)))
-                  (when stale
-                    (dolist (range (reverse stale))
-                      (delete-region (car range) (cdr range)))
-                    (magnus-coord--write-file-atomic file)))))))))))
+  (let* ((max-entries (magnus-coord--dir-local-value
+                       'magnus-coord-log-max-entries directory))
+         (file (magnus-coord-file-path directory)))
+    (when (file-exists-p file)
+      (with-temp-buffer
+        (insert-file-contents file)
+        (pcase-let ((`(,changed . ,content)
+                     (magnus-coord--trim-log-content
+                      (buffer-string) max-entries)))
+          (when changed
+            (erase-buffer)
+            (insert content)
+            (magnus-coord--write-file-atomic file)))))))
 
 (defun magnus-coord-trim-all ()
   "Trim coordination file logs for all active project directories."
@@ -839,9 +856,26 @@ Also update vterm buffer activity ticks for quiescence tracking."
                 (alist-get directory magnus-coord--file-mtimes
                            nil nil #'equal)))
           (unless (equal mtime last-mtime)
-            (let ((content (magnus-coord--read-content directory)))
+            (let* ((content (magnus-coord--read-content directory))
+                   ;; Delivery sees the whole immutable ingress revision even
+                   ;; when presentation history is trimmed before caching.
+                   (ingress-content content)
+                   (max-entries
+                    (magnus-coord--dir-local-value
+                     'magnus-coord-log-max-entries directory))
+                   (trimmed
+                    (magnus-coord--trim-log-content content max-entries)))
+              (when (car trimmed)
+                (setq content (cdr trimmed))
+                (with-temp-buffer
+                  (insert content)
+                  (magnus-coord--write-file-atomic file))
+                ;; The atomic replacement has its own identity and mtime.
+                (setq mtime
+                      (file-attribute-modification-time
+                       (file-attributes file))))
               (magnus-coord--cache-content directory content)
-              (magnus-coord--consume-content directory content)
+              (magnus-coord--consume-content directory ingress-content)
               (setf (alist-get directory magnus-coord--file-mtimes
                                nil nil #'equal)
                     mtime))))
@@ -1189,7 +1223,9 @@ Returns a plist with :log, :discoveries, :decisions, :git, :start, :end."
   (let* ((parsed (magnus-coord-parse directory))
          (log-entries (plist-get parsed :log))
          (decisions (plist-get parsed :decisions))
-         (discoveries (plist-get parsed :discoveries))
+         ;; Preserve prose and nested Markdown written by older Magnus agents;
+         ;; the status parser's top-level bullet model is intentionally narrower.
+         (discoveries (magnus-coord--section-text directory "Discoveries"))
          (start-time (gethash directory magnus-coord--session-start-times))
          (git-log (when start-time
                     (magnus-coord--git-log-since directory start-time))))
@@ -1199,6 +1235,22 @@ Returns a plist with :log, :discoveries, :decisions, :git, :start, :end."
           :git (or git-log "No git data")
           :start start-time
           :end (float-time))))
+
+(defun magnus-coord--section-text (directory heading)
+  "Return complete Markdown section HEADING from DIRECTORY's journal."
+  (with-temp-buffer
+    (insert (or (magnus-coord--read-content directory) ""))
+    (goto-char (point-min))
+    (when (re-search-forward
+           (format "^## %s[[:space:]]*$" (regexp-quote heading)) nil t)
+      (forward-line 1)
+      (let ((start (point))
+            (end (if (re-search-forward "^## " nil t)
+                     (match-beginning 0)
+                   (point-max))))
+        (let ((text (string-trim
+                     (buffer-substring-no-properties start end))))
+          (unless (string-empty-p text) text))))))
 
 (defun magnus-coord--format-log-for-retro (entries)
   "Format log ENTRIES for the retro prompt."
@@ -1236,9 +1288,7 @@ Write a session retrospective with these sections:
 
 Keep it under 250 words. No filler."
           (magnus-coord--format-log-for-retro (plist-get data :log))
-          (if (plist-get data :discoveries)
-              (mapconcat #'identity (plist-get data :discoveries) "\n")
-            "None recorded")
+          (or (plist-get data :discoveries) "None recorded")
           (if (plist-get data :decisions)
               (mapconcat #'identity (plist-get data :decisions) "\n")
             "None recorded")
@@ -1247,8 +1297,7 @@ Keep it under 250 words. No filler."
 (defun magnus-coord-generate-retro (directory)
   "Generate a session retrospective for DIRECTORY asynchronously."
   (setq directory (magnus-coord--normalized-directory directory))
-  (when (and (bound-and-true-p magnus-claude-executable)
-             (executable-find magnus-claude-executable))
+  (when (bound-and-true-p magnus-claude-executable)
     (let* ((data (magnus-coord--collect-retro-data directory))
            (key (list 'coord-retro directory)))
       (magnus-background-submit
@@ -1465,29 +1514,32 @@ chain-of-thought. Keep it proportional and omit empty narration.
 
 <!-- magnus-instructions-version: %d -->
 " instructions journal journal magnus-coord--instructions-version)))
-;;; Coordination skill
+
+;;; Legacy explicit coordination skill API
 
 (defun magnus-coord-skill-path (directory)
-  "Get the coordination skill file path for DIRECTORY."
+  "Return the legacy coordination skill path for DIRECTORY."
   (expand-file-name magnus-coord-skill-file directory))
 
 (defun magnus-coord-ensure-skill (directory)
-  "Ensure the coordinate skill file exists in DIRECTORY."
+  "Explicitly ensure the legacy coordination skill exists in DIRECTORY.
+This compatibility entry point is never called by Magnus's normal setup or
+onboarding workflow."
   (let ((file (magnus-coord-skill-path directory)))
     (unless (file-exists-p file)
       (magnus-coord--create-skill file directory))
     file))
 
 (defun magnus-coord--create-skill (file &optional directory)
-  "Create the coordination skill FILE."
-  (let ((dir (file-name-directory file)))
-    (unless (file-exists-p dir)
-      (make-directory dir t)))
+  "Create legacy coordination skill FILE for DIRECTORY."
+  (let ((parent (file-name-directory file)))
+    (unless (file-exists-p parent)
+      (make-directory parent t)))
   (with-temp-file file
     (insert (magnus-coord--skill-content directory))))
 
 (defun magnus-coord--skill-content (&optional directory)
-  "Generate the coordination skill content."
+  "Return legacy coordination skill content for DIRECTORY."
   (format "# Coordination Check-in
 
 When you run /coordinate, perform these steps in order:

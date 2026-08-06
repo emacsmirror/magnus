@@ -4,6 +4,28 @@
 (require 'cl-lib)
 (require 'magnus-coord)
 
+(ert-deftest magnus-coord-integration-legacy-skill-api-is-explicit-only ()
+  "The shipped skill API works without joining normal coordination setup."
+  (let* ((directory (make-temp-file "magnus-coord-legacy-skill-" t))
+         (magnus-coord-skill-file "legacy/coordinate/SKILL.md")
+         (skill (expand-file-name magnus-coord-skill-file directory)))
+    (unwind-protect
+        (progn
+          (should (equal (magnus-coord-skill-path directory) skill))
+          (magnus-coord-ensure-file directory)
+          (should-not (file-exists-p skill))
+          (should (equal (magnus-coord-ensure-skill directory) skill))
+          (should (file-regular-p skill))
+          (with-temp-buffer
+            (insert-file-contents skill)
+            (should (string-match-p "# Coordination Check-in"
+                                    (buffer-string)))
+            (should
+             (string-match-p
+              (regexp-quote (magnus-coord-display-file directory))
+              (buffer-string)))))
+      (delete-directory directory t))))
+
 (ert-deftest magnus-coord-integration-poll-reads-once-per-change ()
   "One Markdown revision is read once and shared by every consumer."
   (let* ((directory (make-temp-file "magnus-coord-poll-" t))
@@ -342,6 +364,70 @@
             (should (string-match-p "ordinary-newest" content))
             (should (string-match-p "ordinary-second" content))
             (should-not (string-match-p "ordinary-old\\(?:est\\)?" content))))
+      (delete-directory directory t))))
+
+(ert-deftest magnus-coord-integration-poll-enforces-log-bound-without-reminders ()
+  "Ingress trimming is independent of the optional reminder timer."
+  (let* ((directory (make-temp-file "magnus-coord-poll-trim-" t))
+         (file (expand-file-name magnus-coord-file directory))
+         (magnus-coord-reminder-interval nil)
+         (magnus-coord-log-max-entries 2)
+         (magnus-coord--watched-dirs (list directory))
+         (magnus-coord--file-mtimes (list (cons directory '(0 0 0 0))))
+         (magnus-coord--states nil)
+         (magnus-coord-mention-notify nil))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "# Agent Coordination\n\n## Log\n\n"
+                    "[12:03] agent: newest\n\n"
+                    "[12:02] agent: second\n\n"
+                    "[12:01] agent: stale\n\n"))
+          (cl-letf (((symbol-function 'magnus-coord--update-buffer-ticks)
+                     #'ignore)
+                    ((symbol-function 'magnus-coord--check-new-dms) #'ignore)
+                    ((symbol-function 'magnus-coord--check-new-summons)
+                     #'ignore))
+            (magnus-coord--poll-all))
+          (let ((content
+                 (with-temp-buffer
+                   (insert-file-contents file)
+                   (buffer-string))))
+            (should (string-match-p "newest" content))
+            (should (string-match-p "second" content))
+            (should-not (string-match-p "stale" content)))
+          (should
+           (equal
+            (sort
+             (mapcar (lambda (entry) (plist-get entry :message))
+                     (plist-get (magnus-coord-parse directory) :log))
+             #'string<)
+            '("newest" "second"))))
+      (delete-directory directory t))))
+
+(ert-deftest magnus-coord-integration-retro-preserves-freeform-discoveries ()
+  "Retrospectives retain prose and nested Markdown, not only flat bullets."
+  (let* ((directory (make-temp-file "magnus-coord-discoveries-" t))
+         (file (expand-file-name magnus-coord-file directory)))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "# Agent Coordination\n\n"
+                    "## Discoveries\n\n"
+                    "The parser has a subtle invariant.\n\n"
+                    "- Outer evidence\n"
+                    "  - Nested detail\n\n"
+                    "## Decisions\n\n- Keep the invariant\n"))
+          (let* ((discoveries
+                  (magnus-coord--section-text directory "Discoveries"))
+                 (prompt
+                  (magnus-coord--retro-prompt
+                   (list :log nil :discoveries discoveries
+                         :decisions '("Keep the invariant")
+                         :git "No commits"))))
+            (should (string-match-p "subtle invariant" discoveries))
+            (should (string-match-p "  - Nested detail" discoveries))
+            (should (string-match-p "  - Nested detail" prompt))))
       (delete-directory directory t))))
 
 (ert-deftest magnus-coord-integration-reminders-run-housekeeping-while-idle ()

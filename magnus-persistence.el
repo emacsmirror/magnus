@@ -127,11 +127,18 @@ deliberately point into a shared directory."
     (unless (magnus-persistence--nonempty-string-p
              (magnus-instance-directory instance))
       (error "Invalid Magnus state record %d: missing or invalid directory" index))
-    (unless (magnus-persistence--timestamp-p
-             (magnus-instance-created-at instance))
-      (error "Invalid Magnus state record %d: invalid creation timestamp" index))
+    ;; Creation time is display metadata, not identity or lifecycle authority.
+    ;; Historical or hand-repaired state must not make every persisted agent
+    ;; disappear because this one nonessential field has an obsolete shape.
+    (unless (and (magnus-instance-created-at instance)
+                 (magnus-persistence--timestamp-p
+                  (magnus-instance-created-at instance)))
+      (setf (magnus-instance-created-at instance) (current-time))
+      (message "Magnus: repaired creation timestamp in state record %d" index))
     (unless (symbolp (magnus-instance-provider instance))
       (error "Invalid Magnus state record %d: invalid provider" index))
+    (unless (magnus-instances-valid-kind-p (magnus-instance-kind instance))
+      (error "Invalid Magnus state record %d: invalid instance kind" index))
     (unless (memq (magnus-instance-status instance)
                   '(running stopped suspended purged finished errored))
       (error "Invalid Magnus state record %d: invalid status" index))

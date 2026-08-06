@@ -155,5 +155,38 @@
       (delete-file first)
       (delete-file second))))
 
+(ert-deftest magnus-trace-file-identity-uses-emacs-28-accessors ()
+  (let* ((file (make-temp-file "magnus-trace-file-identity-"))
+         (attributes (file-attributes file)))
+    (unwind-protect
+        (should
+         (equal (magnus-trace--file-identity attributes)
+                (cons (file-attribute-device-number attributes)
+                      (file-attribute-inode-number attributes))))
+      (delete-file file))))
+
+(ert-deftest magnus-trace-load-earlier-skips-oversized-placeholder ()
+  "A nil scanner placeholder never reaches the JSON renderer."
+  (with-temp-buffer
+    (setq magnus-trace--jsonl-file "/tmp/ignored.jsonl"
+          magnus-trace--skip-count 2
+          magnus-trace--page-start-offset 10
+          magnus-trace--rendered-count 0)
+    (let ((magnus-trace-max-initial-entries 10)
+          (magnus-trace-max-buffer-lines nil)
+          rendered)
+      (cl-letf (((symbol-function 'magnus-trace--read-previous-records)
+                 (lambda (&rest _arguments)
+                   '(:lines (nil "valid") :count 2 :start 0)))
+                ((symbol-function 'magnus-trace--render-json-line)
+                 (lambda (line)
+                   (push line rendered)
+                   t))
+                ((symbol-function 'message) #'ignore))
+        (magnus-trace-load-earlier))
+      (should (equal rendered '("valid")))
+      (should (zerop magnus-trace--skip-count))
+      (should (= magnus-trace--rendered-count 1)))))
+
 (provide 'magnus-trace-cursor-tests)
 ;;; magnus-trace-cursor-tests.el ends here

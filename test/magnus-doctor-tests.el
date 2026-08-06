@@ -41,6 +41,21 @@
         (should (string-match-p "No agent provider"
                                 (magnus-doctor-check-summary provider)))))))
 
+(ert-deftest magnus-doctor-resolves-program-before-configured-flags ()
+  (let (looked-up)
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (program)
+                 (push program looked-up)
+                 (and (string= program "codex") "/bin/codex"))))
+      (let ((check
+             (magnus-doctor--executable-check
+              'codex "codex --fixture-flag" "Codex")))
+        (should (eq (magnus-doctor-check-severity check) 'ok))
+        (should (equal looked-up '("codex" "codex --fixture-flag")))
+        (should (string-match-p
+                 "configured arguments: --fixture-flag"
+                 (magnus-doctor-check-detail check)))))))
+
 (ert-deftest magnus-doctor-detects-overbroad-durable-permissions ()
   (let* ((directory (make-temp-file "magnus-doctor-storage-" t))
          (file (expand-file-name "state.el" directory)))
@@ -127,6 +142,37 @@
         (should (eq (magnus-doctor-check-severity check) 'error))
         (should (string-match-p "keen-owl"
                                 (magnus-doctor-check-summary check)))))))
+
+(ert-deftest magnus-doctor-downgrades-missing-archived-directory ()
+  (let* ((instance
+          (magnus-instance--create
+           :id "archived" :name "old-owl" :directory "/missing/archive"
+           :status 'purged)))
+    (cl-letf (((symbol-function 'magnus-instances-list)
+               (lambda () (list instance))))
+      (let ((check (car (magnus-doctor--instance-checks))))
+        (should (eq (magnus-doctor-check-severity check) 'warning))
+        (should (string-match-p "archived agent"
+                                (magnus-doctor-check-detail check)))))))
+
+(ert-deftest magnus-doctor-reports-missing-git-as-an-error ()
+  (let ((magnus-claude-executable "claude")
+        (magnus-codex-executable "codex"))
+    (cl-letf (((symbol-function 'locate-library)
+               (lambda (library) (format "/packages/%s.el" library)))
+              ((symbol-function 'executable-find)
+               (lambda (command)
+                 (unless (equal command "git")
+                   (format "/bin/%s" command))))
+              ((symbol-function 'magnus-doctor--storage-check)
+               (lambda (id _path label _directory-p)
+                 (magnus-doctor--check id 'ok label)))
+              ((symbol-function 'magnus-instances-list) (lambda () nil)))
+      (let* ((checks (magnus-doctor-run))
+             (git (cl-find 'git checks :key #'magnus-doctor-check-id)))
+        (should (eq (magnus-doctor-check-severity git) 'error))
+        (should (string-match-p "Install Git"
+                                (magnus-doctor-check-detail git)))))))
 
 (ert-deftest magnus-doctor-buffer-renders-severity-and-remediation ()
   (with-temp-buffer

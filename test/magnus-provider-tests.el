@@ -144,6 +144,14 @@ DATE defaults to the original deterministic test fixture date."
                (regexp-quote (shell-quote-argument "read this next"))
                resumed)))))
 
+(ert-deftest magnus-codex-tui-command-preserves-configured-prefix-flags ()
+  (let ((instance (magnus-instances-create "/tmp" "flagged-codex" 'codex))
+        (magnus-codex-executable "codex --fixture-flag"))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_command) nil)))
+      (should (string-prefix-p
+               "exec codex --fixture-flag -C "
+               (magnus-codex--tui-command instance))))))
+
 (ert-deftest magnus-codex-spawn-uses-shared-terminal-substrate ()
   (let* ((directory (make-temp-file "magnus-codex-terminal-" t))
          (instance (magnus-instances-create
@@ -987,6 +995,60 @@ DATE defaults to the original deterministic test fixture date."
         (should (magnus-coord--instance-running-p instance))
       (delete-process process)
       (kill-buffer buffer))))
+
+(ert-deftest magnus-coord-headless-nudge-never-enters-terminal-transport ()
+  (let* ((directory (make-temp-file "magnus-headless-nudge-" t))
+         (instance
+          (magnus-instances-create
+           directory "headless-worker" 'claude 'headless))
+         (magnus-coord-nudge-debounce nil)
+         logged)
+    (unwind-protect
+        (cl-letf (((symbol-function 'magnus-coord--log-undelivered-nudge)
+                   (lambda (_instance _text reason)
+                     (setq logged reason)
+                     nil))
+                  ((symbol-function 'magnus-terminal-submit)
+                   (lambda (&rest _arguments)
+                     (ert-fail "headless nudge reached terminal transport")))
+                  ((symbol-function 'magnus-provider-call)
+                   (lambda (&rest _arguments)
+                     (ert-fail "headless nudge reached provider transport"))))
+          (should-not
+           (magnus-coord-nudge-agent instance "hello" "Peer"))
+          (should (equal logged
+                         "headless task has no interactive terminal")))
+      (delete-directory directory t))))
+
+(ert-deftest magnus-coord-local-nudge-uses-terminal-single-writer ()
+  (let* ((instance (magnus-instances-create "/tmp" "local-nudge" 'claude))
+         (buffer (generate-new-buffer " *magnus-local-nudge*"))
+         (process (make-pipe-process
+                   :name (generate-new-buffer-name "magnus-local-nudge")
+                   :buffer buffer :noquery t))
+         (magnus-coord-nudge-debounce nil)
+         submission)
+    (magnus-instances-update instance :buffer buffer :status 'running)
+    (unwind-protect
+        (cl-letf (((symbol-function 'magnus-terminal-submit)
+                   (lambda (&rest arguments)
+                     (setq submission arguments)
+                     'submitted))
+                  ((symbol-function 'vterm-send-string)
+                   (lambda (&rest _arguments)
+                     (ert-fail "coord must use the terminal arbiter")))
+                  ((symbol-function 'vterm-send-return)
+                   (lambda (&rest _arguments)
+                     (ert-fail "coord must use the terminal arbiter"))))
+          (magnus-coord-nudge-agent instance "hello" "Peer")
+          (should
+           (equal submission
+                  (list instance "[From Peer]: hello" nil
+                        :settle-delay 0.1 :scope 'magnus-coord))))
+      (when (process-live-p process)
+        (delete-process process))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (ert-deftest magnus-health-check-supports-codex-tui-buffers ()
   (let* ((magnus-health--state (make-hash-table :test #'equal))

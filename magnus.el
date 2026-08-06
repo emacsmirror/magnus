@@ -55,6 +55,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'magnus-environment)
 (require 'magnus-instances)
 
 (declare-function magnus-persistence-load "magnus-persistence")
@@ -75,11 +76,7 @@
 (declare-function magnus-health-start "magnus-health")
 (declare-function magnus-coord-setup-attention-tracking "magnus-coord")
 (declare-function magnus-coord-attention-load "magnus-coord")
-(declare-function magnus-coord-stop-reminders "magnus-coord")
 (declare-function magnus-coord-nudge-agent "magnus-coord")
-(declare-function magnus-retro "magnus-coord")
-(declare-function magnus-health-stop "magnus-health")
-(declare-function magnus-attention-stop "magnus-attention")
 (declare-function magnus-instances-active-list "magnus-instances")
 (declare-function magnus-process-archive "magnus-process")
 (declare-function magnus-process--agent-memory-path "magnus-process")
@@ -109,7 +106,8 @@
   :prefix "magnus-")
 
 (defcustom magnus-claude-executable "claude"
-  "Path to the Claude Code executable."
+  "Claude Code executable or command prefix.
+The value may include established command-line arguments."
   :type 'string
   :group 'magnus)
 
@@ -367,7 +365,8 @@ non-nil.  (In current Claude CLI builds `--bare' fails auth with
 \"Not logged in\"; callers that need a real reply pass NO-BARE and
 sanitize the CLAUDE.md-flavored output themselves.)
 Includes --model flag only when `magnus-headless-model' is set."
-  (append (list magnus-claude-executable)
+  (append (magnus-environment-command-prefix
+           magnus-claude-executable "Claude")
           (unless no-bare (list "--bare"))
           (list "--print")
           (when magnus-headless-model (list "--model" magnus-headless-model))
@@ -377,8 +376,7 @@ Includes --model flag only when `magnus-headless-model' is set."
   "Run `claude --print' synchronously with PROMPT.
 Returns the trimmed output string, or nil on error."
   (condition-case err
-      (when (and (bound-and-true-p magnus-claude-executable)
-                 (executable-find magnus-claude-executable))
+      (when (bound-and-true-p magnus-claude-executable)
         (let ((process-environment
                (cl-remove-if
                 (lambda (e) (string-prefix-p "CLAUDECODE=" e))
@@ -486,8 +484,7 @@ not launch many provider processes at once."
          (memory-path (magnus-process--agent-memory-path instance)))
     (when (and (stringp memory-path)
                (file-exists-p memory-path)
-               (bound-and-true-p magnus-claude-executable)
-               (executable-find magnus-claude-executable))
+               (bound-and-true-p magnus-claude-executable))
       (let* ((memory (with-temp-buffer
                        (insert-file-contents
                         memory-path nil 0

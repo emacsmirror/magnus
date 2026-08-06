@@ -100,6 +100,7 @@
   (let ((magnus-attention-queue '("agent"))
         (magnus-attention-current "agent")
         (magnus-attention--checking t)
+        (magnus-attention--monitoring-active t)
         (magnus-attention--timer (run-at-time 3600 nil #'ignore))
         (magnus-attention--focus-timer (run-at-time 3600 nil #'ignore))
         (magnus-instances-changed-hook nil))
@@ -112,6 +113,7 @@
     (should-not magnus-attention-queue)
     (should-not magnus-attention-current)
     (should-not magnus-attention--checking)
+    (should-not magnus-attention--monitoring-active)
     (should-not (memq #'magnus-attention--on-instances-empty
                       magnus-instances-changed-hook))))
 

@@ -54,6 +54,8 @@
   (list :purpose (or purpose 'review)
         :directory default-directory
         :prompt "Exercise the fake provider"
+        :base (make-string 40 ?a)
+        :head (make-string 40 ?b)
         :fixture-command command))
 
 (defun magnus-test-headless--emit (line &optional stderr no-newline)
@@ -75,6 +77,20 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
       (sleep-for 0.001))
     (unless (funcall predicate)
       (ert-fail "Timed out waiting for fake headless provider"))))
+
+(ert-deftest magnus-headless-review-request-requires-exact-git-scope ()
+  (let ((request (magnus-test-headless--request "true")))
+    (magnus-headless--validate-request 'magnus-test-headless request)
+    (dolist (invalid '(nil "abc" "not-an-object-id"))
+      (let ((candidate (plist-put (copy-sequence request) :base invalid)))
+        (should-error
+         (magnus-headless--validate-request
+          'magnus-test-headless candidate)
+         :type 'user-error)))
+    ;; Non-review headless work has no Git evidence contract.
+    (magnus-headless--validate-request
+     'magnus-test-headless
+     (list :purpose 'agent :directory default-directory :prompt "Work"))))
 
 (ert-deftest magnus-headless-provider-requires-generic-capability ()
   (let ((request (magnus-test-headless--request "exit 0" 'agent)))
@@ -559,6 +575,22 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
     '(:purpose agent :prompt "Implement it"))
    :type 'user-error))
 
+(ert-deftest magnus-claude-headless-specs-preserve-configured-prefix-flags ()
+  (let ((magnus-claude-executable "claude --fixture-flag"))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_command) nil)))
+      (let* ((review
+              (magnus-claude-headless-review-spec
+               '(:prompt "Review it" :name "wise-deer"
+                 :schema-json "{\"type\":\"object\"}")))
+             (agent
+              (magnus-claude-headless-spec
+               '(:purpose agent :prompt "Implement it"
+                 :allowed-tools "Read"))))
+        (should (equal (cl-subseq (plist-get review :command) 0 2)
+                       '("claude" "--fixture-flag")))
+        (should (equal (cl-subseq (plist-get agent :command) 0 2)
+                       '("claude" "--fixture-flag")))))))
+
 (ert-deftest magnus-claude-review-decoder-captures-schema-result ()
   (let* ((event '((type . "result")
                   (subtype . "success")
@@ -663,6 +695,21 @@ When STDERR is non-nil write to stderr.  NO-NEWLINE omits the trailing newline."
    (magnus-codex-headless-spec
     '(:purpose agent :prompt "Implement it"))
    :type 'user-error))
+
+(ert-deftest magnus-codex-headless-spec-preserves-configured-prefix-flags ()
+  (let ((schema-file (make-temp-file "magnus-codex-prefix-schema-"))
+        (magnus-codex-executable "codex --fixture-flag"))
+    (unwind-protect
+        (cl-letf (((symbol-function 'executable-find) (lambda (_command) nil)))
+          (let* ((spec
+                  (magnus-codex-headless-review-spec
+                   (list :directory default-directory :prompt "Review it"
+                         :name "wise-deer" :schema-file schema-file
+                         :base (make-string 40 ?a))))
+                 (command (plist-get spec :command)))
+            (should (equal (cl-subseq command 0 3)
+                           '("codex" "--fixture-flag" "exec")))))
+      (delete-file schema-file))))
 
 (ert-deftest magnus-codex-review-decoder-uses-final-agent-message ()
   (let* ((decoder (magnus-codex--make-headless-review-decoder))

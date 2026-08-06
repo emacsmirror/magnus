@@ -95,6 +95,48 @@
     (dolist (state (list (list unsafe-name) (list unsafe-id)))
       (should-error (magnus-persistence--deserialize-state state)))))
 
+(ert-deftest magnus-persistence-round-trips-and-validates-instance-kind ()
+  "Headless identity is durable while old records remain interactive."
+  (let* ((headless
+          (magnus-instances-create "/tmp/headless" "headless" nil 'headless))
+         (serialized (magnus-instances-serialize headless))
+         (legacy (copy-sequence serialized))
+         (invalid (copy-sequence serialized)))
+    (should (eq (plist-get serialized :kind) 'headless))
+    (should (eq (magnus-instance-kind
+                 (magnus-instances-deserialize serialized))
+                'headless))
+    (cl-remf legacy :kind)
+    (should (eq (magnus-instance-kind
+                 (magnus-persistence--deserialize-record legacy 1))
+                'interactive))
+    (plist-put invalid :kind 'background)
+    (should-error (magnus-persistence--deserialize-state (list invalid)))))
+
+(ert-deftest magnus-persistence-repairs-obsolete-creation-metadata ()
+  "Nonessential creation timestamps cannot discard otherwise valid agents."
+  (let* ((first
+          (magnus-instances-serialize
+           (magnus-persistence-tests--instance "missing-created")))
+         (second
+          (magnus-instances-serialize
+           (magnus-persistence-tests--instance "obsolete-created" 'codex)))
+         (replacement '(30000 123 0 0))
+         repaired)
+    (plist-put first :created-at nil)
+    (plist-put second :created-at "historical-format")
+    (cl-letf (((symbol-function 'current-time) (lambda () replacement))
+              ((symbol-function 'message) #'ignore))
+      (setq repaired
+            (magnus-persistence--deserialize-state (list first second))))
+    (should (equal (mapcar #'magnus-instance-id repaired)
+                   '("missing-created" "obsolete-created")))
+    (dolist (instance repaired)
+      (should (equal (magnus-instance-created-at instance) replacement)))
+    (should (eq (magnus-instance-provider (cadr repaired)) 'codex))
+    (should (equal (magnus-instance-directory (car repaired))
+                   "/tmp/project-missing-created"))))
+
 (ert-deftest magnus-persistence-load-disables-reader-evaluation ()
   "Reader evaluation in a state file is rejected without side effects."
   (let* ((root (make-temp-file "magnus-persistence-" t))

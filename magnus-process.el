@@ -17,6 +17,7 @@
 (require 'cl-lib)
 (require 'filenotify)
 (require 'subr-x)
+(require 'magnus-environment)
 (require 'magnus-instances)
 (require 'magnus-provider)
 (require 'magnus-headless)
@@ -26,7 +27,7 @@
 (require 'magnus-trace)
 
 (declare-function magnus-instances-create "magnus-instances"
-                  (directory name &optional provider))
+                  (directory name &optional provider kind))
 
 (declare-function magnus-status-refresh "magnus-status")
 (declare-function magnus-project-root "magnus")
@@ -122,14 +123,30 @@ publishing readiness for a replacement runtime."
 
 ;;; Process creation
 
+(defun magnus-process--shell-command (&rest arguments)
+  "Return shell command string built from safely quoted ARGUMENTS."
+  (mapconcat #'shell-quote-argument arguments " "))
+
+(defun magnus-process--claude-command-prefix ()
+  "Return configured Claude command as a nonempty argv prefix.
+An executable path which resolves as configured remains one token, including
+paths containing spaces.  Otherwise parse the string as shell words to retain
+the shipped ability to customize `magnus-claude-executable' with extra flags."
+  (magnus-environment-command-prefix magnus-claude-executable "Claude"))
+
+(defun magnus-process--claude-command (&rest arguments)
+  "Return a safely quoted Claude shell command with ARGUMENTS appended."
+  (apply #'magnus-process--shell-command
+         (append (magnus-process--claude-command-prefix) arguments)))
+
 (defun magnus-process--claude-session-id-supported-p ()
   "Return non-nil when the configured Claude CLI supports `--session-id'.
 Probe each resolved executable at most once per Emacs session.  A failed probe
 conservatively selects the legacy unique-delta capture path."
-  (let* ((executable (or (executable-find magnus-claude-executable)
-                         magnus-claude-executable))
+  (let* ((prefix (magnus-process--claude-command-prefix))
+         (program (or (executable-find (car prefix)) (car prefix)))
          (missing (make-symbol "not-probed"))
-         (cached (gethash executable
+         (cached (gethash prefix
                           magnus-process--claude-session-id-support-cache
                           missing)))
     (if (not (eq cached missing))
@@ -137,7 +154,8 @@ conservatively selects the legacy unique-delta capture path."
       (let ((supported
              (condition-case err
                  (with-temp-buffer
-                   (and (eq 0 (call-process executable nil t nil "--help"))
+                   (and (eq 0 (apply #'call-process program nil t nil
+                                     (append (cdr prefix) '("--help"))))
                         (goto-char (point-min))
                         (re-search-forward
                          "\\(?:^\\|[[:space:]]\\)--session-id\\(?:[=[:space:]]\\|$\\)"
@@ -146,7 +164,7 @@ conservatively selects the legacy unique-delta capture path."
                 (message "Magnus: could not probe Claude session-ID support: %s"
                          (error-message-string err))
                 nil))))
-        (puthash executable (if supported 'supported 'unsupported)
+        (puthash prefix (if supported 'supported 'unsupported)
                  magnus-process--claude-session-id-support-cache)
         (and supported t)))))
 
@@ -154,10 +172,6 @@ conservatively selects the legacy unique-delta capture path."
   "Return a fresh UUID v4 candidate for one interactive Claude launch."
   (require 'magnus-provider-claude)
   (magnus-claude--fresh-session-id))
-
-(defun magnus-process--shell-command (&rest arguments)
-  "Return shell command string built from safely quoted ARGUMENTS."
-  (mapconcat #'shell-quote-argument arguments " "))
 
 (defun magnus-process--reserve-legacy-session-launch (directory token)
   "Reserve legacy session inference in DIRECTORY for launch TOKEN."
@@ -385,10 +399,9 @@ When INITIAL-MESSAGE is non-nil, include it in the native TUI's first turn."
           (with-current-buffer buffer
             (vterm-send-string
              (if candidate-session-id
-                 (magnus-process--shell-command
-                  magnus-claude-executable "--session-id"
-                  candidate-session-id)
-               (magnus-process--shell-command magnus-claude-executable)))
+                 (magnus-process--claude-command
+                  "--session-id" candidate-session-id)
+               (magnus-process--claude-command)))
             (setq return-timer
                   (run-with-timer
                    0.1 nil
@@ -436,17 +449,14 @@ the full message text before submitting."
                   "[\n\r]+" " "
                   (magnus-process--onboarding-message
                    current-instance summon-context))))
-        (with-current-buffer buffer
-          (vterm-send-string msg))
-        ;; Delay Return so the TUI can digest the pasted text
-        (run-with-timer 0.5 nil
-                        (lambda ()
-                          (when (magnus-process--runtime-owner-p
-                                 current-instance buffer owner-process)
-                            (with-current-buffer buffer
-                              (vterm-send-return))
-                            (magnus-process--run-ready-hook
-                             current-instance buffer owner-process))))))))
+        (magnus-terminal-submit
+         current-instance msg
+         (lambda ()
+           (when (magnus-process--runtime-owner-p
+                  current-instance buffer owner-process)
+             (magnus-process--run-ready-hook
+              current-instance buffer owner-process)))
+         :settle-delay 0.5 :scope 'magnus-onboarding :deduplicate t)))))
 
 (defun magnus-process--agent-memory-path (instance)
   "Return the memory file path for INSTANCE.
@@ -821,6 +831,9 @@ The session ID is preserved so the agent can be resurrected later
   "Resurrect a purged INSTANCE by resuming its provider session.
 If the instructions file was updated since the agent was archived,
 nudge the agent to re-read it."
+  (when (magnus-process--headless-p instance)
+    (user-error "Headless task '%s' cannot be resurrected interactively"
+                (magnus-instance-name instance)))
   (let* ((session-id (magnus-instance-session-id instance))
          (directory (magnus-instance-directory instance))
          (external (magnus-provider-external-p instance))
@@ -915,6 +928,9 @@ Sends SIGTSTP to pause the process.  Use `magnus-process-resume' to continue."
   (when (magnus-provider-external-p instance)
     (user-error "Suspend is not supported by the `%s' provider"
                 (magnus-instance-provider instance)))
+  (when (magnus-process--headless-p instance)
+    (user-error "Headless task '%s' cannot be suspended"
+                (magnus-instance-name instance)))
   (when-let ((buffer (magnus-instance-buffer instance)))
     (when (buffer-live-p buffer)
       (when-let ((process (get-buffer-process buffer)))
@@ -931,14 +947,18 @@ Sends SIGCONT to continue the process."
   (when (magnus-provider-external-p instance)
     (user-error "Process resume is not supported by the `%s' provider"
                 (magnus-instance-provider instance)))
+  (when (magnus-process--headless-p instance)
+    (user-error "Headless task '%s' cannot be resumed interactively"
+                (magnus-instance-name instance)))
   (when-let ((buffer (magnus-instance-buffer instance)))
     (when (buffer-live-p buffer)
       (when-let ((process (get-buffer-process buffer)))
-        (signal-process process 'SIGCONT)
-        (magnus-instances-update instance :status 'running)
-        (when (get-buffer magnus-buffer-name)
-          (magnus-status-refresh))
-        (message "Resumed %s" (magnus-instance-name instance))))))
+        (when (process-live-p process)
+          (signal-process process 'SIGCONT)
+          (magnus-instances-update instance :status 'running)
+          (when (get-buffer magnus-buffer-name)
+            (magnus-status-refresh))
+          (message "Resumed %s" (magnus-instance-name instance)))))))
 
 (defun magnus-process-suspended-p (instance)
   "Return non-nil if INSTANCE is suspended."
@@ -1165,10 +1185,9 @@ underscores with hyphens."
           (with-current-buffer buffer
             (if session-id
                 (vterm-send-string
-                 (magnus-process--shell-command
-                  magnus-claude-executable "--resume" session-id))
+                 (magnus-process--claude-command "--resume" session-id))
               (vterm-send-string
-               (magnus-process--shell-command magnus-claude-executable)))
+               (magnus-process--claude-command)))
             (setq return-timer
                   (run-with-timer
                    0.1 nil
@@ -1196,6 +1215,9 @@ underscores with hyphens."
 
 (defun magnus-process--ensure-changeable-lifecycle (instance action)
   "Reject lifecycle states where INSTANCE cannot safely ACTION."
+  (when (magnus-process--headless-p instance)
+    (user-error "Headless task '%s' cannot %s"
+                (magnus-instance-name instance) action))
   (pcase (magnus-instance-status instance)
     ('purged
      (user-error "Instance '%s' is archived; resurrect it with R before trying to %s"
@@ -1222,6 +1244,13 @@ if a session ID exists, or spawn a fresh process."
      ((eq status 'purged)
       (user-error "Instance '%s' is archived; resurrect it with R"
                   (magnus-instance-name instance)))
+     ;; A headless task can only display the output buffer owned by its one
+     ;; execution.  Never turn a persisted or bufferless task into a TUI.
+     ((magnus-process--headless-p instance)
+      (if (buffer-live-p buffer)
+          (switch-to-buffer buffer)
+        (user-error "Headless output for '%s' is no longer available"
+                    (magnus-instance-name instance))))
      ;; A completed headless buffer is useful output, not an interactive agent
      ;; to restart.  Retain the old visit behavior only while that output lives.
      ((memq status '(finished errored))
@@ -1330,10 +1359,7 @@ object, recover a uniquely tagged buffer regardless of its display name."
 
 (defun magnus-process--headless-p (instance)
   "Return non-nil if INSTANCE is a headless (non-interactive) agent."
-  (when-let ((buffer (magnus-instance-buffer instance)))
-    (when (buffer-live-p buffer)
-      (with-current-buffer buffer
-        (derived-mode-p 'magnus-process-headless-mode)))))
+  (eq (magnus-instance-effective-kind instance) 'headless))
 
 (defvar magnus--creation-task)
 
@@ -1348,7 +1374,8 @@ Returns the new instance."
          (instance-name (or name
                             (concat "headless-"
                                     (funcall magnus-instance-name-generator dir))))
-         (instance (magnus-instances-create dir instance-name)))
+         (instance (magnus-instances-create
+                    dir instance-name nil 'headless)))
     (magnus-process--create-transaction
      instance
      (lambda (candidate _external)

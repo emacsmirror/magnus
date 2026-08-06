@@ -18,6 +18,37 @@
 (require 'cl-lib)
 (require 'subr-x)
 
+(defun magnus-environment-command-prefix (configured &optional label)
+  "Return CONFIGURED command as a nonempty argv prefix.
+LABEL names the command in diagnostics.  A configured executable which resolves
+as written remains one token, including paths containing spaces.  Otherwise
+CONFIGURED is parsed as shell words so established customizations containing
+extra flags remain supported."
+  (unless (and (stringp configured) (not (string-empty-p configured)))
+    (user-error "%s command is not configured" (or label "Provider")))
+  (let* ((exact
+          (or (executable-find configured)
+              (and (file-name-absolute-p configured)
+                   (file-executable-p configured)
+                   configured)))
+         (arguments
+          (if exact
+              (list configured)
+            (condition-case err
+                (split-string-and-unquote configured)
+              (error
+               (user-error "Invalid %s command %S: %s"
+                           (or label "provider") configured
+                           (error-message-string err)))))))
+    (unless (and arguments
+                 (cl-every (lambda (argument)
+                             (and (stringp argument)
+                                  (not (string-empty-p argument))))
+                           arguments))
+      (user-error "%s command is empty: %S"
+                  (or label "Provider") configured))
+    arguments))
+
 (defun magnus-environment--binding-name (binding)
   "Validate BINDING and return its environment variable name."
   (unless (and (stringp binding)

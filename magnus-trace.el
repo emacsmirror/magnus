@@ -279,7 +279,7 @@ at the top.  Stops when all entries are loaded or the buffer exceeds
                    'magnus-trace-header t)))
         ;; Render batch entries at point (before existing content)
         (dolist (line batch)
-          (when (magnus-trace--render-json-line line)
+          (when (and line (magnus-trace--render-json-line line))
             (setq parsed-count (1+ parsed-count)))))
       (setq magnus-trace--skip-count new-skip
             magnus-trace--page-start-offset
@@ -676,6 +676,11 @@ content are accepted, and visible response markers are unwrapped."
   (signal 'magnus-trace-cursor-stale
           (list (apply #'format format-string arguments))))
 
+(defun magnus-trace--file-identity (attributes)
+  "Return an Emacs-28-compatible file identity from ATTRIBUTES."
+  (cons (file-attribute-device-number attributes)
+        (file-attribute-inode-number attributes)))
+
 (defun magnus-trace-cursor-create (instance)
   "Create an in-memory cursor at the current end of INSTANCE's trace.
 Signal `magnus-trace-cursor-error' until the instance has an exact captured
@@ -691,7 +696,7 @@ replayed."
               '("Instance trace file is not available yet")))
     (let* ((canonical-file (file-truename file))
            (attributes (file-attributes canonical-file))
-           (identity (file-attribute-file-identifier attributes)))
+           (identity (magnus-trace--file-identity attributes)))
       (magnus-trace-cursor--create
        :instance instance
        :instance-id (magnus-instance-id instance)
@@ -725,7 +730,7 @@ replayed."
          "The trace file disappeared or is no longer resolvable"))
       (let* ((canonical-file (file-truename file))
              (attributes (file-attributes canonical-file))
-             (identity (file-attribute-file-identifier attributes))
+             (identity (magnus-trace--file-identity attributes))
              (size (file-attribute-size attributes)))
         (unless (and (equal canonical-file (magnus-trace-cursor-file cursor))
                      (equal identity

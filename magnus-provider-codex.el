@@ -33,7 +33,8 @@
 (defvar magnus-process--transaction-runtime-buffer nil)
 
 (defcustom magnus-codex-executable "codex"
-  "Path to the Codex executable used for native TUI sessions."
+  "Codex executable or command prefix used for native TUI sessions.
+The value may include established command-line arguments."
   :type 'string
   :group 'magnus)
 
@@ -53,6 +54,10 @@ arriving during startup."
   "Seconds to wait for a new Codex TUI to record its session ID."
   :type 'number
   :group 'magnus)
+
+(defun magnus-codex--command-prefix ()
+  "Return configured Codex command as a nonempty argv prefix."
+  (magnus-environment-command-prefix magnus-codex-executable "Codex"))
 
 (defconst magnus-codex--session-scan-limit (* 1024 1024)
   "Maximum rollout bytes inspected while identifying a new session.")
@@ -289,7 +294,7 @@ FILES-BEFORE contains rollout files that predate this launch."
   (let ((session-id (magnus-instance-session-id instance)))
     (mapconcat
      #'shell-quote-argument
-     (append (list "exec" magnus-codex-executable)
+     (append (list "exec") (magnus-codex--command-prefix)
              (when session-id (list "resume"))
              (list "-C" (magnus-instance-directory instance))
              (when session-id (list session-id))
@@ -443,8 +448,12 @@ When MARKER is non-nil, capture its new session against FILES-BEFORE."
   (when (magnus-codex-running-p instance)
     (user-error "Codex instance `%s' is already running"
                 (magnus-instance-name instance)))
-  (unless (executable-find magnus-codex-executable)
-    (user-error "Cannot find Codex executable: %s" magnus-codex-executable))
+  (let* ((prefix (magnus-codex--command-prefix))
+         (program (car prefix)))
+    (unless (or (executable-find program)
+                (and (file-name-absolute-p program)
+                     (file-executable-p program)))
+      (user-error "Cannot find Codex executable: %s" program)))
   (when-let ((old-buffer (magnus-instance-buffer instance)))
     (when (buffer-live-p old-buffer)
       (magnus-terminal--discard-buffer old-buffer)))
@@ -698,7 +707,8 @@ the turn completes, so each process needs an independent last-message cell."
     (list
      :command
      (append
-      (list magnus-codex-executable "exec"
+      (magnus-codex--command-prefix)
+      (list "exec"
             "--json"
             "--color" "never"
             "--sandbox" "read-only"

@@ -18,6 +18,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'magnus-environment)
 (require 'magnus-instances)
 
 (declare-function magnus-coord-watched-directories "magnus-coord" ())
@@ -49,19 +50,39 @@
      (intern library) 'error (format "%s is missing" label)
      (format "Install the `%s' Emacs package, then restart Emacs." library))))
 
-(defun magnus-doctor--executable-check (id executable label &optional detail)
+(defun magnus-doctor--executable-check
+    (id executable label &optional detail missing-severity)
   "Check configured EXECUTABLE for LABEL under ID.
 DETAIL explains the missing command; provider-oriented guidance is the
-default."
+default.  MISSING-SEVERITY defaults to `warning'."
   (let ((configured (and (stringp executable)
                          (not (string-empty-p executable))
-                         executable)))
-    (if-let ((path (and configured (executable-find configured))))
+                         executable))
+        prefix path configuration-error)
+    (when configured
+      (condition-case err
+          (progn
+            (setq prefix
+                  (magnus-environment-command-prefix configured label))
+            (let ((program (car prefix)))
+              (setq path
+                    (or (executable-find program)
+                        (and (file-name-absolute-p program)
+                             (file-executable-p program)
+                             program)))))
+        (error
+         (setq configuration-error (error-message-string err)))))
+    (if path
         (magnus-doctor--check
-         id 'ok (format "%s CLI is available" label) path)
+         id 'ok (format "%s CLI is available" label)
+         (if (cdr prefix)
+             (format "%s (configured arguments: %s)"
+                     path (string-join (cdr prefix) " "))
+           path))
       (magnus-doctor--check
-       id 'warning (format "%s CLI is unavailable" label)
-       (or detail
+       id (or missing-severity 'warning)
+       (format "%s CLI is unavailable" label)
+       (or configuration-error detail
            (format
             (concat
              "Configured command: %s. Interactive %s agents and %s-backed "
@@ -144,8 +165,14 @@ its parent is the location Magnus needs to create or replace a file in."
             'ok (format "Agent %s directory exists" name) directory)
          (magnus-doctor--check
           (intern (format "instance-%s" (magnus-instance-id instance)))
-          'error (format "Agent %s directory is unavailable" name)
-          (or directory "<unset>")))))
+          (if (eq (magnus-instance-status instance) 'purged)
+              'warning
+            'error)
+          (format "Agent %s directory is unavailable" name)
+          (if (eq (magnus-instance-status instance) 'purged)
+              (format "%s (archived agent; safe to forget if intentional)"
+                      (or directory "<unset>"))
+            (or directory "<unset>"))))))
    (magnus-instances-list)))
 
 (defun magnus-doctor--active-project-directories ()
@@ -230,7 +257,8 @@ its parent is the location Magnus needs to create or replace a file in."
       claude codex provider
       (magnus-doctor--executable-check
        'git "git" "Git"
-       "Install Git to inspect immutable review scopes and project history.")
+       "Install Git to inspect immutable review scopes and project history."
+       'error)
       (magnus-doctor--storage-check
        'state
        (if (and (boundp 'magnus-state-file)

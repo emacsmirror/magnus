@@ -8,7 +8,8 @@
 (require 'magnus-provider-claude)
 
 (ert-deftest magnus-claude-text-only-agent-honors-model-with-zero-tools ()
-  (let* ((spec
+  (let* ((magnus-claude-executable "claude")
+         (spec
           (magnus-claude-headless-agent-spec
            '(:purpose agent
              :prompt "Summarize"
@@ -25,6 +26,16 @@
                          "--tools" "")))
     (should-not (member "--allowedTools" command))))
 
+(ert-deftest magnus-headless-command-preserves-configured-prefix-flags ()
+  (let ((magnus-claude-executable "claude --fixture-flag")
+        (magnus-headless-model "small-model"))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_program) nil)))
+      (should
+       (equal (magnus--headless-command "Match this" t)
+              '("claude" "--fixture-flag" "--print"
+                "--model" "small-model" "Match this"))))))
+
 (ert-deftest magnus-agent-indexing-bounds-memory-and-queues-text-only-work ()
   (let* ((memory-file (make-temp-file "magnus-index-memory-"))
          (instance
@@ -32,6 +43,7 @@
            :id "agent-uuid" :name "calm-owl"
            :directory default-directory :provider 'claude))
          (magnus-agents-index-memory-limit 8)
+         (magnus-claude-executable "claude --fixture-flag")
          (magnus-headless-model "small-model")
          submission indexed)
     (unwind-protect
@@ -43,7 +55,8 @@
                     ((symbol-function 'magnus-instances-get)
                      (lambda (_id) instance))
                     ((symbol-function 'executable-find)
-                     (lambda (_program) "/fake/claude"))
+                     (lambda (&rest _arguments)
+                       (ert-fail "caller must not preflight the whole command")))
                     ((symbol-function 'magnus-background-submit)
                      (lambda (key provider request callbacks)
                        (setq submission
@@ -77,11 +90,13 @@
 
 (ert-deftest magnus-coord-retro-uses-serialized-text-only-job ()
   (let ((directory (make-temp-file "magnus-retro-project-" t))
+        (magnus-claude-executable "claude --fixture-flag")
         (magnus-headless-model "small-model")
         submission saved)
     (unwind-protect
         (cl-letf (((symbol-function 'executable-find)
-                   (lambda (_program) "/fake/claude"))
+                   (lambda (&rest _arguments)
+                     (ert-fail "caller must not preflight the whole command")))
                   ((symbol-function 'magnus-coord--collect-retro-data)
                    (lambda (_directory)
                      '(:log nil :discoveries nil :decisions nil
@@ -109,10 +124,12 @@
 
 (ert-deftest magnus-dashboard-ai-messages-are-opt-in-and-cancel-scoped ()
   (let ((magnus-health-dashboard-ai-messages nil)
+        (magnus-claude-executable "claude --fixture-flag")
         (magnus-health-dashboard--generating nil)
         submission cancelled)
     (cl-letf (((symbol-function 'executable-find)
-               (lambda (_program) "/fake/claude"))
+               (lambda (&rest _arguments)
+                 (ert-fail "caller must not preflight the whole command")))
               ((symbol-function 'magnus-background-submit)
                (lambda (&rest arguments)
                  (setq submission arguments)
