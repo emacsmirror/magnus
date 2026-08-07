@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Magnus — Claude Code and Codex, under one Emacs roof</title>
+    <meta name="description" content="A Magit-inspired Emacs control room for hands-on work with Claude Code and Codex agents: native TUIs, durable identities, coordination, attention, and independent cross-provider review.">
+    <meta name="theme-color" content="#f4efe4">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="Magnus — Claude Code and Codex, under one Emacs roof">
+    <meta property="og:description" content="See the team, steer every agent, and review committed work without leaving Emacs.">
+    <meta property="og:url" content="https://hrishikeshs.github.io/magnus/">
+    <meta property="og:image" content="https://hrishikeshs.github.io/magnus/assets/social-card.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:image:alt" content="The Magnus status buffer beside a completed independent code review in Emacs">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="canonical" href="https://hrishikeshs.github.io/magnus/">
+    <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="styles.css">
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "Magnus",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Any system supported by Emacs and vterm",
+        "description": "A Magit-inspired Emacs control room for Claude Code and Codex agents.",
+        "url": "https://hrishikeshs.github.io/magnus/",
+        "downloadUrl": "https://melpa.org/#/magnus",
+        "license": "https://opensource.org/license/mit"
+      }
+    </script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="site-header">
+      <div class="shell header-inner">
+        <a class="brand" href="#top" aria-label="Magnus home">
+          <span class="brand-mark" aria-hidden="true">M</span>
+          <span>Magnus</span>
+        </a>
+        <nav aria-label="Primary navigation">
+          <a href="#why">Why Magnus</a>
+          <a href="#workflow">Workflow</a>
+          <a href="#reviews">Reviews</a>
+          <a class="mobile-priority" href="#install">Install</a>
+          <a href="https://github.com/hrishikeshs/magnus">GitHub</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero" id="top">
+        <div class="shell hero-copy">
+          <p class="eyebrow"><span></span> Magit-inspired. Human-directed.</p>
+          <h1>Claude Code and Codex,<br><em>under one Emacs roof.</em></h1>
+          <p class="lede">
+            Magnus turns scattered agent terminals into a team you can see,
+            steer, coordinate, and independently review—without hiding the
+            native tools you already trust.
+          </p>
+          <div class="actions" role="group" aria-label="Get Magnus">
+            <a class="button primary" href="#install">Install from MELPA</a>
+            <a class="button secondary" href="https://github.com/hrishikeshs/magnus">View source</a>
+          </div>
+          <ul class="proof" aria-label="Magnus principles">
+            <li>Native TUIs</li>
+            <li>Claude + Codex</li>
+            <li>No Magnus daemon</li>
+            <li>Emacs 28.1+</li>
+          </ul>
+        </div>
+
+        <figure class="shell product-shot hero-shot">
+          <a class="image-link" href="assets/magnus-cockpit.webp"
+             aria-label="Open the full-size Magnus status and review image">
+            <img src="assets/magnus-cockpit.webp"
+                 width="1600" height="850"
+                 alt="A Magnus status buffer with synthetic Claude and Codex agents beside a completed independent review">
+          </a>
+          <figcaption>
+            The team on the left. Its committed evidence and independent
+            review on the right. <a href="assets/magnus-cockpit.webp">Open the full-size image.</a>
+          </figcaption>
+        </figure>
+      </section>
+
+      <section class="problem section" id="why">
+        <div class="shell narrow">
+          <p class="section-label">The missing layer</p>
+          <h2>Terminal tabs show conversations.<br>They do not show the team.</h2>
+          <p class="section-intro">
+            One coding agent is easy to hold in your head. With two or three,
+            the questions change: Who owns this file? Who is waiting for me?
+            Which session was the expert yesterday? How do I get a fresh-model
+            review without reconstructing the task in another chat?
+          </p>
+        </div>
+
+        <div class="shell question-grid">
+          <article>
+            <span class="question-number">01</span>
+            <h3>Who is doing what?</h3>
+            <p>Named agents publish active work, files, discoveries, and decisions in a shared project journal.</p>
+          </article>
+          <article>
+            <span class="question-number">02</span>
+            <h3>Who needs attention?</h3>
+            <p>The status buffer surfaces approvals, health, current work, and running reviews without stealing focus.</p>
+          </article>
+          <article>
+            <span class="question-number">03</span>
+            <h3>What survives?</h3>
+            <p>Agent identity, captured provider sessions, memory, shared context, and successful review lineages outlive a terminal.</p>
+          </article>
+          <article>
+            <span class="question-number">04</span>
+            <h3>Who checks the work?</h3>
+            <p>A fresh headless reviewer inspects exact commits, then returns anchored findings in a Magit-style reader.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="workflow section ink-section" id="workflow">
+        <div class="shell">
+          <div class="section-heading split-heading">
+            <div>
+              <p class="section-label">The Magnus loop</p>
+              <h2>Direct the work.<br>Keep the judgment.</h2>
+            </div>
+            <p>
+              Magnus is built for programmers who want capable agents and
+              active supervision—not an unattended swarm.
+            </p>
+          </div>
+
+          <ol class="workflow-list">
+            <li>
+              <span class="step">01</span>
+              <div>
+                <h3>Bring up the right pair</h3>
+                <p>Create Claude Code and Codex agents for a project. Magnus persists their names and identities, and resumes captured provider sessions when available.</p>
+              </div>
+              <kbd>c&nbsp;&nbsp;&nbsp;? X</kbd>
+            </li>
+            <li>
+              <span class="step">02</span>
+              <div>
+                <h3>Work in native TUIs</h3>
+                <p>Keep provider composers, approvals, slash commands, and streaming output. Visit and redirect agents as the work unfolds.</p>
+              </div>
+              <kbd>RET</kbd>
+            </li>
+            <li>
+              <span class="step">03</span>
+              <div>
+                <h3>See the project, not just the chats</h3>
+                <p>Track active work, attention, health, coordination, shared discoveries, and decisions from one buffer.</p>
+              </div>
+              <code>*magnus*</code>
+            </li>
+            <li>
+              <span class="step">04</span>
+              <div>
+                <h3>Review committed evidence</h3>
+                <p>Send the author's exact commits to the other provider and continue across rounds with the same named reviewer.</p>
+              </div>
+              <kbd>v RET</kbd>
+            </li>
+          </ol>
+        </div>
+      </section>
+
+      <section class="reviews section" id="reviews">
+        <div class="shell feature-layout">
+          <div class="feature-copy">
+            <p class="section-label">Independent review</p>
+            <h2>Not another chat tab.<br>An evidence-bound review.</h2>
+            <p>
+              Select an author and press <kbd>v RET</kbd>. Magnus asks that
+              agent which committed range belongs to the task, validates it,
+              and runs a fresh reviewer headlessly in an isolated checkout.
+            </p>
+            <ul class="check-list">
+              <li>Defaults to the provider opposite the author</li>
+              <li>Publishes only a successful structured result</li>
+              <li>Anchors findings to the immutable Git diff</li>
+              <li>Preserves reviewer identity across follow-up rounds</li>
+              <li>Keeps unfinished execution disposable</li>
+            </ul>
+            <a class="text-link" href="https://github.com/hrishikeshs/magnus/blob/master/docs/reviews.md">Read the review guide <span aria-hidden="true">→</span></a>
+          </div>
+
+          <figure class="product-shot review-shot">
+            <a class="image-link" href="assets/magnus-review.webp"
+               aria-label="Open the full-size Magnus review image">
+              <img src="assets/magnus-review.webp"
+                   width="1200" height="1270" loading="lazy"
+                   alt="A synthetic Magnus review with findings anchored beneath the exact Git diff they discuss">
+            </a>
+            <figcaption>
+              Findings live beside the code they discuss, with Magit-style
+              folding and round navigation. <a href="assets/magnus-review.webp">Open the full-size image.</a>
+            </figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section class="difference section">
+        <div class="shell">
+          <div class="section-heading">
+            <p class="section-label">What Magnus does differently</p>
+            <h2>Native where it matters.<br>Opinionated where it helps.</h2>
+          </div>
+
+          <div class="principle-grid">
+            <article>
+              <span class="principle-glyph" aria-hidden="true">⌁</span>
+              <h3>Preserve the provider</h3>
+              <p>Magnus does not replace Claude Code or Codex with a generic chat buffer. Both run directly in <code>vterm</code>.</p>
+            </article>
+            <article>
+              <span class="principle-glyph" aria-hidden="true">◎</span>
+              <h3>Keep humans in the loop</h3>
+              <p>The status buffer makes a small team legible while you keep visiting, steering, and judging each agent's work.</p>
+            </article>
+            <article>
+              <span class="principle-glyph" aria-hidden="true">↻</span>
+              <h3>Persist useful outcomes</h3>
+              <p>Identity, memory, context, and successful reviews survive. Stale queries and half-finished reviewer runs do not.</p>
+            </article>
+            <article>
+              <span class="principle-glyph" aria-hidden="true">◇</span>
+              <h3>Stay inspectable</h3>
+              <p>No Magnus daemon, hosted backend, provider plugin, or agent skill. Coordination is Markdown; reviews are local artifacts.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="architecture section">
+        <div class="shell architecture-card">
+          <div>
+            <p class="section-label">A thin control plane</p>
+            <h2>Emacs stays the cockpit.</h2>
+            <p>
+              Magnus launches your configured CLIs and uses their normal
+              authentication and network behavior. Around them it adds durable
+              identity, a single terminal-delivery path, project coordination,
+              local traces, and exact-evidence review.
+            </p>
+            <a class="text-link" href="https://github.com/hrishikeshs/magnus/blob/master/docs/architecture.md">Explore the architecture <span aria-hidden="true">→</span></a>
+          </div>
+          <div class="architecture-flow" role="group" aria-label="Magnus architecture flow">
+            <div class="flow-node provider-node">Claude Code</div>
+            <div class="flow-line" aria-hidden="true"></div>
+            <div class="flow-node center-node">Magnus<br><small>Emacs</small></div>
+            <div class="flow-line" aria-hidden="true"></div>
+            <div class="flow-node provider-node">Codex</div>
+            <p>native TUI · durable identity · coordination · review</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="install section ink-section" id="install">
+        <div class="shell install-layout">
+          <div>
+            <p class="section-label">Start in sixty seconds</p>
+            <h2>Your agents already know the terminal.<br>Bring them home.</h2>
+            <p>
+              Install and authenticate Claude Code or Codex first. Install both
+              for the default cross-provider review workflow.
+            </p>
+          </div>
+          <div class="install-card">
+            <div class="code-title"><span>MELPA</span><span>Emacs Lisp</span></div>
+            <pre><code>(use-package magnus
+  :ensure t
+  :bind (("C-c m" . magnus)))</code></pre>
+            <ol>
+              <li>Restart if replacing a loaded version.</li>
+              <li>Run <code>M-x magnus-doctor</code>.</li>
+              <li>Run <code>M-x magnus</code>.</li>
+            </ol>
+            <div class="install-links">
+              <a href="https://melpa.org/#/magnus">MELPA</a>
+              <a href="https://github.com/hrishikeshs/magnus/blob/master/docs/getting-started.md">Other installers</a>
+              <a href="https://github.com/hrishikeshs/magnus/blob/master/docs/reference.md">Command reference</a>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="faq section" id="faq">
+        <div class="shell narrow">
+          <p class="section-label">Questions</p>
+          <h2>Before you install</h2>
+
+          <details>
+            <summary>Do I need both Claude Code and Codex?</summary>
+            <p>No. One provider is enough for interactive agents. Install both when you want Magnus to choose the other provider for independent review.</p>
+          </details>
+          <details>
+            <summary>Does Magnus replace the provider interface?</summary>
+            <p>No. Interactive agents run in their native terminal interfaces inside <code>vterm</code>. Magnus adds coordination and lifecycle around them.</p>
+          </details>
+          <details>
+            <summary>Does Magnus run a server or upload my review artifacts?</summary>
+            <p>No Magnus daemon or hosted service is involved. Durable Magnus state and completed review artifacts remain on your machine. Provider CLIs keep their normal network behavior.</p>
+          </details>
+          <details>
+            <summary>Can Magnus review uncommitted work?</summary>
+            <p>No. Reviews intentionally require a clean worktree and exact committed evidence. Ask the author to commit first.</p>
+          </details>
+          <details>
+            <summary>Is this an autonomous agent swarm?</summary>
+            <p>No. Magnus is optimized for hands-on programmers directing a small team and stepping into native agent sessions whenever judgment is needed.</p>
+          </details>
+        </div>
+      </section>
+
+      <section class="closing">
+        <div class="shell closing-inner">
+          <p class="eyebrow"><span></span> Built for the Emacs way</p>
+          <h2>See the team.<br>Stay in the loop.</h2>
+          <div class="actions">
+            <a class="button primary" href="https://melpa.org/#/magnus">Install Magnus</a>
+            <a class="button secondary" href="https://github.com/hrishikeshs/magnus">Read the code</a>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="shell footer-inner">
+        <div>
+          <a class="brand" href="#top">
+            <span class="brand-mark" aria-hidden="true">M</span>
+            <span>Magnus</span>
+          </a>
+          <p>A Magit-inspired control room for Claude Code and Codex.</p>
+        </div>
+        <nav aria-label="Footer navigation">
+          <a href="https://github.com/hrishikeshs/magnus">GitHub</a>
+          <a href="https://melpa.org/#/magnus">MELPA</a>
+          <a href="https://github.com/hrishikeshs/magnus/blob/master/NEWS.md">Release notes</a>
+          <a href="https://github.com/hrishikeshs/magnus/blob/master/LICENSE">MIT license</a>
+        </nav>
+      </div>
+    </footer>
+  </body>
+</html>

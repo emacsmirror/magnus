@@ -41,8 +41,8 @@ provider-neutral, resource-bounded agent workspace.
 
 ### Resource hardening
 
-- Reviews use the shared single-process background FIFO and time out abandoned
-  provider runs so the queue can continue.
+- Independent reviews own their headless provider processes directly, may run
+  concurrently, and time out abandoned provider runs independently.
 - Expertise indexing, retrospectives, and optional dashboard generations share
   one low-priority FIFO with a single active process and bounded queue, output,
   and timeout settings; expertise indexing also bounds memory input.
