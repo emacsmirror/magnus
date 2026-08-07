@@ -48,8 +48,7 @@ interfaces instead of replacing them with another chat UI.
 Create, visit, steer, rename, archive, and resurrect named agents such as
 `swift-fox` and `keen-owl`. Each agent has its own terminal and working
 directory. Magnus preserves provider sessions when they are available, so an
-archived collaborator can return with its conversation intact. Live process
-suspend and resume is currently Claude-only.
+archived collaborator can return with its conversation intact.
 
 ### Agent Coordination
 
