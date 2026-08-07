@@ -43,6 +43,18 @@ Streaming output, approval prompts, slash commands, and the terminal composer
 keep working as they do outside Emacs. Magnus adds orchestration around those
 interfaces instead of replacing them with another chat UI.
 
+### Other coding agents
+
+Magnus ships with Claude Code and Codex support, but the provider layer is
+open. If you want to use another agent, you just need to write an adapter for
+it. Register the lifecycle, messaging, trace, and headless operations that its
+CLI supports; Magnus's shared layers continue to provide identity, persistence,
+coordination, attention, and status.
+
+See [`magnus-provider.el`](magnus-provider.el) for the small dispatch interface
+and [`magnus-provider-codex.el`](magnus-provider-codex.el) for a complete
+interactive and headless adapter.
+
 ### Instance Management
 
 Create, visit, steer, rename, archive, and resurrect named agents such as
