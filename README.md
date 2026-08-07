@@ -3,7 +3,7 @@
 [![MELPA](https://melpa.org/packages/magnus-badge.svg)](https://melpa.org/#/magnus)
 [![CI](https://github.com/hrishikeshs/magnus/actions/workflows/ci.yml/badge.svg)](https://github.com/hrishikeshs/magnus/actions/workflows/ci.yml)
 
-A magit-inspired interface for managing Claude Code and Codex agents within Emacs.
+A magit-inspired interface for managing multiple Claude Code and Codex instances within Emacs.
 
 Run multiple AI agents in parallel, let them communicate to avoid conflicts,
 and handle their permission requests one at a time.
@@ -142,8 +142,23 @@ Magnus is available from MELPA:
 
 Or run `M-x package-install RET magnus RET`.
 
-See [Getting started](docs/getting-started.md) for `package-vc`, `straight.el`,
-and `quelpa` installation, provider setup, and `M-x magnus-doctor`.
+### From GitHub (Emacs 29+)
+
+Install the latest revision directly:
+
+```text
+M-x package-vc-install RET https://github.com/hrishikeshs/magnus RET
+```
+
+Or add it to your configuration:
+
+```elisp
+(unless (package-installed-p 'magnus)
+  (package-vc-install "https://github.com/hrishikeshs/magnus"))
+```
+
+See [Getting started](docs/getting-started.md) for `straight.el` and `quelpa`
+installation, provider setup, upgrades, and `M-x magnus-doctor`.
 
 ## Quick start
 
@@ -158,6 +173,77 @@ and `quelpa` installation, provider setup, and `M-x magnus-doctor`.
 Press `?` in `*magnus*` for the complete dispatcher. The minibuffer shows
 contextual actions as point moves. In an agent terminal, `C-g` sends Escape to
 the provider TUI because Emacs normally reserves `ESC` as a Meta prefix.
+
+## Command reference
+
+The main interactive entry points are:
+
+| Command | Purpose |
+|---------|---------|
+| `M-x magnus` | Open the status buffer |
+| `M-x magnus-create-instance` | Create a Claude Code agent |
+| `M-x magnus-create-codex` | Create a Codex agent |
+| `M-x magnus-create-headless` | Run a one-off headless Claude task |
+| `M-x magnus-context` | Open the current project's shared context |
+| `M-x magnus-doctor` | Check dependencies, storage, and runtime health |
+| `M-x magnus-upgrade` | Reinstall Magnus with a guarded agent shutdown |
+
+Inside `*magnus*`, press `?` for the contextual command menu. See the full
+[command reference](docs/reference.md) for status, trace, context, and review
+commands.
+
+## Customization
+
+Magnus uses ordinary Emacs customization variables. For example:
+
+```elisp
+;; Provider executables.
+(setq magnus-claude-executable "/path/to/claude")
+(setq magnus-codex-executable "/path/to/codex")
+
+;; Default project for new agents.
+(setq magnus-default-directory "~/workspace")
+
+;; UI and coordination.
+(setq magnus-status-show-context-hints t)
+(setq magnus-coord-reminder-interval 600)
+(setq magnus-attention-auto-approve-patterns nil)
+
+;; Independent review defaults.
+(setq magnus-review-default-provider nil) ; use the opposite provider
+(setq magnus-review-default-effort 'high)
+```
+
+Run `M-x customize-group RET magnus RET` to browse every option. The
+[customization reference](docs/reference.md#common-customization) covers
+monitoring, traces, background work, review timeouts, and storage.
+
+## Architecture
+
+Magnus is a thin Emacs control plane around the native provider tools:
+
+```text
+magnus/
+├── magnus.el                          # Entry point and top-level setup
+├── magnus-{instances,persistence}.el  # Durable agent identity and state
+├── magnus-{process,terminal}.el        # Lifecycle and automated TUI delivery
+├── magnus-provider.el                  # Provider registry and dispatch
+├── magnus-provider-{claude,codex}.el   # Claude and Codex adapters
+├── magnus-{status,transient}.el        # Status buffer and contextual actions
+├── magnus-{coord,onboarding}.el        # Shared journal, memory, instructions
+├── magnus-{attention,health}.el        # Permission queue and liveness signals
+├── magnus-{trace,context}.el           # Provider history and shared notes
+├── magnus-{headless,background}.el     # Bounded noninteractive model work
+├── magnus-review.el                    # Durable lineages and Git evidence
+├── magnus-review-controller.el         # Ephemeral review orchestration
+├── magnus-review-ui.el                 # Magit-style review reader
+└── magnus-{doctor,environment}.el      # Diagnostics and process environment
+```
+
+There is no Magnus daemon or replacement chat runtime. The provider CLIs own
+their authentication, network behavior, approvals, and terminal interfaces.
+See the [architecture deep dive](docs/architecture.md) for lifecycle,
+coordination, persistence, trust boundaries, and review publication.
 
 ## Documentation
 
