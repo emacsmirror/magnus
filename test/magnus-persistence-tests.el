@@ -90,8 +90,8 @@
                  (magnus-persistence-tests--instance "valid")))
          (unsafe-name (copy-sequence valid))
          (unsafe-id (copy-sequence valid)))
-    (plist-put unsafe-name :name "../outside")
-    (plist-put unsafe-id :id "../../writer")
+    (setq unsafe-name (plist-put unsafe-name :name "../outside"))
+    (setq unsafe-id (plist-put unsafe-id :id "../../writer"))
     (dolist (state (list (list unsafe-name) (list unsafe-id)))
       (should-error (magnus-persistence--deserialize-state state)))))
 
