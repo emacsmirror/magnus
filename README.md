@@ -30,7 +30,7 @@ But this creates problems:
 - **File conflicts**: Agents might edit the same files
 - **Context sharing**: How do agents know what others are doing?
 - **Permission chaos**: Multiple agents asking for input at once
-- **Cross-model review**: Request a review of one model's work from another easily
+- How to get a different model to review the work produced by a given model?
 
 Magnus solves all of this.
 
