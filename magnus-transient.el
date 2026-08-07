@@ -36,7 +36,11 @@
 (declare-function magnus-project-root "magnus")
 (declare-function magnus-status--get-review-at-point "magnus-status")
 (declare-function magnus-review-ui-open "magnus-review-ui")
-(declare-function magnus-doctor "magnus-doctor")
+
+;; Source checkouts do not have package-generated autoloads.  Keep Doctor lazy
+;; while ensuring Transient can validate the suffix before its first use.
+(autoload 'magnus-doctor "magnus-doctor"
+  "Open a read-only report of Magnus installation and runtime health." t)
 
 (defvar magnus--creation-task)
 

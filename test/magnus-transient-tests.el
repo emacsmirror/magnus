@@ -93,6 +93,27 @@ layout representation, which differs between supported Transient releases."
 (ert-deftest magnus-transient-shipped-create-menu-remains-a-command ()
   (should (commandp 'magnus-create-dispatch)))
 
+(ert-deftest magnus-transient-main-menu-opens-from-a-source-checkout ()
+  "The main menu must not depend on package-generated autoloads."
+  (let ((emacs (expand-file-name invocation-name invocation-directory))
+        (test-directory
+         (expand-file-name "test" magnus-test-project-directory)))
+    (with-temp-buffer
+      (should
+       (= 0
+          (call-process
+           emacs nil (current-buffer) nil
+           "--batch" "-Q"
+           "-L" magnus-test-project-directory
+           "-L" test-directory
+           "-l" "test-helper"
+           "--eval"
+           (concat
+            "(progn (mapc #'require "
+            "'(magnus-context magnus-coord magnus-attention magnus-health "
+            "magnus-review-ui magnus-status magnus-transient)) "
+            "(transient-setup 'magnus-dispatch))")))))))
+
 (ert-deftest magnus-transient-create-codex-forwards-task-and-provider ()
   (let (arguments creation-task refreshed)
     (cl-letf (((symbol-function 'read-string)
