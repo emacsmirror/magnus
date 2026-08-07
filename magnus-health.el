@@ -15,12 +15,14 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'magnus-instances)
+(require 'magnus-background)
 
 (declare-function magnus-process-running-p "magnus-process")
 
 (defvar magnus-claude-executable)
-(declare-function magnus--headless-command "magnus")
+(defvar magnus-headless-model)
 (declare-function magnus--strip-thinking-markers "magnus")
 
 ;;; Customization
@@ -43,6 +45,13 @@
 (defcustom magnus-health-hash-chars 1000
   "Number of characters from end of buffer to hash for change detection."
   :type 'integer
+  :group 'magnus)
+
+(defcustom magnus-health-dashboard-ai-messages nil
+  "When non-nil, generate optional AI messages for the health dashboard.
+The bundled static message rotation remains available when this is nil.  AI
+generation uses Magnus's single bounded background queue."
+  :type 'boolean
   :group 'magnus)
 
 ;;; Faces
@@ -281,7 +290,7 @@ Returns one of: ok, stale, stuck, dead, or nil if unknown."
     "I don't always test my code, but when I do, I do it in production with headless agents."
     "Life is too short for modal editing. Unless you're in evil-mode."
     "The cloud is just someone else's Emacs running on a server somewhere."
-    "Behind every successful project is a .magnus-coord.md file nobody read."
+    "Behind every successful project is a coordination file somebody almost read."
     "Talk is cheap. Show me the defun."
     "sudo make me a sandwich. M-x make-me-a-sandwich."
     "There is no place like 127.0.0.1 and no editor like GNU Emacs."
@@ -317,40 +326,36 @@ points. Under 100 characters each. Be fresh and topical."
 (defvar magnus-health-dashboard--gen-output ""
   "Accumulated stdout from the generator process.")
 
+(defconst magnus-health-dashboard--job-key 'health-dashboard-messages
+  "Background queue key for optional dashboard message generation.")
+
 (defun magnus-health-dashboard--generate-messages ()
-  "Fire a lightweight Claude process to generate fresh dashboard messages.
-Uses `--print' mode with no tools — just text generation.
-Falls back silently to the static list if generation fails."
-  (when (and (not magnus-health-dashboard--generating)
-             (bound-and-true-p magnus-claude-executable)
-             (executable-find magnus-claude-executable))
+  "Queue a text-only Claude job to generate fresh dashboard messages.
+The static list remains active while the optional job waits or fails."
+  (when (and magnus-health-dashboard-ai-messages
+             (not magnus-health-dashboard--generating)
+             (bound-and-true-p magnus-claude-executable))
     (setq magnus-health-dashboard--generating t
           magnus-health-dashboard--gen-output "")
-    (condition-case err
-        (let ((process-environment
-               (cl-remove-if
-                (lambda (e) (string-prefix-p "CLAUDECODE=" e))
-                process-environment)))
-          (let ((proc (make-process
-                       :name "magnus-health-bloomberg-gen"
-                       :command (magnus--headless-command
-                                     magnus-health-dashboard--gen-prompt t)
-                       :connection-type 'pipe
-                       :filter (lambda (_proc output)
-                                 (setq magnus-health-dashboard--gen-output
-                                       (concat magnus-health-dashboard--gen-output output)))
-                       :sentinel (lambda (_proc event)
-                                   (let ((status (string-trim event)))
-                                     (if (string-prefix-p "finished" status)
-                                         (magnus-health-dashboard--parse-gen-output)
-                                       (message "Magnus terminal: generator %s" status))
-                                     (setq magnus-health-dashboard--generating nil))))))
-            ;; Close stdin so claude doesn't block waiting for input
-            (when (process-live-p proc)
-              (process-send-eof proc))))
-      (error
-       (setq magnus-health-dashboard--generating nil)
-       (message "Magnus terminal: %s" (error-message-string err))))))
+    (unless
+        (magnus-background-submit
+         magnus-health-dashboard--job-key 'claude
+         (list :purpose 'agent
+               :directory (expand-file-name "~")
+               :prompt magnus-health-dashboard--gen-prompt
+               :allowed-tools ""
+               :model (and (boundp 'magnus-headless-model)
+                           magnus-headless-model)
+               :name "dashboard-fortunes")
+         (list
+          :on-complete
+          (lambda (result)
+            (setq magnus-health-dashboard--generating nil)
+            (when (plist-get result :success-p)
+              (setq magnus-health-dashboard--gen-output
+                    (plist-get result :output))
+              (magnus-health-dashboard--parse-gen-output)))))
+      (setq magnus-health-dashboard--generating nil))))
 
 (defun magnus-health-dashboard--parse-gen-output ()
   "Parse generator output into individual messages and add to queue."
@@ -553,7 +558,7 @@ the side window from flickering or resizing."
       (window-preserve-size win nil t)))
   (setq magnus-health-dashboard--timer
         (run-with-timer 0 0.5 #'magnus-health-dashboard--update))
-  ;; Pre-generate fresh messages
+  ;; Opt-in generation shares Magnus's serialized background runner.
   (magnus-health-dashboard--generate-messages)
   (message "MAGNUS TERMINAL ONLINE"))
 
@@ -562,10 +567,8 @@ the side window from flickering or resizing."
   (when magnus-health-dashboard--timer
     (cancel-timer magnus-health-dashboard--timer)
     (setq magnus-health-dashboard--timer nil))
-  ;; Kill any running generator process
-  (when-let ((proc (get-process "magnus-health-bloomberg-gen")))
-    (when (process-live-p proc)
-      (delete-process proc)))
+  ;; Remove only this dashboard's work.  Indexing and retros keep their place.
+  (magnus-background-cancel magnus-health-dashboard--job-key)
   (setq magnus-health-dashboard--generating nil
         magnus-health-dashboard--msg-queue nil)
   (when-let ((buf (get-buffer magnus-health-dashboard--buffer)))
@@ -573,6 +576,14 @@ the side window from flickering or resizing."
       (delete-window win))
     (kill-buffer buf))
   (message "MAGNUS TERMINAL OFFLINE"))
+
+(defun magnus-health-shutdown ()
+  "Stop health monitoring and every optional dashboard resource."
+  (magnus-health-stop)
+  (when (or magnus-health-dashboard--timer
+            magnus-health-dashboard--generating
+            (get-buffer magnus-health-dashboard--buffer))
+    (magnus-health-dashboard--stop)))
 
 (provide 'magnus-health)
 ;;; magnus-health.el ends here

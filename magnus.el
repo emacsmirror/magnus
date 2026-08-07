@@ -1,11 +1,11 @@
-;;; magnus.el --- Manage multiple Claude Code instances -*- lexical-binding: t -*-
+;;; magnus.el --- Manage multiple AI coding agents -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2026 Hrishikesh S
 
 ;; Author: Hrishikesh S <hrish2006@gmail.com>
 ;; Maintainer: Hrishikesh S <hrish2006@gmail.com>
-;; Version: 0.1.0
-;; Package-Requires: ((emacs "28.1") (vterm "0.0.2") (transient "0.4.0"))
+;; Version: 0.2.0
+;; Package-Requires: ((emacs "28.1") (vterm "0.0.2") (transient "0.4.0") (magit-section "3.3.0"))
 ;; Keywords: tools, processes, convenience
 ;; URL: https://github.com/hrishikeshs/magnus
 ;; SPDX-License-Identifier: MIT
@@ -32,23 +32,30 @@
 
 ;;; Commentary:
 
-;; Magnus is a magit-inspired interface for managing multiple Claude Code
-;; instances within Emacs.  It provides a status buffer showing all active
-;; instances and transient menus for quick actions.
+;; Magnus is a Magit-inspired interface for hands-on management of Claude Code
+;; and Codex agents in Emacs.  Interactive agents retain their native terminal
+;; UIs while Magnus supplies durable identities, shared onboarding, lifecycle
+;; management, attention and health monitoring, and a shared coordination
+;; journal.
+;; Committed work can be sent to a headless reviewer from either provider and
+;; read as a structured, folding Git diff.
 ;;
 ;; Main entry point: M-x magnus
+;; Installation diagnostics: M-x magnus-doctor
 ;;
 ;; Key bindings in magnus buffer:
-;;   RET - Switch to instance
-;;   c   - Create new instance
+;;   RET - Visit instance or review
+;;   c   - Create a Claude Code instance
 ;;   k   - Archive instance
 ;;   r   - Rename instance
+;;   v   - Request an independent review
 ;;   g   - Refresh status
 ;;   ?   - Show help menu
 
 ;;; Code:
 
 (require 'cl-lib)
+(require 'magnus-environment)
 (require 'magnus-instances)
 
 (declare-function magnus-persistence-load "magnus-persistence")
@@ -69,15 +76,24 @@
 (declare-function magnus-health-start "magnus-health")
 (declare-function magnus-coord-setup-attention-tracking "magnus-coord")
 (declare-function magnus-coord-attention-load "magnus-coord")
-(declare-function magnus-coord-stop-reminders "magnus-coord")
 (declare-function magnus-coord-nudge-agent "magnus-coord")
-(declare-function magnus-retro "magnus-coord")
-(declare-function magnus-health-stop "magnus-health")
-(declare-function magnus-attention-stop "magnus-attention")
 (declare-function magnus-instances-active-list "magnus-instances")
 (declare-function magnus-process-archive "magnus-process")
 (declare-function magnus-process--agent-memory-path "magnus-process")
 (declare-function magnus-persistence-save "magnus-persistence")
+(declare-function magnus-review-load-all "magnus-review")
+(declare-function magnus-review-controller-setup "magnus-review-controller")
+(declare-function magnus-review-controller-shutdown "magnus-review-controller")
+(declare-function magnus-status-shutdown "magnus-status")
+(declare-function magnus-persistence-shutdown "magnus-persistence")
+(declare-function magnus-context-shutdown "magnus-context")
+(declare-function magnus-coord-shutdown "magnus-coord")
+(declare-function magnus-attention-shutdown "magnus-attention")
+(declare-function magnus-health-shutdown "magnus-health")
+(declare-function magnus-trace-stop-timer "magnus-trace")
+(declare-function magnus-background-submit "magnus-background")
+(declare-function magnus-background-setup "magnus-background")
+(declare-function magnus-background-shutdown "magnus-background")
 
 (defvar magnus-context-directory)
 (defvar magnus-context-cache-directory)
@@ -85,12 +101,13 @@
 ;;; Customization
 
 (defgroup magnus nil
-  "Manage multiple Claude Code instances."
+  "Manage multiple AI coding agents."
   :group 'tools
   :prefix "magnus-")
 
 (defcustom magnus-claude-executable "claude"
-  "Path to the Claude Code executable."
+  "Claude Code executable or command prefix.
+The value may include established command-line arguments."
   :type 'string
   :group 'magnus)
 
@@ -101,6 +118,13 @@ indexing, and smart resurrection matching.  When nil, no --model flag
 is passed and Claude uses its default model."
   :type '(choice (const :tag "Default (no --model flag)" nil)
                  (string :tag "Model name"))
+  :group 'magnus)
+
+(defcustom magnus-expertise-match-timeout 15
+  "Maximum seconds a synchronous dormant-expertise match may use.
+The bounded matcher falls back cleanly so an unavailable Claude CLI cannot
+freeze an interactive Magnus review request indefinitely."
+  :type 'number
   :group 'magnus)
 
 (defcustom magnus-default-directory nil
@@ -144,6 +168,11 @@ package reinstalls."
 Maps agent names to expertise keywords extracted by AI.
 Stored in ~/.magnus/ so it survives Emacs config resets."
   :type 'file
+  :group 'magnus)
+
+(defcustom magnus-agents-index-memory-limit (* 64 1024)
+  "Maximum bytes read from an agent memory file for expertise indexing."
+  :type 'integer
   :group 'magnus)
 
 (defcustom magnus-instance-name-generator #'magnus-generate-instance-name
@@ -203,7 +232,9 @@ Plist with :sender and :reason, bound during agent-initiated summoning.")
 When `magnus--creation-task' is set, uses AI to match the task
 against dormant agent memories for smart resurrection.  Falls back
 to most-recent resurrection, then random name generation."
-  (let ((existing (mapcar #'magnus-instance-name (magnus-instances-list))))
+  (let ((existing
+         (append (mapcar #'magnus-instance-name (magnus-instances-list))
+                 (magnus-instances-reserved-names directory))))
     (or (when magnus--creation-task
           (magnus--smart-resurrect directory existing magnus--creation-task))
         (magnus--resurrect-dormant-identity directory existing)
@@ -250,29 +281,47 @@ Returns the name of the most recently active dormant identity, or nil."
 EXISTING is the list of names currently in use.
 Uses a synchronous `claude --print' call to find the best match.
 Returns the chosen name, or nil if no match or user declines."
-  (let ((candidates (magnus--dormant-candidates directory existing)))
+  (when-let ((match (magnus-expertise-match directory task existing)))
+    (let ((name (plist-get match :name))
+          (reason (plist-get match :reason)))
+      (when (y-or-n-p (format "Resurrect %s? (%s) " name reason))
+        name))))
+
+(defun magnus-expertise-match (directory task &optional exclusions)
+  "Return the dormant identity whose expertise best matches TASK.
+DIRECTORY identifies the project and EXCLUSIONS is a list of identity names
+that cannot be selected.  The result is a plist containing :name, :reason,
+and :expertise, or nil when no suitable identity is available.
+
+This function performs matching only.  Unlike `magnus--smart-resurrect', it
+does not prompt, resume a provider session, or otherwise change lifecycle
+state, so other workflows such as independent reviews can reuse it."
+  (let ((candidates (magnus-expertise-candidates directory exclusions)))
     (when candidates
       (message "Matching task to dormant agents...")
       (when-let ((output (magnus--run-match-sync
                           (magnus--build-match-prompt candidates task))))
         (when-let ((match (magnus--parse-match-output output candidates)))
-          (let ((name (car match))
-                (reason (cdr match)))
-            (when (y-or-n-p (format "Resurrect %s? (%s) " name reason))
-              name)))))))
+          (let ((name (car match)))
+            (list :name name
+                :reason (cdr match)
+                :expertise (magnus--agents-index-get
+                            directory name)
+                :summary (cdr (assoc name candidates)))))))))
 
-(defun magnus--dormant-candidates (directory existing)
-  "Return dormant agent candidates in DIRECTORY.
-EXISTING is the list of names to exclude.
-Returns an alist of (NAME . SUMMARY) pairs, using expertise index
-tags when available, falling back to memory excerpt."
+(defun magnus-expertise-candidates (directory &optional exclusions)
+  "Return dormant expertise candidates for DIRECTORY.
+EXCLUSIONS is a list of identity names to omit.  The return value is an alist
+of (NAME . SUMMARY), using indexed expertise when available and a bounded
+memory excerpt otherwise."
   (let* ((agents-dir (expand-file-name ".claude/agents/" directory))
-         (candidates nil))
+         candidates)
     (when (file-directory-p agents-dir)
       (dolist (entry (directory-files agents-dir nil "\\`[^.]"))
-        (let ((memory (expand-file-name (concat entry "/memory.md") agents-dir)))
+        (let ((memory (expand-file-name (concat entry "/memory.md")
+                                        agents-dir)))
           (when (and (file-exists-p memory)
-                     (not (member entry existing)))
+                     (not (member entry exclusions)))
             (let ((tags (magnus--agents-index-get directory entry)))
               (push (cons entry
                           (if tags
@@ -280,6 +329,13 @@ tags when available, falling back to memory excerpt."
                             (magnus--read-memory-summary memory)))
                     candidates))))))
     (nreverse candidates)))
+
+(defun magnus--dormant-candidates (directory existing)
+  "Return dormant agent candidates in DIRECTORY.
+EXISTING is the list of names to exclude.
+Returns an alist of (NAME . SUMMARY) pairs, using expertise index
+tags when available, falling back to memory excerpt."
+  (magnus-expertise-candidates directory existing))
 
 (defun magnus--read-memory-summary (file)
   "Read the first 500 characters of memory FILE as a summary."
@@ -309,7 +365,8 @@ non-nil.  (In current Claude CLI builds `--bare' fails auth with
 \"Not logged in\"; callers that need a real reply pass NO-BARE and
 sanitize the CLAUDE.md-flavored output themselves.)
 Includes --model flag only when `magnus-headless-model' is set."
-  (append (list magnus-claude-executable)
+  (append (magnus-environment-command-prefix
+           magnus-claude-executable "Claude")
           (unless no-bare (list "--bare"))
           (list "--print")
           (when magnus-headless-model (list "--model" magnus-headless-model))
@@ -319,25 +376,45 @@ Includes --model flag only when `magnus-headless-model' is set."
   "Run `claude --print' synchronously with PROMPT.
 Returns the trimmed output string, or nil on error."
   (condition-case err
-      (when (and (bound-and-true-p magnus-claude-executable)
-                 (executable-find magnus-claude-executable))
+      (when (bound-and-true-p magnus-claude-executable)
         (let ((process-environment
                (cl-remove-if
                 (lambda (e) (string-prefix-p "CLAUDECODE=" e))
                 process-environment)))
           (with-temp-buffer
-            (let ((cmd (magnus--headless-command prompt t)))
-              (apply #'call-process (car cmd) nil t nil (cdr cmd)))
-            ;; no-bare output may carry CLAUDE.md thinking markers; the
-            ;; answer line ("name|reason") is the last line that has a pipe.
-            (let* ((clean (magnus--strip-thinking-markers (buffer-string)))
-                   (lines (seq-filter
-                           (lambda (l) (not (string-empty-p (string-trim l))))
-                           (split-string clean "\n")))
-                   (answer (or (seq-find (lambda (l) (string-match-p "|" l))
-                                         (reverse lines))
-                               (car lines))))
-              (string-trim (or answer ""))))))
+            (let* ((cmd (magnus--headless-command prompt t))
+                   (process
+                    (make-process
+                     :name "magnus-expertise-match"
+                     :buffer (current-buffer)
+                     :command cmd
+                     :connection-type 'pipe
+                     :noquery t))
+                   (deadline (+ (float-time)
+                                (max 0.1 magnus-expertise-match-timeout))))
+              (while (and (process-live-p process)
+                          (< (float-time) deadline))
+                (accept-process-output process 0.05))
+              (when (process-live-p process)
+                (delete-process process)
+                (message "Magnus: expertise match timed out after %.1fs"
+                         magnus-expertise-match-timeout))
+              (when (and (eq (process-status process) 'exit)
+                         (zerop (process-exit-status process)))
+                ;; no-bare output may carry CLAUDE.md thinking markers; the
+                ;; answer line ("name|reason") is the last line with a pipe.
+                (let* ((clean (magnus--strip-thinking-markers (buffer-string)))
+                       (lines
+                        (seq-filter
+                         (lambda (line)
+                           (not (string-empty-p (string-trim line))))
+                         (split-string clean "\n")))
+                       (answer
+                        (or (seq-find
+                             (lambda (line) (string-match-p "|" line))
+                             (reverse lines))
+                            (car lines))))
+                  (string-trim (or answer ""))))))))
     (error (message "Magnus: match sync error: %s" (error-message-string err))
            nil)))
 
@@ -398,51 +475,51 @@ Returns (NAME . REASON) if a valid match was found, or nil."
 
 (defun magnus--agents-index-update (instance)
   "Update the expertise index for INSTANCE asynchronously.
-Reads the agent's memory file and extracts expertise keywords via haiku."
+Reads a bounded prefix of the agent's memory and queues one text-only model
+call.  All Magnus background work is serialized, so archiving many agents does
+not launch many provider processes at once."
   (let* ((name (magnus-instance-name instance))
+         (instance-id (magnus-instance-id instance))
          (directory (magnus-instance-directory instance))
          (memory-path (magnus-process--agent-memory-path instance)))
-    (when (and (file-exists-p memory-path)
-               (bound-and-true-p magnus-claude-executable)
-               (executable-find magnus-claude-executable))
+    (when (and (stringp memory-path)
+               (file-exists-p memory-path)
+               (bound-and-true-p magnus-claude-executable))
       (let* ((memory (with-temp-buffer
-                       (insert-file-contents memory-path)
+                       (insert-file-contents
+                        memory-path nil 0
+                        (max 0 magnus-agents-index-memory-limit))
                        (buffer-string)))
              (prompt (format "Read this agent memory and extract 3-5 expertise \
 keywords that describe what this agent knows. Reply with ONLY comma-separated \
 lowercase keywords, nothing else.\n\nMemory:\n%s" memory))
-             (process-environment
-              (cl-remove-if
-               (lambda (e) (string-prefix-p "CLAUDECODE=" e))
-               process-environment)))
-        (condition-case err
-            (let ((proc (make-process
-                         :name (format "magnus-index-%s" name)
-                         :command (magnus--headless-command prompt t)
-                         :connection-type 'pipe
-                         :filter (lambda (proc output)
-                                   (process-put
-                                    proc :output
-                                    (concat (or (process-get proc :output) "")
-                                            output)))
-                         :sentinel (magnus--agents-index-sentinel
-                                    directory name))))
-              (when (process-live-p proc)
-                (process-send-eof proc)))
-          (error (message "Magnus: index update error for %s: %s"
-                          name (error-message-string err))))))))
-
-(defun magnus--agents-index-sentinel (directory name)
-  "Return a process sentinel for indexing agent NAME in DIRECTORY."
-  (lambda (proc event)
-    (let ((status (string-trim event)))
-      (if (string-prefix-p "finished" status)
-          (let ((tags (magnus--sanitize-expertise
-                       (or (process-get proc :output) ""))))
-            (unless (string-empty-p tags)
-              (magnus--agents-index-set directory name tags)
-              (message "Magnus: indexed %s → %s" name tags)))
-        (message "Magnus: indexing %s failed: %s" name status)))))
+             (key (list 'expertise instance-id)))
+        (magnus-background-submit
+         key 'claude
+         (list :purpose 'agent
+               :directory directory
+               :prompt prompt
+               :allowed-tools ""
+               :model magnus-headless-model
+               :name (format "index-%s" name))
+         (list
+          :on-complete
+          (lambda (result)
+            (when (plist-get result :success-p)
+              (let ((current (magnus-instances-get instance-id))
+                    (tags
+                     (magnus--sanitize-expertise
+                      (plist-get result :output))))
+                ;; A queued archive job may finish after a transactional rename
+                ;; or directory move.  Never publish metadata under its stale
+                ;; identity; the next archive/reindex can submit fresh evidence.
+                (when (and current
+                           (equal name (magnus-instance-name current))
+                           (equal directory
+                                  (magnus-instance-directory current))
+                           (not (string-empty-p tags)))
+                  (magnus--agents-index-set directory name tags)
+                  (message "Magnus: indexed %s → %s" name tags)))))))))))
 
 (defun magnus--strip-thinking-markers (raw)
   "Strip [thinking]...[end-thinking] blocks and marker lines from RAW.
@@ -527,28 +604,47 @@ them now; new agents populate once their memory file exists."
     (user-error
      "Magnus was upgraded in this Emacs session; restart Emacs before use"))
   (unless magnus--initialized
-    (require 'magnus-instances)
-    (require 'magnus-persistence)
-    (require 'magnus-process)
-    (require 'magnus-status)
-    (require 'magnus-transient)
-    (require 'magnus-context)
-    (require 'magnus-coord)
-    (require 'magnus-attention)
-    (require 'magnus-health)
-    (magnus--migrate-data-files)
-    (magnus-persistence-load)
-    (magnus--agents-index-load)
-    (magnus-persistence--setup-autosave)
-    (magnus-coord-ensure-watchers)
-    (magnus-context-setup-hooks)
-    (magnus-attention-setup-hooks)
-    (magnus-attention-start)
-    (magnus-coord-start-reminders)
-    (magnus-health-start)
-    (magnus-coord-attention-load)
-    (magnus-coord-setup-attention-tracking)
-    (setq magnus--initialized t)))
+    (let ((complete nil))
+      (unwind-protect
+          (progn
+            (require 'magnus-instances)
+            (require 'magnus-persistence)
+            (require 'magnus-process)
+            (require 'magnus-background)
+            (require 'magnus-context)
+            (require 'magnus-coord)
+            (require 'magnus-attention)
+            (require 'magnus-health)
+            (require 'magnus-review)
+            (require 'magnus-review-controller)
+            (require 'magnus-review-ui)
+            (require 'magnus-status)
+            (require 'magnus-transient)
+            (magnus--migrate-data-files)
+            (magnus-persistence-load)
+            (magnus--agents-index-load)
+            (magnus-background-setup)
+            ;; Completed review lineages load before the controller attaches
+            ;; its entirely in-memory scope and execution machinery.
+            (magnus-review-load-all)
+            (magnus-persistence--setup-autosave)
+            (add-hook 'kill-emacs-hook #'magnus--shutdown)
+            (magnus-review-controller-setup)
+            (magnus-coord-ensure-watchers)
+            (magnus-context-setup-hooks)
+            (magnus-attention-setup-hooks)
+            (magnus-attention-start)
+            (magnus-coord-start-reminders)
+            (magnus-health-start)
+            (magnus-coord-attention-load)
+            (magnus-coord-setup-attention-tracking)
+            (setq magnus--initialized t
+                  complete t))
+        ;; Any setup step may have installed a hook, launched a reviewer, or
+        ;; allocated a timer before failing.  Teardown functions are idempotent,
+        ;; so unwind without guessing how far initialization progressed.
+        (unless complete
+          (magnus--shutdown))))))
 
 ;;;###autoload
 (defun magnus ()
@@ -590,17 +686,36 @@ The agent runs to completion and exits."
 
 ;;; Upgrade
 
-(defvar magnus-persistence--save-timer)
+(defun magnus--shutdown-subsystem (function)
+  "Call teardown FUNCTION without preventing the remaining cleanup.
+Return non-nil when FUNCTION completed successfully or is unavailable."
+  (if (not (fboundp function))
+      t
+    (condition-case err
+        (progn
+          (funcall function)
+          t)
+      (error
+       (message "Magnus: %s failed during shutdown: %s"
+                function (error-message-string err))
+       nil))))
 
 (defun magnus--shutdown ()
   "Stop all Magnus timers, watchers, and hooks."
-  (magnus-coord-stop-reminders)
-  (magnus-health-stop)
-  (magnus-attention-stop)
-  (when magnus-persistence--save-timer
-    (cancel-timer magnus-persistence--save-timer)
-    (setq magnus-persistence--save-timer nil))
-  (setq magnus--initialized nil))
+  (unwind-protect
+      (dolist (function
+               '(magnus-review-controller-shutdown
+                 magnus-status-shutdown
+                 magnus-trace-stop-timer
+                 magnus-coord-shutdown
+                 magnus-health-shutdown
+                 magnus-background-shutdown
+                 magnus-attention-shutdown
+                 magnus-context-shutdown
+                 magnus-persistence-shutdown))
+        (magnus--shutdown-subsystem function))
+    (remove-hook 'kill-emacs-hook #'magnus--shutdown)
+    (setq magnus--initialized nil)))
 
 (defun magnus--upgrade-execute ()
   "Archive all agents, save state, and reinstall Magnus.

@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        emacs-version: ['28.1', '29.1']
+        emacs-version: ['28.1', '29.4', '30.2']
     steps:
       - uses: actions/checkout@v4
 
@@ -19,8 +19,23 @@ jobs:
         with:
           version: ${{ matrix.emacs-version }}
 
+      - name: Cache ELPA packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.emacs.d/elpa
+          key: elpa-${{ runner.os }}-emacs-${{ matrix.emacs-version }}-${{ hashFiles('test/install-ci-dependencies.el') }}
+
+      - name: Install test dependencies
+        run: emacs --batch -Q -l test/install-ci-dependencies.el
+
       - name: Lint
         run: make lint
+
+      - name: Byte compile
+        run: make lint-compile
+
+      - name: Package metadata
+        run: make package-lint
 
       - name: Test
         run: make test

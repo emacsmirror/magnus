@@ -7,6 +7,12 @@
 (defvar lint-ok t "Set to nil on any failure.")
 (defvar lint-do-compile nil "Non-nil to byte-compile files.")
 
+(defconst lint-project-directory
+  (file-name-as-directory
+   (expand-file-name
+    (file-name-directory (or load-file-name buffer-file-name))))
+  "Directory containing the Magnus sources being checked.")
+
 (defun lint-files ()
   "Return the list of .el files from command-line args."
   (let ((files nil)
@@ -15,12 +21,21 @@
       (let ((arg (pop args)))
         (cond
          ((string= arg "--compile")
-         (setq lint-do-compile t)
+          (setq lint-do-compile t)
           ;; Initialize package.el so installed deps (vterm, transient)
           ;; are on the load-path for byte-compilation.
           (setq load-prefer-newer t)
           (require 'package)
-          (package-initialize))
+          ;; Emacs 29 ships an older Transient.  Compile against the declared
+          ;; package dependency, not whichever built-in happens to be present.
+          (setq package-install-upgrade-built-in t)
+          (package-initialize)
+          ;; An installed Magnus package may now precede this checkout.  Keep
+          ;; byte compilation pinned to the source tree under test; otherwise
+          ;; stale struct compiler metadata can silently produce invalid code.
+          (setq load-path
+                (cons lint-project-directory
+                      (delete lint-project-directory load-path))))
          ((string-suffix-p ".el" arg) (push arg files)))))
     (setq command-line-args-left nil)
     (nreverse files)))

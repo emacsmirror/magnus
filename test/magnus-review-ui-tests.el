@@ -1,0 +1,345 @@
+;;; magnus-review-ui-tests.el --- Review reader tests -*- lexical-binding: t -*-
+
+(require 'cl-lib)
+(require 'ert)
+(require 'magnus-review-ui)
+
+(defconst magnus-test-review-ui--base-oid
+  "1111111111111111111111111111111111111111")
+
+(defconst magnus-test-review-ui--head-oid
+  "2222222222222222222222222222222222222222")
+
+(defun magnus-test-review-ui--round (number)
+  "Return a canonical review round numbered NUMBER."
+  (magnus-review-round--create
+   :number number
+   :base-oid magnus-test-review-ui--base-oid
+   :head-oid magnus-test-review-ui--head-oid
+   :created-at 1
+   :completed-at 2
+   :verdict 'comment
+   :read-state 'unread
+   :finding-count 1
+   :result-sha256 (make-string 64 ?a)
+   :patch-sha256 (make-string 64 ?b)
+   :name-status-sha256 (make-string 64 ?c)))
+
+(defun magnus-test-review-ui--review (&rest rounds)
+  "Return a canonical review containing ROUNDS."
+  (magnus-review--create
+   :id "review"
+   :project-root default-directory
+   :project-hash "project"
+   :author-instance-id "author-id"
+   :author-name "author"
+   :reviewer-name "reviewer"
+   :reviewer-provider 'codex
+   :model "gpt-test"
+   :effort 'high
+   :task "Review the committed implementation"
+   :reviewer-expertise nil
+   :revision 1
+   :lifecycle 'open
+   :created-at 1
+   :updated-at 2
+   :rounds rounds
+   :session-id "reviewer-session"))
+
+(defun magnus-test-review-ui--patch (&optional patch-path)
+  "Return a one-file unified patch for PATCH-PATH."
+  (let ((path (or patch-path "lib/sample.el")))
+    (format (concat
+             "diff --git a/%s b/%s\n"
+             "index 1111111..2222222 100644\n"
+             "--- a/%s\n"
+             "+++ b/%s\n"
+             "@@ -1,2 +1,2 @@\n"
+             "-old value\n"
+             "+new value\n"
+             " shared value\n")
+            path path path path)))
+
+(defun magnus-test-review-ui--type-change-patch (&optional patch-path)
+  "Return Git's two-section regular-file-to-symlink patch for PATCH-PATH."
+  (let ((path (or patch-path "lib/link")))
+    (format (concat
+             "diff --git a/%s b/%s\n"
+             "deleted file mode 100644\n"
+             "index 1111111..0000000\n"
+             "--- a/%s\n"
+             "+++ /dev/null\n"
+             "@@ -1 +0,0 @@\n"
+             "-target\n"
+             "diff --git a/%s b/%s\n"
+             "new file mode 120000\n"
+             "index 0000000..2222222\n"
+             "--- /dev/null\n"
+             "+++ b/%s\n"
+             "@@ -0,0 +1 @@\n"
+             "+target\n")
+            path path path path path path)))
+
+(ert-deftest magnus-review-ui-normalizes-only-safe-repository-paths ()
+  (should (equal (magnus-review-ui--normalize-path "./a/lib.el") "a/lib.el"))
+  (should (equal (magnus-review-ui--normalize-path "b/lib.el") "b/lib.el"))
+  (dolist (path '(nil "" "/tmp/escape" "../escape" "a/../../escape"
+                      "/dev/null" "bad\npath"))
+    (should-not (magnus-review-ui--normalize-path path))))
+
+(ert-deftest magnus-review-ui-preserves-real-a-and-b-top-level-directories ()
+  (dolist (path '("a/sample.el" "b/sample.el"))
+    (let* ((files
+            (magnus-review-ui--parse-evidence
+             (magnus-test-review-ui--patch path)
+             (concat "M\0" path "\0")))
+           (file (car files)))
+      (should (= (length files) 1))
+      (should (equal (magnus-review-ui--file-display-path file) path))
+      (should (equal (magnus-review-ui--file-old-path file) path))
+      (should (equal (magnus-review-ui--file-new-path file) path)))))
+
+(ert-deftest magnus-review-ui-decodes-c-quoted-unicode-header-paths ()
+  (should
+   (equal
+    (magnus-review-ui--path-from-header
+     "+++ \"b/caf\\303\\251.el\"" "+++ ")
+    "café.el")))
+
+(ert-deftest magnus-review-ui-parses-and-cross-checks-immutable-evidence ()
+  (let* ((files
+          (magnus-review-ui--parse-evidence
+           (magnus-test-review-ui--patch)
+           "M\0lib/sample.el\0"))
+         (file (car files))
+         (hunk (car (magnus-review-ui--file-hunks file)))
+         (lines (magnus-review-ui--hunk-lines hunk)))
+    (should (= (length files) 1))
+    (should (equal (magnus-review-ui--file-display-path file) "lib/sample.el"))
+    (should (equal (magnus-review-ui--file-status file) "M"))
+    (should (equal (mapcar #'magnus-review-ui--diff-line-kind lines)
+                   '(removed added context)))
+    (should (equal (mapcar #'magnus-review-ui--diff-line-old-line lines)
+                   '(1 nil 2)))
+    (should (equal (mapcar #'magnus-review-ui--diff-line-new-line lines)
+                   '(nil 1 2)))))
+
+(ert-deftest magnus-review-ui-collapses-git-type-change-patch-sections ()
+  (let* ((files
+          (magnus-review-ui--parse-evidence
+           (magnus-test-review-ui--type-change-patch)
+           "T\0lib/link\0"))
+         (file (car files)))
+    (should (= (length files) 1))
+    (should (equal (magnus-review-ui--file-status file) "T"))
+    (should (equal (magnus-review-ui--file-old-path file) "lib/link"))
+    (should (equal (magnus-review-ui--file-new-path file) "lib/link"))
+    (should (= (length (magnus-review-ui--file-hunks file)) 2))
+    (should (= (cl-count-if
+                (lambda (header) (string-prefix-p "diff --git " header))
+                (magnus-review-ui--file-headers file))
+               2))))
+
+(ert-deftest magnus-review-ui-rejects-incomplete-git-type-change ()
+  (let* ((patch (magnus-test-review-ui--type-change-patch))
+         (second (string-match "diff --git " patch 1)))
+    (should-error
+     (magnus-review-ui--parse-evidence (substring patch 0 second)
+                                       "T\0lib/link\0")
+     :type 'error)))
+
+(ert-deftest magnus-review-ui-renders-a-magit-style-completed-round ()
+  (let* ((round (magnus-test-review-ui--round 1))
+         (review (magnus-test-review-ui--review round))
+         (files
+          (magnus-review-ui--parse-evidence
+           (magnus-test-review-ui--patch)
+           "M\0lib/sample.el\0")))
+    (with-temp-buffer
+      (magnus-review-ui-mode)
+      (magnus-review-ui--remember-identity review round)
+      (setq-local
+       magnus-review-ui--result
+       `(:result
+         (:base_oid ,magnus-test-review-ui--base-oid
+          :head_oid ,magnus-test-review-ui--head-oid
+          :verdict "comment"
+          :summary "The implementation is sound."
+          :findings
+          ((:id "F-001" :severity "high" :kind "line"
+            :path "lib/sample.el" :head_line 1
+            :title "Guard this branch"
+            :evidence "The new value can be nil."
+            :recommendation "Validate before use.")))))
+      (let ((inhibit-read-only t))
+        (magnus-review-ui--render files))
+      (let ((text (buffer-string)))
+        (should (string-match-p "Review of author" text))
+        (should (string-match-p
+                 "Reviewer: reviewer \\[codex · gpt-test · high\\]" text))
+        (should (string-match-p "Round: 1 of 1" text))
+        (should (string-match-p "The implementation is sound" text))
+        (should (string-match-p "HIGH F-001  Guard this branch" text))
+        (should (string-match-p "modified  lib/sample.el" text)))
+      (should magit-root-section)
+      (should (derived-mode-p 'magit-section-mode))
+      (should (eq (lookup-key magnus-review-ui-mode-map (kbd "RET"))
+                  #'magnus-review-ui-visit-snapshot))
+      (should (eq (lookup-key magnus-review-ui-mode-map (kbd "?"))
+                  #'magnus-review-ui-actions)))))
+
+(ert-deftest magnus-review-ui-rejects-disagreeing-evidence-paths ()
+  (should-error
+   (magnus-review-ui--parse-evidence
+    (magnus-test-review-ui--patch "lib/patch.el")
+    "M\0lib/status.el\0")
+   :type 'error)
+  (should-error
+   (magnus-review-ui--parse-name-status "R100\0only-old.el\0")
+   :type 'error))
+
+(ert-deftest magnus-review-ui-assigns-inline-file-and-general-findings ()
+  (let* ((files
+          (magnus-review-ui--parse-evidence
+           (magnus-test-review-ui--patch)
+           "M\0lib/sample.el\0"))
+         (findings
+          (magnus-review-ui--normalize-findings
+           (list
+            '(:id "F-inline" :kind "line" :path "lib/sample.el"
+              :head_line 1 :title "Inline")
+            '(:id "F-file" :kind "line" :path "lib/sample.el"
+              :head_line 99 :title "File fallback")
+            '(:id "F-general" :kind "general" :title "General"))))
+         (assigned (magnus-review-ui--assign-findings files findings))
+         (inline (plist-get assigned :inline))
+         (file-findings (plist-get assigned :file))
+         (general (plist-get assigned :general)))
+    (should (equal
+             (mapcar #'magnus-review-ui--finding-id
+                     (gethash '("lib/sample.el" . 1) inline))
+             '("F-inline")))
+    (should (equal
+             (mapcar #'magnus-review-ui--finding-id
+                     (gethash "lib/sample.el" file-findings))
+             '("F-file")))
+    (should (equal (mapcar #'magnus-review-ui--finding-id general)
+                   '("F-general")))))
+
+(ert-deftest magnus-review-ui-validates-result-against-immutable-scope ()
+  (let ((round (magnus-test-review-ui--round 1)))
+    (should-not
+     (magnus-review-ui--validate-result-scope
+      round
+      (list :result
+            (list :base_oid magnus-test-review-ui--base-oid
+                  :head_oid magnus-test-review-ui--head-oid))))
+    (should-error
+     (magnus-review-ui--validate-result-scope
+      round
+      (list :result
+            (list :base_oid magnus-test-review-ui--base-oid
+                  :head_oid "3333333333333333333333333333333333333333")))
+     :type 'error)))
+
+(ert-deftest magnus-review-ui-requires-canonical-review-records ()
+  (let* ((round (magnus-test-review-ui--round 1))
+         (review (magnus-test-review-ui--review round)))
+    (should (eq (magnus-review-ui--select-round review nil) round))
+    (should-error
+     (magnus-review-ui--select-round (list :rounds (list round)) nil))))
+
+(ert-deftest magnus-review-ui-marks-a-valid-round-read-exactly-once ()
+  (with-temp-buffer
+    (magnus-review-ui-mode)
+    (let* ((round (magnus-test-review-ui--round 1))
+           (review (magnus-test-review-ui--review round))
+           (writes 0))
+      (magnus-review-ui--remember-identity review round)
+      (setq-local magnus-review-ui--result '(:result (:summary "Reviewed")))
+      (setq-local magnus-review-ui--diff-error nil)
+      (cl-letf (((symbol-function 'magnus-review-mark-read)
+                 (lambda (_candidate candidate-round)
+                   (unless (eq (magnus-review-round-read-state candidate-round)
+                               'read)
+                     (setf (magnus-review-round-read-state candidate-round)
+                           'read)
+                     (cl-incf writes)))))
+        (magnus-review-ui--mark-read)
+        (magnus-review-ui--mark-read))
+      (should (= writes 1)))))
+
+(ert-deftest magnus-review-ui-keeps-corrupt-result-unread ()
+  (with-temp-buffer
+    (magnus-review-ui-mode)
+    (let ((round (magnus-test-review-ui--round 1))
+          called)
+      (setq-local magnus-review-ui--round round
+                  magnus-review-ui--diff-error nil)
+      (setq-local magnus-review-ui--result
+                  '(:magnus_review_ui_error "invalid JSON"))
+      (cl-letf (((symbol-function 'magnus-review-mark-read)
+                 (lambda (&rest _arguments) (setq called t))))
+        (magnus-review-ui--mark-read))
+      (should-not called))))
+
+(ert-deftest magnus-review-ui-round-navigation-is-bounded-and-stable ()
+  (with-temp-buffer
+    (magnus-review-ui-mode)
+    (let* ((first (magnus-test-review-ui--round 1))
+           (second (magnus-test-review-ui--round 2))
+           (review (magnus-test-review-ui--review first second))
+           (refreshed 0))
+      (magnus-review-ui--remember-identity review first)
+      (cl-letf (((symbol-function 'magnus-review-ui-refresh)
+                 (lambda () (cl-incf refreshed))))
+        (magnus-review-ui-next-round)
+        (should (eq magnus-review-ui--round second))
+        (should (= refreshed 1))
+        (should-error (magnus-review-ui-next-round) :type 'user-error)
+        (magnus-review-ui-previous-round)
+        (should (eq magnus-review-ui--round first))
+        (should (= refreshed 2))
+        (should-error (magnus-review-ui-previous-round) :type 'user-error)))))
+
+(ert-deftest magnus-review-ui-actions-preserve-review-and-round-context ()
+  (with-temp-buffer
+    (magnus-review-ui-mode)
+    (let* ((round (magnus-test-review-ui--round 1))
+           (review (magnus-test-review-ui--review round))
+           (magnus-reviews (list review))
+           received)
+      (magnus-review-ui--remember-identity review round)
+      (cl-letf (((symbol-function 'magnus-review-actions)
+                 (lambda (candidate candidate-round)
+                   (setq received (list candidate candidate-round)))))
+        (magnus-review-ui-actions))
+      (should (equal received (list review round))))))
+
+(ert-deftest magnus-review-ui-refresh-re-resolves-stale-buffer-objects ()
+  (with-temp-buffer
+    (magnus-review-ui-mode)
+    (let* ((old-round (magnus-test-review-ui--round 1))
+           (new-round (magnus-test-review-ui--round 1))
+           (old-review (magnus-test-review-ui--review old-round))
+           (new-review (magnus-test-review-ui--review new-round))
+           (magnus-reviews (list new-review)))
+      (magnus-review-ui--remember-identity old-review old-round)
+      (cl-letf (((symbol-function 'magnus-review-ui--load-artifacts)
+                 (lambda (&rest _arguments)
+                   '(:ui-result (:result (:summary "Verified"))
+                     :patch "" :name-status "")))
+                ((symbol-function 'magnus-review-ui--load-diff)
+                 (lambda (&rest _arguments) nil))
+                ((symbol-function 'magnus-review-ui--render) #'ignore)
+                ((symbol-function 'magnus-review-ui--mark-read) #'ignore))
+        (magnus-review-ui-refresh))
+      (should (eq magnus-review-ui--review new-review))
+      (should (eq magnus-review-ui--round new-round)))))
+
+(ert-deftest magnus-review-ui-sanitizes-section-heading-values ()
+  (should (equal (magnus-review-ui--display-value "unsafe\ntitle")
+                 "unsafe title")))
+
+(provide 'magnus-review-ui-tests)
+;;; magnus-review-ui-tests.el ends here

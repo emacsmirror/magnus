@@ -144,6 +144,94 @@ DATE defaults to the original deterministic test fixture date."
                (regexp-quote (shell-quote-argument "read this next"))
                resumed)))))
 
+(ert-deftest magnus-codex-tui-command-preserves-configured-prefix-flags ()
+  (let ((instance (magnus-instances-create "/tmp" "flagged-codex" 'codex))
+        (magnus-codex-executable "codex --fixture-flag"))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_command) nil)))
+      (should (string-prefix-p
+               "exec codex --fixture-flag -C "
+               (magnus-codex--tui-command instance))))))
+
+(ert-deftest magnus-codex-spawn-uses-shared-terminal-substrate ()
+  (let* ((directory (make-temp-file "magnus-codex-terminal-" t))
+         (instance (magnus-instances-create
+                    directory "shared-terminal" 'codex))
+         (terminal (magnus-test--codex-tui instance))
+         (buffer (car terminal))
+         requested-name
+         requested-environment)
+    (unwind-protect
+        (let ((magnus-instances-changed-hook nil))
+          (cl-letf
+              (((symbol-function 'magnus-terminal-create-buffer)
+                (lambda (name &optional environment)
+                  (setq requested-name name
+                        requested-environment environment)
+                  buffer))
+               ((symbol-function 'magnus-process--create-vterm-buffer)
+                (lambda (&rest _arguments)
+                  (error "Codex used the private process helper")))
+               ((symbol-function 'magnus-codex--setup-tui-sentinel) #'ignore)
+               ((symbol-function 'run-with-timer)
+                (lambda (&rest _arguments) nil)))
+            (should (eq (magnus-codex--spawn-tui instance "Inspect this")
+                        buffer))
+            (should (equal requested-name "*codex:shared-terminal*"))
+            (should-not requested-environment)
+            (should (eq (magnus-instance-buffer instance) buffer))
+            (should (eq (magnus-instance-status instance) 'running))))
+      (magnus-test--delete-terminal terminal)
+      (delete-directory directory t))))
+
+(ert-deftest magnus-codex-direct-start-rolls-back-failed-tui-replacement ()
+  (let* ((directory (make-temp-file "magnus-codex-start-rollback-" t))
+         (instance (magnus-instances-create
+                    directory "failed-replacement" 'codex))
+         (old-buffer (generate-new-buffer " *magnus-old-codex-tui*"))
+         (new-buffer (generate-new-buffer " *magnus-new-codex-tui*"))
+         (new-process
+          (make-pipe-process
+           :name (generate-new-buffer-name "magnus-new-codex-tui")
+           :buffer new-buffer
+           :noquery t))
+         (unrelated-buffer
+          (generate-new-buffer " *magnus-unrelated-codex-tui*"))
+         (magnus-process--transaction-runtime-buffer (list nil))
+         (magnus-instances-changed-hook nil)
+         (magnus-buffer-name " *magnus-status-not-present*"))
+    (unwind-protect
+        (progn
+          (magnus-instances-update
+           instance :buffer old-buffer :status 'stopped
+           :session-id "resume-after-failure")
+          (cl-letf (((symbol-function 'executable-find)
+                     (lambda (_executable) "/usr/bin/codex"))
+                    ((symbol-function 'magnus-terminal-create-buffer)
+                     (lambda (&rest _arguments) new-buffer))
+                    ((symbol-function 'magnus-codex--setup-tui-sentinel)
+                     (lambda (&rest _arguments)
+                       (error "simulated sentinel setup failure"))))
+            (let ((err (should-error (magnus-codex-start instance))))
+              (should (string-match-p
+                       "simulated sentinel setup failure"
+                       (error-message-string err)))))
+          (should-not (buffer-live-p old-buffer))
+          (should-not (buffer-live-p new-buffer))
+          (should-not (process-live-p new-process))
+          (should (buffer-live-p unrelated-buffer))
+          (should (eq (caar magnus-process--transaction-runtime-buffer)
+                      new-buffer))
+          (should (eq (cdar magnus-process--transaction-runtime-buffer)
+                      new-process))
+          (should-not (magnus-instance-buffer instance))
+          (should (eq (magnus-instance-status instance) 'stopped)))
+      (when (process-live-p new-process)
+        (delete-process new-process))
+      (dolist (buffer (list old-buffer new-buffer unrelated-buffer))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer)))
+      (delete-directory directory t))))
+
 (ert-deftest magnus-codex-session-capture-matches-exact-first-prompt ()
   (let* ((root (make-temp-file "magnus-codex-sessions-" t))
          (directory (make-temp-file "magnus-codex-project-" t))
@@ -334,17 +422,20 @@ DATE defaults to the original deterministic test fixture date."
                             (overlay-get overlay 'magnus-thinking))
                           (overlays-in (point-min) (point-max)))))))
 
-(ert-deftest magnus-codex-trace-never-runs-claude-session-inference ()
-  (let ((instance (magnus-instances-create "/tmp" "waiting-codex" 'codex)))
-    (with-temp-buffer
-      (magnus-trace-mode)
-      (setq magnus-trace--instance instance)
-      (cl-letf (((symbol-function 'magnus-process--list-sessions)
-                 (lambda (&rest _arguments)
-                   (ert-fail "Codex trace attempted Claude session discovery"))))
-        (magnus-trace-refresh))
-      (should (string-match-p "Waiting for session" (buffer-string)))
-      (should-not (magnus-instance-session-id instance)))))
+(ert-deftest magnus-trace-never-guesses-a-project-session ()
+  (dolist (provider '(claude codex))
+    (let ((instance
+           (magnus-instances-create
+            "/tmp" (format "waiting-%s" provider) provider)))
+      (with-temp-buffer
+        (magnus-trace-mode)
+        (setq magnus-trace--instance instance)
+        (cl-letf (((symbol-function 'magnus-process--list-sessions)
+                   (lambda (&rest _arguments)
+                     (ert-fail "Trace attempted project-wide session discovery"))))
+          (magnus-trace-refresh))
+        (should (string-match-p "Waiting for session" (buffer-string)))
+        (should-not (magnus-instance-session-id instance))))))
 
 (ert-deftest magnus-trace-retains-partial-jsonl-records ()
   (let* ((file (make-temp-file "magnus-trace-partial-"))
@@ -443,13 +534,88 @@ DATE defaults to the original deterministic test fixture date."
       (setq magnus-trace--instance instance
             magnus-trace--pending-text "stale-fragment"
             magnus-trace--file-offset 999)
-      (cl-letf (((symbol-function 'magnus-trace--read-snapshot)
-                 (lambda (_file)
-                   (list (list line) "current-fragment" 42))))
+      (cl-letf (((symbol-function 'magnus-trace--tail-snapshot)
+                 (lambda (_file _keep)
+                   (list :lines (list line)
+                         :start 0
+                         :total 1
+                         :skip 0
+                         :pending "current-fragment"
+                         :discarding nil
+                         :size 42))))
         (magnus-trace--trim "snapshot.jsonl"))
       (should (= magnus-trace--file-offset 42))
       (should (equal magnus-trace--pending-text "current-fragment"))
       (should (string-match-p "snapshot-message" (buffer-string))))))
+
+(ert-deftest magnus-trace-tail-pagination-and-trim-bound-read-ranges ()
+  (let* ((file (make-temp-file "magnus-trace-bounded-"))
+         (instance (magnus-instances-create "/tmp" "bounded-codex" 'codex))
+         (magnus-trace-max-initial-entries 3)
+         (magnus-trace-max-buffer-lines nil)
+         (magnus-trace-read-chunk-bytes 257)
+         (read-range (symbol-function 'magnus-trace--read-range))
+         ranges)
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (dotimes (index 600)
+              (insert
+               (magnus-test--codex-event-line
+                "user_message" (format "bounded-%03d" index))
+               "\n")))
+          (with-temp-buffer
+            (magnus-trace-mode)
+            (setq magnus-trace--instance instance)
+            (cl-letf (((symbol-function 'magnus-trace--read-range)
+                       (lambda (path start end)
+                         (push (- end start) ranges)
+                         (funcall read-range path start end))))
+              (magnus-trace--append-new-entries file)
+              (should (= magnus-trace--skip-count 597))
+              (should-not (string-match-p "bounded-596" (buffer-string)))
+              (should (string-match-p "bounded-599" (buffer-string)))
+              (magnus-trace-load-earlier)
+              (should (= magnus-trace--skip-count 594))
+              (should (string-match-p "bounded-596" (buffer-string)))
+              (magnus-trace--trim file)
+              (should (= magnus-trace--skip-count 597))
+              (should-not (string-match-p "bounded-596" (buffer-string)))
+              (should (string-match-p "bounded-599" (buffer-string)))))
+          (should (> (length ranges) 3))
+          (should (cl-every
+                   (lambda (length)
+                     (<= length magnus-trace-read-chunk-bytes))
+                   ranges)))
+      (delete-file file))))
+
+(ert-deftest magnus-trace-bounds-an-unfinished-record ()
+  (let* ((file (make-temp-file "magnus-trace-oversized-"))
+         (instance (magnus-instances-create "/tmp" "oversized" 'claude))
+         (magnus-trace-read-chunk-bytes 11)
+         (magnus-trace-max-record-bytes 128))
+    (unwind-protect
+        (with-temp-buffer
+          (magnus-trace-mode)
+          (setq magnus-trace--instance instance)
+          (with-temp-file file
+            (insert "{" (make-string 256 ?x)))
+          (magnus-trace--append-new-entries file)
+          (should (string-empty-p magnus-trace--pending-text))
+          (should magnus-trace--discarding-incomplete-record-p)
+          (write-region
+           (concat
+            "\n"
+            (json-encode
+             '((type . "user")
+               (message . ((content . "after-oversized")))))
+            "\n")
+           nil file t 'silent)
+          (magnus-trace--append-new-entries file)
+          (should-not magnus-trace--discarding-incomplete-record-p)
+          (should (string-empty-p magnus-trace--pending-text))
+          (should (string-match-p "after-oversized" (buffer-string))))
+      (delete-file file))))
 
 (ert-deftest magnus-codex-trace-pagination-uses-provider-adapter ()
   (let* ((file (make-temp-file "magnus-trace-codex-"))
@@ -510,15 +676,127 @@ DATE defaults to the original deterministic test fixture date."
           (magnus-codex-send instance "read this next")
           (should (equal sent "read this next"))
           (should return-sent)
-          (should-not (process-get process 'magnus-codex-input-queue)))
+          (should-not
+           (process-get process 'magnus-terminal-delivery-queue)))
+      (magnus-test--delete-terminal terminal))))
+
+(ert-deftest magnus-codex-accepted-callback-waits-for-tui-submission ()
+  (let* ((instance (magnus-instances-create "/tmp" "receipt-codex" 'codex))
+         (terminal (magnus-test--codex-tui instance))
+         (process (cdr terminal))
+         (accepted 0)
+         sent)
+    ;; A not-yet-ready process is enough to exercise the crash window without
+    ;; depending on the selected window in a batch Emacs.
+    (process-put process 'magnus-codex-ready nil)
+    (unwind-protect
+        (cl-letf (((symbol-function 'vterm-send-string)
+                   (lambda (&rest _args) (setq sent t)))
+                  ((symbol-function 'vterm-send-return)
+                   (lambda () (setq sent t))))
+          (should
+           (eq (magnus-codex-send
+                instance "accepted result"
+                (lambda () (cl-incf accepted)))
+               'queued))
+          (should (= accepted 0))
+          (should-not sent)
+          (should (process-get process 'magnus-terminal-delivery-queue))
+          ;; Stopping before readiness discards the process-local queue without
+          ;; falsely acknowledging a delivery which never reached the TUI.
+          (delete-process process)
+          (should (= accepted 0)))
+      (magnus-test--delete-terminal terminal))))
+
+(ert-deftest magnus-codex-supplied-delivery-scope-is-cancellable ()
+  (let* ((instance (magnus-instances-create "/tmp" "scoped-codex" 'codex))
+         (terminal (magnus-test--codex-tui instance))
+         (process (cdr terminal))
+         (scope (list 'review-controller "review-1"))
+         (cancelled-accepted 0)
+         (ordinary-accepted 0)
+         sent)
+    (process-put process 'magnus-codex-ready nil)
+    (unwind-protect
+        (cl-letf (((symbol-function 'vterm-send-string)
+                   (lambda (text &optional _paste-p) (push text sent)))
+                  ((symbol-function 'vterm-send-return)
+                   (lambda () (push 'return sent)))
+                  ((symbol-function 'run-with-timer)
+                   (lambda (&rest _arguments) 'test-timer)))
+          (should
+           (eq (magnus-codex-send
+                instance "cancel me"
+                (lambda () (cl-incf cancelled-accepted))
+                scope)
+               'queued))
+          (should
+           (eq (magnus-codex-send
+                instance "keep me"
+                (lambda () (cl-incf ordinary-accepted)))
+               'queued))
+          (let ((queue
+                 (process-get process 'magnus-terminal-delivery-queue)))
+            (should (eq (plist-get (car queue) :scope) scope))
+            (should (eq (plist-get (cadr queue) :scope) 'codex)))
+          (magnus-terminal-cancel-scope scope)
+          (should (= cancelled-accepted 0))
+          (process-put process 'magnus-codex-ready t)
+          (should (eq (magnus-terminal-drain process) 'submitted))
+          (should (= cancelled-accepted 0))
+          (should (= ordinary-accepted 1))
+          (should (equal (nreverse sent) '("keep me" return))))
+      (magnus-test--delete-terminal terminal))))
+
+(ert-deftest magnus-codex-tui-send-error-retains-and-retries-entry ()
+  (let* ((instance (magnus-instances-create "/tmp" "retry-codex" 'codex))
+         (terminal (magnus-test--codex-tui instance))
+         (process (cdr terminal))
+         (attempts 0)
+         (accepted 0)
+         timers events)
+    (process-put process 'magnus-codex-ready t)
+    (unwind-protect
+        (cl-letf (((symbol-function 'vterm-send-string)
+                   (lambda (text &optional _paste-p)
+                     (cl-incf attempts)
+                     (if (= attempts 1)
+                         (error "temporary vterm failure")
+                       (push text events))))
+                  ((symbol-function 'vterm-send-return)
+                   (lambda () (push 'return events)))
+                  ((symbol-function 'run-with-timer)
+                   (lambda (_seconds _repeat function &rest arguments)
+                     (setq timers
+                           (append timers (list (cons function arguments))))
+                     'test-timer)))
+          (should
+           (eq (magnus-codex-send
+                instance "retry this"
+                (lambda () (cl-incf accepted)))
+               'queued))
+          (should (= accepted 0))
+          (should-not (process-get process 'magnus-terminal-delivery-busy))
+          (should (process-get process 'magnus-terminal-delivery-queue))
+          (while timers
+            (let ((timer (pop timers)))
+              (apply (car timer) (cdr timer))))
+          (should (= attempts 2))
+          (should (= accepted 1))
+          (should (equal (nreverse events) '("retry this" return)))
+          (should (magnus-terminal-delivery-idle-p process)))
       (magnus-test--delete-terminal terminal))))
 
 (ert-deftest magnus-codex-concurrent-tui-messages-are-serialized ()
   (let* ((instance (magnus-instances-create "/tmp" "queued-codex" 'codex))
          (terminal (magnus-test--codex-tui instance))
          (process (cdr terminal))
+         (ready-hooks 0)
+         (magnus-process-ready-hook
+          (list (lambda (_instance) (cl-incf ready-hooks))))
          timers events)
     (process-put process 'magnus-codex-ready t)
+    (process-put process 'magnus-codex-ready-hook-pending t)
     (unwind-protect
         (cl-letf (((symbol-function 'vterm-send-string)
                    (lambda (text &optional _paste-p)
@@ -533,10 +811,14 @@ DATE defaults to the original deterministic test fixture date."
           (magnus-codex-send instance "first")
           (magnus-codex-send instance "second")
           (should (equal events '("first" return)))
+          (should (= ready-hooks 0))
           (while timers
             (let ((timer (pop timers)))
               (apply (car timer) (cdr timer))))
-          (should (equal events '("first" return "second" return))))
+          (should (equal events '("first" return "second" return)))
+          (should (= ready-hooks 1))
+          (should-not
+           (process-get process 'magnus-codex-ready-hook-pending)))
       (magnus-test--delete-terminal terminal))))
 
 (ert-deftest magnus-codex-stop-interrupts-and-closes-native-tui ()
@@ -561,6 +843,50 @@ DATE defaults to the original deterministic test fixture date."
       (should-not (magnus-instance-buffer instance)))
     (magnus-test--delete-terminal terminal)))
 
+(ert-deftest magnus-codex-delayed-stop-preserves-same-buffer-replacement ()
+  (let* ((instance
+          (magnus-instances-create "/tmp" "delayed-stop-replacement" 'codex))
+         (terminal (magnus-test--codex-tui instance))
+         (buffer (car terminal))
+         (old-process (cdr terminal))
+         replacement-process
+         delayed-stop
+         sent-key)
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'vterm-send-key)
+                     (lambda (key &rest _arguments) (setq sent-key key)))
+                    ((symbol-function 'run-with-timer)
+                     (lambda (_seconds _repeat function &rest arguments)
+                       (setq delayed-stop (cons function arguments))
+                       'test-timer)))
+            (magnus-codex-stop instance))
+          (should (equal sent-key "C-c"))
+          (should delayed-stop)
+          ;; A new TUI can claim the same terminal buffer during the grace
+          ;; period after C-c but before the delayed stop callback runs.
+          (setq replacement-process
+                (make-pipe-process
+                 :name (generate-new-buffer-name
+                        "magnus-delayed-stop-replacement")
+                 :buffer buffer :noquery t))
+          (process-put replacement-process 'magnus-codex-instance instance)
+          (magnus-instances-update
+           instance :buffer buffer :status 'running)
+          (apply (car delayed-stop) (cdr delayed-stop))
+          (should-not (process-live-p old-process))
+          (should (process-live-p replacement-process))
+          (should (buffer-live-p buffer))
+          (should (eq (get-buffer-process buffer) replacement-process))
+          (should (eq (magnus-instance-buffer instance) buffer))
+          (should (eq (magnus-instance-status instance) 'running)))
+      (when (process-live-p old-process)
+        (delete-process old-process))
+      (when (process-live-p replacement-process)
+        (delete-process replacement-process))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest magnus-codex-stale-tui-exit-preserves-replacement ()
   (let* ((instance (magnus-instances-create "/tmp" "replacement" 'codex))
          (old-terminal (magnus-test--codex-tui instance))
@@ -580,21 +906,82 @@ DATE defaults to the original deterministic test fixture date."
       (magnus-test--delete-terminal old-terminal)
       (magnus-test--delete-terminal new-terminal))))
 
-(ert-deftest magnus-coord-stopped-agent-nudge-is-logged-not-signaled ()
-  (let* ((directory (make-temp-file "magnus-stopped-nudge-" t))
-         (instance (magnus-instances-create directory "stopped-codex" 'codex))
-         (magnus-coord-nudge-debounce nil))
+(ert-deftest magnus-codex-stale-tui-exit-preserves-same-buffer-replacement ()
+  (let* ((instance
+          (magnus-instances-create "/tmp" "same-buffer-replacement" 'codex))
+         (buffer (generate-new-buffer " *magnus-same-buffer-codex-tui*"))
+         (old-process
+          (make-pipe-process
+           :name (generate-new-buffer-name "magnus-old-same-buffer-tui")
+           :buffer buffer :noquery t))
+         replacement-process
+         sentinel
+         (magnus-buffer-name " *magnus-status-not-present*"))
     (unwind-protect
         (progn
+          (magnus-instances-update
+           instance :buffer buffer :status 'running)
+          (magnus-codex--setup-tui-sentinel instance buffer)
+          (setq sentinel (process-sentinel old-process))
+          ;; A second process can claim the same terminal buffer before Emacs
+          ;; dispatches the old process's terminal sentinel.
+          (setq replacement-process
+                (make-pipe-process
+                 :name (generate-new-buffer-name
+                        "magnus-new-same-buffer-tui")
+                 :buffer buffer :noquery t))
+          (process-put replacement-process 'magnus-codex-instance instance)
+          (set-process-sentinel old-process nil)
+          (delete-process old-process)
+          (funcall sentinel old-process "exited")
+          (should (eq (get-buffer-process buffer) replacement-process))
+          (should (magnus-codex-running-p instance))
+          (should (eq (magnus-instance-status instance) 'running)))
+      (when (process-live-p old-process)
+        (delete-process old-process))
+      (when (process-live-p replacement-process)
+        (delete-process replacement-process))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest magnus-codex-current-tui-exit-publishes-stopped-state ()
+  (let* ((instance (magnus-instances-create "/tmp" "current-exit" 'codex))
+         (terminal (magnus-test--codex-tui instance))
+         (buffer (car terminal))
+         (process (cdr terminal))
+         (magnus-buffer-name " *magnus-status-not-present*")
+         sentinel)
+    (unwind-protect
+        (progn
+          (magnus-codex--setup-tui-sentinel instance buffer)
+          (setq sentinel (process-sentinel process))
+          (set-process-sentinel process nil)
+          (delete-process process)
+          (funcall sentinel process "finished")
+          (should (eq (magnus-instance-buffer instance) buffer))
+          (should (eq (magnus-instance-status instance) 'stopped)))
+      (magnus-test--delete-terminal terminal))))
+
+(ert-deftest magnus-coord-stopped-agent-nudge-is-logged-and-does-not-signal ()
+  (let* ((directory (make-temp-file "magnus-stopped-nudge-" t))
+         (instance (magnus-instances-create directory "stopped-codex" 'codex))
+         (magnus-coord-nudge-debounce nil)
+         logged)
+    (unwind-protect
+        (cl-letf (((symbol-function 'message)
+                   (lambda (format-string &rest arguments)
+                     (setq logged (apply #'format format-string arguments)))))
           (should-not
            (magnus-coord-nudge-agent
             instance "Please tell @bold-wren later" "Magnus"))
-          (let ((log (with-temp-buffer
-                       (insert-file-contents
-                        (expand-file-name ".magnus-coord.md" directory))
-                       (buffer-string))))
-            (should (string-match-p "Undelivered nudge" log))
-            (should (string-match-p "(at) bold-wren" log))))
+          (should (string-match-p "Undelivered nudge" logged))
+          (should (string-match-p "(at) bold-wren" logged))
+          (let ((file (expand-file-name ".magnus-coord.md" directory)))
+            (should (file-exists-p file))
+            (with-temp-buffer
+              (insert-file-contents file)
+              (should (search-forward "Undelivered nudge" nil t))
+              (should (search-forward "(at) bold-wren" nil t)))))
       (delete-directory directory t))))
 
 (ert-deftest magnus-coord-legacy-running-check-needs-no-process-module-call ()
@@ -608,6 +995,60 @@ DATE defaults to the original deterministic test fixture date."
         (should (magnus-coord--instance-running-p instance))
       (delete-process process)
       (kill-buffer buffer))))
+
+(ert-deftest magnus-coord-headless-nudge-never-enters-terminal-transport ()
+  (let* ((directory (make-temp-file "magnus-headless-nudge-" t))
+         (instance
+          (magnus-instances-create
+           directory "headless-worker" 'claude 'headless))
+         (magnus-coord-nudge-debounce nil)
+         logged)
+    (unwind-protect
+        (cl-letf (((symbol-function 'magnus-coord--log-undelivered-nudge)
+                   (lambda (_instance _text reason)
+                     (setq logged reason)
+                     nil))
+                  ((symbol-function 'magnus-terminal-submit)
+                   (lambda (&rest _arguments)
+                     (ert-fail "headless nudge reached terminal transport")))
+                  ((symbol-function 'magnus-provider-call)
+                   (lambda (&rest _arguments)
+                     (ert-fail "headless nudge reached provider transport"))))
+          (should-not
+           (magnus-coord-nudge-agent instance "hello" "Peer"))
+          (should (equal logged
+                         "headless task has no interactive terminal")))
+      (delete-directory directory t))))
+
+(ert-deftest magnus-coord-local-nudge-uses-terminal-single-writer ()
+  (let* ((instance (magnus-instances-create "/tmp" "local-nudge" 'claude))
+         (buffer (generate-new-buffer " *magnus-local-nudge*"))
+         (process (make-pipe-process
+                   :name (generate-new-buffer-name "magnus-local-nudge")
+                   :buffer buffer :noquery t))
+         (magnus-coord-nudge-debounce nil)
+         submission)
+    (magnus-instances-update instance :buffer buffer :status 'running)
+    (unwind-protect
+        (cl-letf (((symbol-function 'magnus-terminal-submit)
+                   (lambda (&rest arguments)
+                     (setq submission arguments)
+                     'submitted))
+                  ((symbol-function 'vterm-send-string)
+                   (lambda (&rest _arguments)
+                     (ert-fail "coord must use the terminal arbiter")))
+                  ((symbol-function 'vterm-send-return)
+                   (lambda (&rest _arguments)
+                     (ert-fail "coord must use the terminal arbiter"))))
+          (magnus-coord-nudge-agent instance "hello" "Peer")
+          (should
+           (equal submission
+                  (list instance "[From Peer]: hello" nil
+                        :settle-delay 0.1 :scope 'magnus-coord))))
+      (when (process-live-p process)
+        (delete-process process))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (ert-deftest magnus-health-check-supports-codex-tui-buffers ()
   (let* ((magnus-health--state (make-hash-table :test #'equal))

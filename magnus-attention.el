@@ -20,9 +20,8 @@
 ;;; Code:
 
 (require 'magnus-instances)
+(require 'magnus-terminal)
 
-(declare-function vterm-send-string "vterm")
-(declare-function vterm-send-return "vterm")
 (declare-function magnus-process--headless-p "magnus-process")
 
 ;;; Customization
@@ -118,6 +117,9 @@ First element is the instance currently having the floor.")
 (defvar magnus-attention--timer nil
   "Timer for checking instances for attention needs.")
 
+(defvar magnus-attention--monitoring-active nil
+  "Non-nil while Magnus can authoritatively classify terminal attention.")
+
 (defvar magnus-attention--last-notify nil
   "Last notification time to avoid spam.")
 
@@ -126,6 +128,17 @@ First element is the instance currently having the floor.")
 
 (defvar magnus-attention--focus-timer nil
   "Pending timer for debounced focus switch.")
+
+(defun magnus-attention-delivery-state (instance-id)
+  "Return terminal delivery state for INSTANCE-ID.
+The result is `inactive', `flagged', or `clear'.  External terminal transports
+must fail closed on `inactive': an empty queue is not evidence that typing is
+safe after attention monitoring has stopped.  Text delivery is safe only for
+`clear'; a semantic approval may deliberately address a `flagged' instance."
+  (cond
+   ((not magnus-attention--monitoring-active) 'inactive)
+   ((member instance-id magnus-attention-queue) 'flagged)
+   (t 'clear)))
 
 ;;; Queue management
 
@@ -273,11 +286,18 @@ Sends `y' which maps to confirm:yes in all CC prompt formats."
           (when (and tail
                      (magnus-attention--is-prompt-line-p tail)
                      (magnus-attention--matches-auto-approve-p tail))
-            (with-current-buffer buffer
-              (vterm-send-string "y")
-              (vterm-send-return))
-            (message "Magnus: auto-approved for %s" (magnus-instance-name instance))
-            t))))))
+            ;; Auto-approval is intentionally ephemeral: if another writer or
+            ;; the user owns the composer, fall back to the attention queue
+            ;; instead of parking a stale `y' for later delivery.
+            (when (memq
+                   (magnus-terminal-try-submit
+                    instance "y" :settle-delay 0.1
+                    :accepted
+                    (lambda ()
+                      (message "Magnus: auto-approved for %s"
+                               (magnus-instance-name instance))))
+                   '(submitted queued))
+              t)))))))
 
 (defun magnus-attention--is-prompt-line-p (line)
   "Return non-nil if LINE looks like an actual yes/no permission prompt."
@@ -332,11 +352,15 @@ Sends `y' which maps to confirm:yes in all CC prompt formats."
         (run-with-timer magnus-attention-check-interval
                         magnus-attention-check-interval
                         #'magnus-attention-check-all))
+  (setq magnus-attention--monitoring-active t)
   (message "Magnus attention monitoring started"))
 
 (defun magnus-attention-stop ()
   "Stop the attention monitoring timer."
   (interactive)
+  ;; Publish fail-closed state before cancelling resources so an external
+  ;; transport callback cannot mistake teardown for an empty safe queue.
+  (setq magnus-attention--monitoring-active nil)
   (when magnus-attention--timer
     (cancel-timer magnus-attention--timer)
     (setq magnus-attention--timer nil))
@@ -387,6 +411,17 @@ Sends `y' which maps to confirm:yes in all CC prompt formats."
   "Set up hooks for attention monitoring."
   (add-hook 'magnus-instances-changed-hook
             #'magnus-attention--on-instances-empty))
+
+(defun magnus-attention-shutdown ()
+  "Stop attention monitoring and detach its global hooks.
+This operation is idempotent so partial Magnus initialization can unwind
+without knowing which attention resources were installed."
+  (magnus-attention-stop)
+  (remove-hook 'magnus-instances-changed-hook
+               #'magnus-attention--on-instances-empty)
+  (setq magnus-attention-queue nil
+        magnus-attention-current nil
+        magnus-attention--checking nil))
 
 (provide 'magnus-attention)
 ;;; magnus-attention.el ends here

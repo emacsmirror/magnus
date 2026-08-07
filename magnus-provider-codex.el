@@ -18,19 +18,23 @@
 (require 'cl-lib)
 (require 'json)
 (require 'subr-x)
+(require 'magnus-environment)
 (require 'magnus-instances)
+(require 'magnus-onboarding)
 (require 'magnus-provider)
+(require 'magnus-terminal)
 
 (declare-function magnus-status-refresh "magnus-status")
-(declare-function magnus-process--create-vterm-buffer "magnus-process"
-                  (buffer-name))
 (declare-function vterm-send-key "vterm" (key &optional shift meta ctrl))
 (declare-function vterm-send-return "vterm" ())
 (declare-function vterm-send-string "vterm" (string &optional paste-p))
 (defvar magnus-buffer-name)
+(defvar magnus-process-ready-hook nil)
+(defvar magnus-process--transaction-runtime-buffer nil)
 
 (defcustom magnus-codex-executable "codex"
-  "Path to the Codex executable used for native TUI sessions."
+  "Codex executable or command prefix used for native TUI sessions.
+The value may include established command-line arguments."
   :type 'string
   :group 'magnus)
 
@@ -50,6 +54,10 @@ arriving during startup."
   "Seconds to wait for a new Codex TUI to record its session ID."
   :type 'number
   :group 'magnus)
+
+(defun magnus-codex--command-prefix ()
+  "Return configured Codex command as a nonempty argv prefix."
+  (magnus-environment-command-prefix magnus-codex-executable "Codex"))
 
 (defconst magnus-codex--session-scan-limit (* 1024 1024)
   "Maximum rollout bytes inspected while identifying a new session.")
@@ -256,70 +264,11 @@ FILES-BEFORE contains rollout files that predate this launch."
 
 (defun magnus-codex--instructions (instance)
   "Build Magnus identity and coordination instructions for Codex INSTANCE."
-  (let* ((name (magnus-instance-name instance))
-         (directory (magnus-instance-directory instance))
-         (memory-relative (format ".claude/agents/%s/memory.md" name))
-         (memory-file (expand-file-name memory-relative directory))
-         (returning (file-exists-p memory-file)))
-    (concat
-     (format "You are %s, a Magnus-managed Codex agent. " name)
-     (if returning
-         (format
-          (concat "You have been here before. Before anything else, read %s. "
-                  "It is your own prior voice: decisions you made, patterns "
-                  "you found, relationships, and unfinished work.\n\n")
-          memory-relative)
-       (format
-        (concat "This is your first session under this identity. Your home is "
-                ".claude/agents/%s/. Before signing off, create %s as a "
-                "first-person letter to future-you, not a status report.\n\n")
-        name memory-relative))
-
-     "Magnus may be running several agents in this project. Get oriented before "
-     "changing files:\n"
-     "1. Read .magnus-coord.md when it exists. Review Active Work, Discoveries, "
-     "Decisions, and the recent Log.\n"
-     "2. Check for overlapping file claims. Discuss conflicts in the Log before "
-     "editing, then announce your plan and claim the files you expect to touch.\n"
-     "3. Read relevant project instructions and inspect existing work before "
-     "choosing an implementation.\n\n"
-
-     "While working:\n"
-     "- Check .magnus-coord.md periodically. Use @mentions to reach teammates.\n"
-     "- Put non-obvious facts and gotchas in Discoveries so peers do not have to "
-     "rediscover them. Put shared architectural choices in Decisions.\n"
-     "- Create .claude/agents/" name "/busy when you need uninterrupted focus; "
-     "remove it when that focus period ends.\n"
-     "- Other agents' first-person memories live under .claude/agents/. Read a "
-     "relevant one when prior context or expertise would save work.\n"
-     "- Before requesting user attention, log [ATTENTION] with the reason; log "
-     "when it is resolved so agents can serialize interruptions.\n"
-     "- Do not overwrite another agent's Active Work row or assume permission to "
-     "commit, push, deploy, or perform unrelated changes.\n\n"
-
-     "When finishing:\n"
-     "1. Release or mark your Active Work row done and log what finished.\n"
-     "2. Record useful discoveries and decisions.\n"
-     "3. Update " memory-relative " in first person: what you learned, why you "
-     "chose this approach, relationships, and what remains.\n"
-     "4. When a commit is authorized, preserve the why, tradeoffs, and gotchas in "
-     "its message; the coordination log is ephemeral.\n\n"
-
-     "Thinking out loud:\n"
-     "For every user-facing message, put a candid visible working notebook inside "
-     "[thinking]...[end-thinking], followed by the answer inside "
-     "[response]...[end-response]. The notebook is valuable before the conclusion "
-     "is polished: state the current hypothesis, evidence, uncertainty, plausible "
-     "branches, constraints, contradictions, dead ends, and corrections as they "
-     "become relevant. If a new fact reverses the plan, say so and explain why. "
-     "Avoid empty narration such as 'I will inspect the code.' Do not claim this "
-     "reveals private hidden chain-of-thought; it is an explicit collaborative "
-     "engineering journal written for the user.\n\n"
-
-     "Begin by orienting and reading your memory when present, then handle the "
-     "user's task."
-     (when magnus-codex-extra-developer-instructions
-       (concat "\n\n" magnus-codex-extra-developer-instructions)))))
+  (concat
+   (magnus-onboarding-prompt instance)
+   (when magnus-codex-extra-developer-instructions
+     (concat "\n\nCodex-specific developer instructions:\n"
+             magnus-codex-extra-developer-instructions))))
 
 (defun magnus-codex--launch-marker (instance)
   "Return a unique session-correlation marker for INSTANCE."
@@ -345,7 +294,7 @@ FILES-BEFORE contains rollout files that predate this launch."
   (let ((session-id (magnus-instance-session-id instance)))
     (mapconcat
      #'shell-quote-argument
-     (append (list "exec" magnus-codex-executable)
+     (append (list "exec") (magnus-codex--command-prefix)
              (when session-id (list "resume"))
              (list "-C" (magnus-instance-directory instance))
              (when session-id (list session-id))
@@ -361,75 +310,158 @@ FILES-BEFORE contains rollout files that predate this launch."
      (lambda (terminal _event)
        (unless (process-live-p terminal)
          (dolist (property '(magnus-codex-capture-timer
-                             magnus-codex-ready-timer
-                             magnus-codex-input-retry-timer
-                             magnus-codex-input-busy-timer))
+                             magnus-codex-ready-timer))
            (magnus-codex--cancel-timer terminal property))
+         (magnus-terminal-release-process terminal)
          ;; A replaced vterm may report its exit after a new TUI is running.
-         (when (and (buffer-live-p (magnus-instance-buffer instance))
-                    (eq terminal (get-buffer-process
-                                  (magnus-instance-buffer instance))))
-           (unless (eq (magnus-instance-status instance) 'purged)
-             (magnus-instances-update instance :status 'stopped))
-           (when (and (boundp 'magnus-buffer-name)
-                      (get-buffer magnus-buffer-name))
-             (magnus-status-refresh))))))))
+         ;; Emacs normally detaches a dead process before its sentinel runs, so
+         ;; nil still means this captured runtime exited normally.  A different
+         ;; process in the same buffer is a replacement and must win the race.
+         (let ((current (and (buffer-live-p buffer)
+                             (get-buffer-process buffer))))
+           (when (and (eq buffer (magnus-instance-buffer instance))
+                      (or (null current) (eq terminal current)))
+             (unless (eq (magnus-instance-status instance) 'purged)
+               (magnus-instances-update instance :status 'stopped))
+             (when (and (boundp 'magnus-buffer-name)
+                        (get-buffer magnus-buffer-name))
+               (magnus-status-refresh)))))))))
+
+(defun magnus-codex--rollback-tui-spawn
+    (instance buffer process command-timer submit-timer)
+  "Roll back one failed Codex TUI launch for INSTANCE.
+BUFFER and PROCESS are the exact runtime allocated by this launch.  The timer
+arguments are startup callbacks which must not survive a synchronous failure.
+Never detach or kill a replacement process that has since claimed BUFFER."
+  (dolist (timer (list command-timer submit-timer))
+    (when (timerp timer)
+      (cancel-timer timer)))
+  (when (processp process)
+    (dolist (property '(magnus-codex-capture-timer
+                        magnus-codex-ready-timer))
+      (ignore-errors (magnus-codex--cancel-timer process property))))
+  (when (processp process)
+    (magnus-terminal-release-process process))
+  (let* ((current (and (buffer-live-p buffer)
+                       (get-buffer-process buffer)))
+         (owned (and (bufferp buffer)
+                     (eq buffer (magnus-instance-buffer instance))
+                     (or (null current) (eq process current)))))
+    ;; Detach first so deleting PROCESS cannot let its sentinel publish another
+    ;; transition.  `magnus-instances-update' mutates before running hooks, so a
+    ;; hook error is diagnostic and must not replace the startup failure.
+    (when owned
+      (condition-case err
+          (magnus-instances-update instance :buffer nil :status 'stopped)
+        (error
+         (message "Magnus: Codex startup rollback hook failed for %s: %s"
+                  (magnus-instance-name instance)
+                  (error-message-string err)))))
+    (when (processp process)
+      (ignore-errors (set-process-query-on-exit-flag process nil))
+      (when (process-live-p process)
+        (ignore-errors (delete-process process))))
+    ;; The buffer belongs to this allocation, but a distinct current process is
+    ;; evidence that it has been adopted as a replacement runtime.
+    (when (and (buffer-live-p buffer)
+               (let ((attached (get-buffer-process buffer)))
+                 (or (null attached) (eq attached process))))
+      (ignore-errors (kill-buffer buffer)))))
 
 (defun magnus-codex--spawn-tui (instance prompt &optional marker files-before)
   "Launch INSTANCE's native TUI with PROMPT.
 When MARKER is non-nil, capture its new session against FILES-BEFORE."
   (let* ((buffer-name (format "*codex:%s*" (magnus-instance-name instance)))
          (default-directory (magnus-instance-directory instance))
-         (buffer (magnus-process--create-vterm-buffer buffer-name))
          (command (magnus-codex--tui-command instance prompt))
-         (process (get-buffer-process buffer)))
-    (unless (process-live-p process)
-      (kill-buffer buffer)
-      (user-error "Could not start a vterm for Codex instance `%s'"
-                  (magnus-instance-name instance)))
-    (with-current-buffer buffer
-      (setq-local magnus-codex--instance instance))
-    (magnus-instances-update instance :buffer buffer :status 'running)
-    (magnus-codex--setup-tui-sentinel instance buffer)
-    (when marker
-      (magnus-codex--watch-for-session process instance prompt files-before))
-    ;; Give vterm's login shell one tick before replacing it with Codex.
-    (run-with-timer
-     0.1 nil
-     (lambda ()
-       (when (magnus-codex--current-process-p process instance)
-         (with-current-buffer buffer
-           (vterm-send-string command)))))
-    (run-with-timer
-     0.5 nil
-     (lambda ()
-       (when (magnus-codex--current-process-p process instance)
-         (with-current-buffer buffer
-           (vterm-send-return))
-         (process-put
-          process 'magnus-codex-ready-timer
-          (run-with-timer
-           magnus-codex-tui-ready-delay nil
-           (lambda ()
-             (when (magnus-codex--current-process-p process instance)
-               (process-put process 'magnus-codex-ready-timer nil)
-               (process-put process 'magnus-codex-ready t)
-               (magnus-codex--drain-input-queue process))))))))
-    (when (and (boundp 'magnus-buffer-name)
-               (get-buffer magnus-buffer-name))
-      (magnus-status-refresh))
-    buffer))
+         ;; Finish pure command construction before allocating a terminal so a
+         ;; malformed instance cannot strand a vterm buffer.
+         buffer
+         process
+         command-timer
+         submit-timer
+         started)
+    (unwind-protect
+        (progn
+          (setq buffer
+                (magnus-terminal-create-buffer buffer-name))
+          (setq process (get-buffer-process buffer))
+          ;; Outer lifecycle transactions consume this exact allocation if a
+          ;; later step fails after provider startup has returned successfully.
+          (when (and (consp magnus-process--transaction-runtime-buffer)
+                     (null (car magnus-process--transaction-runtime-buffer)))
+            (setcar magnus-process--transaction-runtime-buffer
+                    (cons buffer process)))
+          (unless (process-live-p process)
+            (user-error "Could not start a vterm for Codex instance `%s'"
+                        (magnus-instance-name instance)))
+          (with-current-buffer buffer
+            (setq-local magnus-codex--instance instance))
+          (magnus-instances-update instance :buffer buffer :status 'running)
+          (magnus-codex--setup-tui-sentinel instance buffer)
+          (when marker
+            (magnus-codex--watch-for-session
+             process instance prompt files-before))
+          ;; Give vterm's login shell one tick before replacing it with Codex.
+          (setq command-timer
+                (run-with-timer
+                 0.1 nil
+                 (lambda ()
+                   (when (magnus-codex--current-process-p process instance)
+                     (with-current-buffer buffer
+                       (vterm-send-string command))))))
+          (setq submit-timer
+                (run-with-timer
+                 0.5 nil
+                 (lambda ()
+                   (when (magnus-codex--current-process-p process instance)
+                     (with-current-buffer buffer
+                       (vterm-send-return))
+                     (process-put
+                      process 'magnus-codex-ready-timer
+                      (run-with-timer
+                       magnus-codex-tui-ready-delay nil
+                       (lambda ()
+                         (when (magnus-codex--current-process-p
+                                process instance)
+                           (process-put process 'magnus-codex-ready-timer nil)
+                           (process-put process 'magnus-codex-ready t)
+                           ;; Existing queued input predates durable ready-hook
+                           ;; deliveries.  Defer the hook until that queue has
+                           ;; actually drained so an automated notice cannot
+                           ;; jump ahead of user input.
+                           (process-put
+                            process 'magnus-codex-ready-hook-pending t)
+                           (magnus-terminal-drain process)
+                           (magnus-codex--maybe-run-ready-hook process)))))))))
+          (when (and (boundp 'magnus-buffer-name)
+                     (get-buffer magnus-buffer-name))
+            (magnus-status-refresh))
+          (setq started t)
+          buffer)
+      (unless started
+        (magnus-codex--rollback-tui-spawn
+         instance buffer process command-timer submit-timer)))))
 
 (defun magnus-codex-start (instance &optional initial-message)
   "Start or resume Codex INSTANCE with optional INITIAL-MESSAGE."
   (when (magnus-codex-running-p instance)
     (user-error "Codex instance `%s' is already running"
                 (magnus-instance-name instance)))
-  (unless (executable-find magnus-codex-executable)
-    (user-error "Cannot find Codex executable: %s" magnus-codex-executable))
+  (let* ((prefix (magnus-codex--command-prefix))
+         (program (car prefix)))
+    (unless (or (executable-find program)
+                (and (file-name-absolute-p program)
+                     (file-executable-p program)))
+      (user-error "Cannot find Codex executable: %s" program)))
   (when-let ((old-buffer (magnus-instance-buffer instance)))
     (when (buffer-live-p old-buffer)
-      (kill-buffer old-buffer)))
+      (magnus-terminal--discard-buffer old-buffer)))
+  ;; A failed replacement must never leave INSTANCE pointing at its killed old
+  ;; terminal or claiming that a runtime is still live.
+  (unless (and (null (magnus-instance-buffer instance))
+               (eq (magnus-instance-status instance) 'stopped))
+    (magnus-instances-update instance :buffer nil :status 'stopped))
   (if (magnus-instance-session-id instance)
       (magnus-codex--spawn-tui instance initial-message)
     (let* ((marker (magnus-codex--launch-marker instance))
@@ -438,51 +470,42 @@ When MARKER is non-nil, capture its new session against FILES-BEFORE."
            (files-before (magnus-codex--session-files)))
       (magnus-codex--spawn-tui instance prompt marker files-before))))
 
-(defun magnus-codex-send (instance text)
-  "Queue TEXT for serialized delivery through INSTANCE's native TUI."
+(defun magnus-codex--delivery-ready-p (process)
+  "Return non-nil when PROCESS's Codex composer accepts automation."
+  (process-get process 'magnus-codex-ready))
+
+(defun magnus-codex-send (instance text &optional accepted scope)
+  "Queue TEXT for serialized delivery through INSTANCE's native TUI.
+When ACCEPTED is non-nil, call it only after bracketed paste and Return have
+reached vterm.  SCOPE identifies this delivery for selective cancellation and
+defaults to `codex'.  Return `submitted' for immediate submission or `queued'
+while the message is waiting for readiness, serialization, or user TUI
+ownership."
   (let ((process (magnus-codex--tui-process instance)))
     (unless process
       (user-error "Codex instance `%s' is not running"
                   (magnus-instance-name instance)))
-    (process-put process 'magnus-codex-input-queue
-                 (append (process-get process 'magnus-codex-input-queue)
-                         (list text)))
-    (magnus-codex--drain-input-queue process)))
+    (magnus-terminal-submit
+     instance text accepted
+     :ready-p #'magnus-codex--delivery-ready-p
+     :settle-delay 0.1
+     :idle #'magnus-codex--maybe-run-ready-hook
+     :scope (or scope 'codex))))
 
-(defun magnus-codex--drain-input-queue (process)
-  "Submit PROCESS's next queued TUI message when it is safe."
-  (let* ((instance (process-get process 'magnus-codex-instance))
-         (buffer (and instance (magnus-instance-buffer instance)))
-         (queue (process-get process 'magnus-codex-input-queue)))
-    (when (and queue
+(defun magnus-codex--maybe-run-ready-hook (process)
+  "Run PROCESS's deferred ready hook once earlier input has drained."
+  (let ((instance (process-get process 'magnus-codex-instance)))
+    (when (and (process-get process 'magnus-codex-ready-hook-pending)
                (process-get process 'magnus-codex-ready)
-               (not (process-get process 'magnus-codex-input-busy))
+               (magnus-terminal-delivery-idle-p process)
                (magnus-codex--current-process-p process instance))
-      (if (eq buffer (window-buffer (selected-window)))
-          ;; Do not append to a composer while the user owns this TUI.
-          (unless (process-get process 'magnus-codex-input-retry-timer)
-            (process-put
-             process 'magnus-codex-input-retry-timer
-             (run-with-timer
-              1.0 nil
-              (lambda ()
-                (process-put process 'magnus-codex-input-retry-timer nil)
-                (magnus-codex--drain-input-queue process)))))
-        (process-put process 'magnus-codex-input-queue (cdr queue))
-        (process-put process 'magnus-codex-input-busy t)
-        ;; Bracketed paste and Return occur in one Emacs event, preventing two
-        ;; automated deliveries from interleaving.
-        (with-current-buffer buffer
-          (vterm-send-string (car queue) t)
-          (vterm-send-return))
-        (process-put
-         process 'magnus-codex-input-busy-timer
-         (run-with-timer
-          0.1 nil
-          (lambda ()
-            (process-put process 'magnus-codex-input-busy nil)
-            (process-put process 'magnus-codex-input-busy-timer nil)
-            (magnus-codex--drain-input-queue process))))))))
+      (process-put process 'magnus-codex-ready-hook-pending nil)
+      (condition-case err
+          (run-hook-with-args 'magnus-process-ready-hook instance)
+        (error
+         (message "Magnus: process-ready hook failed for %s: %s"
+                  (magnus-instance-name instance)
+                  (error-message-string err)))))))
 
 (defun magnus-codex-interrupt (instance)
   "Interrupt Codex INSTANCE through its native TUI."
@@ -493,16 +516,24 @@ When MARKER is non-nil, capture its new session against FILES-BEFORE."
     (with-current-buffer buffer
       (vterm-send-key "C-c"))))
 
-(defun magnus-codex--finish-stop (instance buffer force)
-  "Finish stopping INSTANCE's captured BUFFER.
-FORCE selects immediate process killing."
-  (when (buffer-live-p buffer)
-    (when-let ((process (get-buffer-process buffer)))
-      (set-process-query-on-exit-flag process nil)
-      (when (process-live-p process)
-        (if force (kill-process process) (delete-process process))))
+(defun magnus-codex--finish-stop (instance buffer process force)
+  "Finish stopping INSTANCE's captured BUFFER and exact PROCESS.
+FORCE selects immediate process killing.  A replacement process which has
+since claimed BUFFER is left running and remains attached to INSTANCE."
+  (when (processp process)
+    (set-process-query-on-exit-flag process nil)
+    (when (process-live-p process)
+      (if force (kill-process process) (delete-process process))))
+  ;; Deleting PROCESS can synchronously run its sentinel and lifecycle hooks.
+  ;; Resolve ownership only afterwards so a same-buffer replacement wins.
+  (when (and (buffer-live-p buffer)
+             (let ((attached (get-buffer-process buffer)))
+               (or (null attached) (eq attached process))))
     (kill-buffer buffer))
-  (when (eq buffer (magnus-instance-buffer instance))
+  (when (and (eq buffer (magnus-instance-buffer instance))
+             (or (not (buffer-live-p buffer))
+                 (let ((attached (get-buffer-process buffer)))
+                   (or (null attached) (eq attached process)))))
     (unless (eq (magnus-instance-status instance) 'purged)
       (magnus-instances-update instance :status 'stopped :buffer nil))))
 
@@ -520,12 +551,13 @@ FORCE kills the terminal immediately; otherwise interrupt before closing it."
       (magnus-instances-update instance :status 'stopped))
     (if (and (buffer-live-p buffer) (process-live-p process))
         (if force
-            (magnus-codex--finish-stop instance buffer t)
+            (magnus-codex--finish-stop instance buffer process t)
           (with-current-buffer buffer
             (vterm-send-key "C-c"))
           (run-with-timer 0.5 nil
-                          #'magnus-codex--finish-stop instance buffer nil))
-      (magnus-codex--finish-stop instance buffer force))))
+                          #'magnus-codex--finish-stop
+                          instance buffer process nil))
+      (magnus-codex--finish-stop instance buffer process force))))
 
 (defun magnus-codex-running-p (instance)
   "Return non-nil when Codex INSTANCE has a live native TUI."
@@ -614,6 +646,162 @@ duplicated in `event_msg' records, and raw reasoning content is encrypted."
            (magnus-codex--canonical-trace-entry
             'assistant timestamp text)))))))
 
+(defun magnus-codex--headless-option-string (value)
+  "Return optional Codex CLI VALUE as a string."
+  (cond
+   ((null value) nil)
+   ((symbolp value) (symbol-name value))
+   ((stringp value) value)
+   (t (format "%s" value))))
+
+(defun magnus-codex--headless-environment ()
+  "Return an isolated environment for a nested Codex headless process."
+  (magnus-environment-without
+   process-environment
+   '("CLAUDECODE" "CODEX_THREAD_ID" "CODEX_CI")
+   ;; Preserve CODEX_HOME and Codex/OpenAI authentication.  Only inherited
+   ;; runner identity and opposite-provider credentials are removed.
+   '("ANTHROPIC_" "CLAUDE_CODE_" "CODEX_SANDBOX")))
+
+(defun magnus-codex--make-headless-review-decoder ()
+  "Return a stateful decoder for one Codex review process.
+
+`codex exec --json' may emit more than one completed agent message during a
+turn.  Codex itself defines the final response as the last such message when
+the turn completes, so each process needs an independent last-message cell."
+  (let ((last-message nil))
+    (lambda (event request)
+      (let* ((type (alist-get 'type event))
+             (item (alist-get 'item event))
+             (item-type (and (listp item) (alist-get 'type item)))
+             (text (and (equal item-type "agent_message")
+                        (alist-get 'text item))))
+        (when (and (equal type "item.completed")
+                   (equal item-type "agent_message")
+                   (stringp text))
+          (setq last-message text))
+        (magnus-codex-headless-decode-event
+         event request
+         (and (equal type "turn.completed") last-message))))))
+
+(defun magnus-codex-headless-review-spec (request)
+  "Return a Codex headless launch specification for REQUEST."
+  (let* ((session-id (plist-get request :session-id))
+         (base (plist-get request :base))
+         (schema-file (plist-get request :schema-file))
+         (directory (plist-get request :directory))
+         (prompt (plist-get request :prompt))
+         (model (magnus-codex--headless-option-string
+                 (plist-get request :model)))
+         (effort (magnus-codex--headless-option-string
+                  (plist-get request :effort)))
+         (name (magnus-codex--headless-option-string
+                (plist-get request :name))))
+    (unless (and (stringp schema-file) (file-readable-p schema-file))
+      (user-error "Codex headless reviews require a JSON schema file"))
+    (if session-id
+        (unless (and (stringp session-id) (not (string-empty-p session-id)))
+          (user-error "Codex review session ID is invalid"))
+      (unless (and (stringp base) (not (string-empty-p base)))
+        (user-error "A fresh Codex review requires an exact base revision")))
+    (list
+     :command
+     (append
+      (magnus-codex--command-prefix)
+      (list "exec"
+            "--json"
+            "--color" "never"
+            "--sandbox" "read-only"
+            "--cd" (expand-file-name directory)
+            "--output-schema" schema-file)
+      (when model (list "--model" model))
+      (when effort
+        (list "--config"
+              (format "model_reasoning_effort=%S" effort)))
+      (if session-id
+          (list "resume" session-id prompt)
+        ;; Use an ordinary exec session so the documented `exec resume' path
+        ;; can preserve reviewer continuity.  The `exec review' subcommand
+        ;; treats a custom prompt as its sole target and rejects combining it
+        ;; with --base/--commit/--uncommitted; --title requires --commit.
+        ;; Magnus already pins the immutable base/head in the detached checkout
+        ;; and PROMPT, then validates the echoed object IDs, so the built-in
+        ;; review target machinery would be redundant.
+        (list prompt)))
+     :environment (magnus-codex--headless-environment)
+     :decoder (magnus-codex--make-headless-review-decoder)
+     :success-requires '(terminal structured-result)
+     :session-id session-id
+     :name (and name (format "magnus-codex-review-%s" name)))))
+
+(defun magnus-codex-headless-spec (request)
+  "Return a Codex headless launch specification for REQUEST's purpose."
+  (pcase (plist-get request :purpose)
+    ('review (magnus-codex-headless-review-spec request))
+    ('agent (user-error "Codex does not support headless agent work"))
+    (purpose (user-error "Codex does not support headless purpose `%s'"
+                         purpose))))
+
+(defun magnus-codex--parse-structured-result (text)
+  "Parse Codex structured result TEXT into alists and lists."
+  (json-parse-string text
+                     :object-type 'alist
+                     :array-type 'list
+                     :null-object nil
+                     :false-object nil))
+
+(defun magnus-codex-headless-decode-event (event request &optional final-message)
+  "Normalize one Codex exec JSONL EVENT for REQUEST.
+FINAL-MESSAGE, when non-nil, is the last agent message selected for a completed
+turn by the process-local decoder returned by
+`magnus-codex--make-headless-review-decoder'."
+  (let* ((type (alist-get 'type event))
+         (item (alist-get 'item event))
+         (item-type (and (listp item) (alist-get 'type item)))
+         (text (and (equal item-type "agent_message")
+                    (alist-get 'text item)))
+         (canonical (list :type (or type "unknown")
+                          :provider 'codex
+                          :raw event)))
+    (when (stringp text)
+      (setq canonical (plist-put canonical :text text)))
+    (when (equal type "thread.started")
+      (setq canonical
+            (plist-put canonical :session-id
+                       (or (alist-get 'thread_id event)
+                           (alist-get 'threadId event)))))
+    ;; `codex exec' may emit prose agent messages before its schema-constrained
+    ;; final response.  Codex selects the last agent message at turn completion;
+    ;; parsing earlier messages would turn valid preambles into sticky errors.
+    (when (and (equal type "turn.completed")
+               (plist-get request :schema-file))
+      (if (not (stringp final-message))
+          (setq canonical
+                (plist-put canonical :decode-error
+                           "Codex completed without a structured final message"))
+        (condition-case err
+            (setq canonical
+                  (plist-put canonical :structured-result
+                             (magnus-codex--parse-structured-result
+                              final-message)))
+          (error
+           (setq canonical
+                 (plist-put canonical :decode-error
+                            (format "Codex result is not schema JSON: %s"
+                                    (error-message-string err))))))))
+    (when (member type '("turn.completed" "turn.failed" "turn.cancelled"))
+      (setq canonical (plist-put canonical :terminal t)))
+    (when (member type '("error" "turn.failed" "turn.cancelled"))
+      (let* ((detail (alist-get 'error event))
+             (message (or (alist-get 'message event)
+                          (and (listp detail) (alist-get 'message detail))
+                          (and (stringp detail) detail)
+                          (format "Codex emitted %s" type))))
+        (setq canonical
+              (plist-put canonical :error
+                         (list :type type :message message :detail detail)))))
+    canonical))
+
 (magnus-provider-register
  'codex
  '((start . magnus-codex-start)
@@ -624,7 +812,8 @@ duplicated in `event_msg' records, and raw reasoning content is encrypted."
    (running-p . magnus-codex-running-p)
    (switch-to . magnus-codex-switch-to)
    (trace-file . magnus-codex-trace-file)
-   (trace-entry . magnus-codex-trace-entry)))
+   (trace-entry . magnus-codex-trace-entry)
+   (headless-spec . magnus-codex-headless-spec)))
 
 (provide 'magnus-provider-codex)
 ;;; magnus-provider-codex.el ends here

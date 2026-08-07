@@ -15,11 +15,10 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'magnus-instances)
 (require 'magnus-provider)
 
-(declare-function magnus-process--list-sessions "magnus-process")
-(declare-function magnus-process--most-recent-session "magnus-process")
 (declare-function magnus-process--session-jsonl-path "magnus-process")
 
 ;;; Faces
@@ -60,6 +59,20 @@ Beyond this limit, users should use grep or less on the raw JSONL file."
   :type 'integer
   :group 'magnus)
 
+(defcustom magnus-trace-read-chunk-bytes (* 64 1024)
+  "Maximum number of JSONL bytes read from disk at once.
+Initial tailing, earlier-page reads, and trimming all honor this bound."
+  :type '(integer :tag "Bytes")
+  :group 'magnus)
+
+(defcustom magnus-trace-max-record-bytes (* 1024 1024)
+  "Maximum bytes retained for one unfinished JSONL record.
+When a writer exceeds this limit before writing a newline, Magnus discards
+that record through its terminating newline rather than growing the trace
+buffer's retained fragment without bound."
+  :type '(integer :tag "Bytes")
+  :group 'magnus)
+
 (defvar-local magnus-trace--instance nil
   "The instance this trace buffer is following.")
 
@@ -84,8 +97,32 @@ Beyond this limit, users should use grep or less on the raw JSONL file."
 (defvar-local magnus-trace--pending-text ""
   "Incomplete trailing JSONL text retained for the next refresh.")
 
+(defvar-local magnus-trace--discarding-incomplete-record-p nil
+  "Non-nil while skipping an oversized unfinished JSONL record.")
+
+(defvar-local magnus-trace--page-start-offset 0
+  "Byte offset of the earliest JSONL record rendered in this buffer.")
+
 (defvar magnus-trace--timer nil
   "Timer for auto-refreshing trace buffers.")
+
+(define-error 'magnus-trace-cursor-error "Magnus trace cursor error")
+(define-error 'magnus-trace-cursor-stale "Magnus trace cursor is stale"
+  'magnus-trace-cursor-error)
+
+(cl-defstruct (magnus-trace-cursor
+               (:constructor magnus-trace-cursor--create))
+  "An in-memory reader pinned to one exact instance trace.
+The cursor deliberately carries no restart or replay semantics."
+  instance
+  instance-id
+  provider
+  session-id
+  file
+  file-identity
+  offset
+  pending
+  discarding)
 
 ;;; Major mode
 
@@ -108,6 +145,20 @@ Beyond this limit, users should use grep or less on the raw JSONL file."
 
 ;;; Core functions
 
+(defun magnus-trace-resolve-file (instance)
+  "Return the exact current trace file for INSTANCE, or nil.
+Claude traces are resolved from the captured session ID and project path.
+External providers resolve their own exact trace through `trace-file'.  This
+function never guesses from other sessions in the project."
+  (when (magnus-instance-session-id instance)
+    (let ((file
+           (if (magnus-provider-external-p instance)
+               (magnus-provider-call instance 'trace-file)
+             (magnus-process--session-jsonl-path
+              (magnus-instance-directory instance)
+              (magnus-instance-session-id instance)))))
+      (and file (expand-file-name file)))))
+
 (defun magnus-trace--reset-read-state (&optional clear-buffer)
   "Reset JSONL reader state.
 When CLEAR-BUFFER is non-nil, also erase rendered content and overlays."
@@ -117,7 +168,9 @@ When CLEAR-BUFFER is non-nil, also erase rendered content and overlays."
         magnus-trace--skip-count 0
         magnus-trace--jsonl-file nil
         magnus-trace--session-id nil
-        magnus-trace--pending-text "")
+        magnus-trace--pending-text ""
+        magnus-trace--discarding-incomplete-record-p nil
+        magnus-trace--page-start-offset 0)
   (when clear-buffer
     (let ((inhibit-read-only t))
       (erase-buffer)
@@ -153,36 +206,11 @@ When CLEAR-BUFFER is non-nil, also erase rendered content and overlays."
   (interactive)
   (when magnus-trace--instance
     (let* ((instance magnus-trace--instance)
-           (session-id (magnus-instance-session-id instance))
-           (directory (magnus-instance-directory instance))
-           (external (magnus-provider-external-p instance)))
-      ;; Claude predates providers and discovers its session asynchronously.
-      ;; Never run that heuristic for another provider in the same directory.
-      (unless (or session-id external)
-        (let ((sessions (magnus-process--list-sessions directory)))
-          (when sessions
-            (setq session-id (if (= 1 (length sessions))
-                                 (car sessions)
-                               (magnus-process--most-recent-session
-                                directory sessions)))
-            (when session-id
-              (magnus-instances-update instance :session-id session-id)
-              ;; Clear the waiting message now that we have a session
-              (let ((inhibit-read-only t))
-                (erase-buffer)
-                (setq magnus-trace--last-line-count 0))))))
-      (let ((jsonl-file
-             (when session-id
-               (if external
-                   ;; External providers may rotate files while preserving a
-                   ;; stable session ID, so let the provider resolve each time.
-                   (magnus-provider-call instance 'trace-file)
-                 (if (and (equal session-id magnus-trace--session-id)
-                          magnus-trace--jsonl-file
-                          (file-exists-p magnus-trace--jsonl-file))
-                     magnus-trace--jsonl-file
-                   (magnus-process--session-jsonl-path
-                    directory session-id))))))
+           (session-id (magnus-instance-session-id instance)))
+      ;; Session capture is owned by the exact provider launch.  Guessing from
+      ;; a project-wide newest JSONL file can attach two concurrent agents to
+      ;; the same conversation, so an unresolved trace simply keeps waiting.
+      (let ((jsonl-file (magnus-trace-resolve-file instance)))
         (if (and jsonl-file (file-exists-p jsonl-file))
             (progn
               (unless (and (equal jsonl-file magnus-trace--jsonl-file)
@@ -223,11 +251,15 @@ at the top.  Stops when all entries are loaded or the buffer exceeds
              magnus-trace-max-buffer-lines
              (abbreviate-file-name magnus-trace--jsonl-file)))
    (t
-    (let* ((all-lines (magnus-trace--read-snapshot-lines
-                       magnus-trace--jsonl-file))
-           (batch-size (or magnus-trace-max-initial-entries 200))
-           (new-skip (max 0 (- magnus-trace--skip-count batch-size)))
-           (batch (seq-subseq all-lines new-skip magnus-trace--skip-count))
+    (let* ((batch-size (or magnus-trace-max-initial-entries 200))
+           (snapshot
+            (magnus-trace--read-previous-records
+             magnus-trace--jsonl-file
+             magnus-trace--page-start-offset
+             (min magnus-trace--skip-count batch-size)))
+           (batch (plist-get snapshot :lines))
+           (loaded (plist-get snapshot :count))
+           (new-skip (- magnus-trace--skip-count loaded))
            (inhibit-read-only t)
            (parsed-count 0))
       (save-excursion
@@ -247,9 +279,11 @@ at the top.  Stops when all entries are loaded or the buffer exceeds
                    'magnus-trace-header t)))
         ;; Render batch entries at point (before existing content)
         (dolist (line batch)
-          (when (magnus-trace--render-json-line line)
+          (when (and line (magnus-trace--render-json-line line))
             (setq parsed-count (1+ parsed-count)))))
       (setq magnus-trace--skip-count new-skip
+            magnus-trace--page-start-offset
+            (plist-get snapshot :start)
             magnus-trace--rendered-count
             (+ magnus-trace--rendered-count parsed-count))
       (goto-char (point-min))
@@ -421,71 +455,338 @@ is `thinking' or `response'.  Unmarked text is treated as response."
      ;; A writer may not have finished the final JSONL record yet.
      nil)))
 
-(defun magnus-trace--split-complete-lines (text)
-  "Split JSONL TEXT into complete lines and an incomplete trailing fragment.
-Return a cons whose car is the line list and whose cdr is the fragment.  A
-valid final JSON value is complete even when no newline has been written yet."
-  (let ((position 0)
-        lines)
-    (while (string-match "\n" text position)
-      (let ((line (substring text position (match-beginning 0))))
-        (unless (string-empty-p line)
-          (push line lines)))
-      (setq position (match-end 0)))
-    (let ((fragment (substring text position)))
-      (if (or (string-empty-p fragment)
-              (magnus-trace--complete-json-p fragment))
-          (progn
-            (unless (string-empty-p fragment)
-              (push fragment lines))
-            (cons (nreverse lines) ""))
-        (cons (nreverse lines) fragment)))))
-
 (defun magnus-trace--read-range (file start end)
   "Read FILE bytes from START through measured END."
-  (with-temp-buffer
-    (insert-file-contents file nil start end)
-    (buffer-string)))
+  (let ((coding-system-for-read 'binary))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert-file-contents file nil start end)
+      (buffer-string))))
 
-(defun magnus-trace--read-snapshot (file)
-  "Return complete lines, trailing fragment, and size from one FILE snapshot."
+(defun magnus-trace--scan-forward
+    (file start end pending discarding record-function)
+  "Scan FILE from START to END in bounded chunks.
+PENDING and DISCARDING describe an unfinished record before START.
+Call RECORD-FUNCTION with the byte start and contents of each record.  An
+oversized record is represented by nil contents.  Return reader state as a
+plist containing `:pending' and `:discarding'."
+  (let* ((chunk-size (max 1 magnus-trace-read-chunk-bytes))
+         (record-limit (max 1 magnus-trace-max-record-bytes))
+         (position start)
+         (fragment (or pending ""))
+         (discarding-p discarding)
+         (record-start (max 0 (- start (string-bytes fragment)))))
+    (when (> (string-bytes fragment) record-limit)
+      (setq fragment ""
+            discarding-p t)
+      (message "Magnus: discarding a trace record larger than %d bytes"
+               record-limit))
+    (cl-labels
+        ((append-piece
+          (piece)
+          (unless discarding-p
+            (if (> (+ (string-bytes fragment) (string-bytes piece))
+                   record-limit)
+                (progn
+                  (setq fragment ""
+                        discarding-p t)
+                  (message
+                   "Magnus: discarding a trace record larger than %d bytes"
+                   record-limit))
+              (setq fragment (concat fragment piece)))))
+         (finish-record
+          ()
+          (unless (and (not discarding-p) (string-empty-p fragment))
+            (funcall record-function
+                     record-start
+                     (unless discarding-p fragment)))
+          (setq fragment ""
+                discarding-p nil)))
+      (while (< position end)
+        (let* ((chunk-end (min end (+ position chunk-size)))
+               (text (magnus-trace--read-range file position chunk-end))
+               (cursor 0))
+          (while (string-match "\n" text cursor)
+            ;; Rendering may change global match data, so capture both bounds
+            ;; before invoking the callback.
+            (let ((line-end (match-beginning 0))
+                  (next-line (match-end 0)))
+              (append-piece (substring text cursor line-end))
+              (finish-record)
+              (setq cursor next-line
+                    record-start (+ position cursor))))
+          (append-piece (substring text cursor))
+          (setq position chunk-end)))
+      ;; A final JSON value is usable before its newline is flushed.  Malformed
+      ;; trailing text stays bounded and is retried when the writer appends.
+      (when (and (not discarding-p)
+                 (not (string-empty-p fragment))
+                 (magnus-trace--complete-json-p fragment))
+        (funcall record-function record-start fragment)
+        (setq fragment ""))
+      (list :pending fragment :discarding discarding-p))))
+
+(defun magnus-trace--tail-snapshot (file keep)
+  "Return a bounded tail snapshot of FILE containing at most KEEP records.
+Every disk read is capped by `magnus-trace-read-chunk-bytes'.  The entire
+prefix is counted so pagination retains its exact earlier-entry count, but
+only the tail ring and one bounded unfinished record are held in memory."
   (let* ((size (file-attribute-size (file-attributes file)))
-         (text (magnus-trace--read-range file 0 size))
-         (split (magnus-trace--split-complete-lines text)))
-    (list (car split) (cdr split) size)))
+         (capacity (max 0 keep))
+         (ring (make-vector capacity nil))
+         (next 0)
+         (retained 0)
+         (total 0)
+         state
+         pairs)
+    (setq state
+          (magnus-trace--scan-forward
+           file 0 size "" nil
+           (lambda (start line)
+             (setq total (1+ total))
+             (when (> capacity 0)
+               (aset ring next (cons start line))
+               (setq next (mod (1+ next) capacity)
+                     retained (min capacity (1+ retained)))))))
+    (when (> retained 0)
+      (let ((oldest (if (= retained capacity) next 0)))
+        (dotimes (index retained)
+          (push (aref ring (mod (+ oldest index) capacity)) pairs))))
+    (setq pairs (nreverse pairs))
+    (list :lines (mapcar #'cdr pairs)
+          :start (if pairs (caar pairs) size)
+          :total total
+          :skip (- total retained)
+          :pending (plist-get state :pending)
+          :discarding (plist-get state :discarding)
+          :size size)))
 
-(defun magnus-trace--read-snapshot-lines (file)
-  "Return complete JSONL lines from one bounded snapshot of FILE."
-  (car (magnus-trace--read-snapshot file)))
+(defun magnus-trace--read-previous-records (file end count)
+  "Read up to COUNT nonempty JSONL records preceding byte END in FILE.
+Return `:lines', `:start', and `:count'.  Reads and retained fragments are
+bounded even when a preceding record has no nearby newline."
+  (let ((chunk-size (max 1 magnus-trace-read-chunk-bytes))
+        (record-limit (max 1 magnus-trace-max-record-bytes))
+        (cursor end)
+        (fragment "")
+        (oversized-p nil)
+        (found 0)
+        pairs)
+    (cl-labels
+        ((prepend-piece
+          (piece)
+          (unless oversized-p
+            (if (> (+ (string-bytes piece) (string-bytes fragment))
+                   record-limit)
+                (progn
+                  (setq fragment ""
+                        oversized-p t)
+                  (message
+                   "Magnus: discarding a trace record larger than %d bytes"
+                   record-limit))
+              (setq fragment (concat piece fragment)))))
+         (finish-record
+          (start)
+          (unless (and (not oversized-p) (string-empty-p fragment))
+            (push (cons start (unless oversized-p fragment)) pairs)
+            (setq found (1+ found)))
+          (setq fragment ""
+                oversized-p nil)))
+      (while (and (> cursor 0) (< found count))
+        (let* ((chunk-start (max 0 (- cursor chunk-size)))
+               (text (magnus-trace--read-range file chunk-start cursor))
+               (search-end (length text))
+               newline)
+          (while (and (< found count)
+                      (setq newline
+                            (cl-position ?\n text :from-end t
+                                         :end search-end)))
+            (prepend-piece (substring text (1+ newline) search-end))
+            (finish-record (+ chunk-start newline 1))
+            (setq search-end newline))
+          (when (< found count)
+            (prepend-piece (substring text 0 search-end))
+            (setq cursor chunk-start))))
+      (when (and (zerop cursor) (< found count))
+        (finish-record 0))
+      (list :lines (mapcar #'cdr pairs)
+            :start (if pairs (caar pairs) end)
+            :count found))))
 
-(defun magnus-trace--normalize-entry (entry)
-  "Normalize provider JSONL ENTRY for the shared renderer, or return nil."
-  (let ((instance magnus-trace--instance))
-    (if (and instance
-             (magnus-provider-external-p instance)
-             (magnus-provider-operation-p instance 'trace-entry))
-        (magnus-provider-call instance 'trace-entry entry)
-      entry)))
+(defun magnus-trace-normalize-entry (instance entry)
+  "Normalize provider JSONL ENTRY for INSTANCE, or return nil.
+The returned value uses Magnus's canonical Claude-style trace shape."
+  (if (and instance
+           (magnus-provider-external-p instance)
+           (magnus-provider-operation-p instance 'trace-entry))
+      (magnus-provider-call instance 'trace-entry entry)
+    entry))
 
-(defun magnus-trace--render-json-line (line)
-  "Parse and render one provider JSONL LINE.
-Return non-nil when LINE parsed, even when the provider ignores its record."
+(defun magnus-trace--decode-line (instance line)
+  "Decode and normalize one trace LINE for INSTANCE.
+Return (t . ENTRY) after successful JSON parsing.  ENTRY may be nil when the
+provider intentionally ignores the record.  Return nil for malformed JSON."
   (condition-case err
-      (let* ((entry (json-parse-string line :object-type 'alist))
-             (normalized (magnus-trace--normalize-entry entry)))
-        (when normalized
-          (magnus-trace--render-entry normalized))
-        t)
+      (cons t
+            (magnus-trace-normalize-entry
+             instance
+             (json-parse-string line :object-type 'alist)))
     (error
      (message "Magnus: skipped malformed trace record: %s"
               (error-message-string err))
      nil)))
 
+(defun magnus-trace--response-texts (text)
+  "Return assistant-visible response segments from TEXT.
+Thinking marker segments are deliberately omitted."
+  (when (and (stringp text) (not (string-empty-p text)))
+    (if (magnus-trace--text-has-markers-p text)
+        (let (responses)
+          (dolist (segment (magnus-trace-parse-content text))
+            (when (eq (plist-get segment :type) 'response)
+              (push (plist-get segment :text) responses)))
+          (nreverse responses))
+      (list text))))
+
+(defun magnus-trace-entry-assistant-texts (entry)
+  "Return assistant-visible text strings from canonical trace ENTRY.
+User, tool, and thinking-only entries return nil.  Both vector and list
+content are accepted, and visible response markers are unwrapped."
+  (when (and (listp entry)
+             (equal (alist-get 'type entry) "assistant"))
+    (let* ((message (alist-get 'message entry))
+           (content (and (listp message) (alist-get 'content message)))
+           texts)
+      (cond
+       ((stringp content)
+        (setq texts (magnus-trace--response-texts content)))
+       ((or (vectorp content) (listp content))
+        (seq-doseq (block content)
+          (when (and (listp block)
+                     (equal (alist-get 'type block) "text"))
+            (dolist (text
+                     (magnus-trace--response-texts
+                      (alist-get 'text block)))
+              (push text texts))))
+        (setq texts (nreverse texts))))
+      texts)))
+
+(defun magnus-trace--cursor-signal-stale (format-string &rest arguments)
+  "Signal a stale trace cursor with FORMAT-STRING and ARGUMENTS."
+  (signal 'magnus-trace-cursor-stale
+          (list (apply #'format format-string arguments))))
+
+(defun magnus-trace--file-identity (attributes)
+  "Return an Emacs-28-compatible file identity from ATTRIBUTES."
+  (cons (file-attribute-device-number attributes)
+        (file-attribute-inode-number attributes)))
+
+(defun magnus-trace-cursor-create (instance)
+  "Create an in-memory cursor at the current end of INSTANCE's trace.
+Signal `magnus-trace-cursor-error' until the instance has an exact captured
+session and an existing trace file.  Existing records are intentionally not
+replayed."
+  (let* ((session-id (magnus-instance-session-id instance))
+         (file (and session-id (magnus-trace-resolve-file instance))))
+    (unless session-id
+      (signal 'magnus-trace-cursor-error
+              '("Instance does not have a captured provider session")))
+    (unless (and file (file-regular-p file))
+      (signal 'magnus-trace-cursor-error
+              '("Instance trace file is not available yet")))
+    (let* ((canonical-file (file-truename file))
+           (attributes (file-attributes canonical-file))
+           (identity (magnus-trace--file-identity attributes)))
+      (magnus-trace-cursor--create
+       :instance instance
+       :instance-id (magnus-instance-id instance)
+       :provider (or (magnus-instance-provider instance) 'claude)
+       :session-id session-id
+       :file canonical-file
+       :file-identity identity
+       :offset (file-attribute-size attributes)
+       :pending ""
+       :discarding nil))))
+
+(defun magnus-trace--cursor-validate (cursor)
+  "Return the current file size for CURSOR, or signal that it is stale."
+  (unless (magnus-trace-cursor-p cursor)
+    (signal 'wrong-type-argument (list 'magnus-trace-cursor-p cursor)))
+  (let* ((instance (magnus-trace-cursor-instance cursor))
+         (session-id (magnus-instance-session-id instance))
+         (provider (or (magnus-instance-provider instance) 'claude)))
+    (unless (and (equal (magnus-instance-id instance)
+                        (magnus-trace-cursor-instance-id cursor))
+                 (eq provider (magnus-trace-cursor-provider cursor)))
+      (magnus-trace--cursor-signal-stale
+       "The Magnus instance identity or provider changed"))
+    (unless (equal session-id (magnus-trace-cursor-session-id cursor))
+      (magnus-trace--cursor-signal-stale
+       "The provider session changed from %s to %s"
+       (magnus-trace-cursor-session-id cursor) session-id))
+    (let ((file (magnus-trace-resolve-file instance)))
+      (unless (and file (file-regular-p file))
+        (magnus-trace--cursor-signal-stale
+         "The trace file disappeared or is no longer resolvable"))
+      (let* ((canonical-file (file-truename file))
+             (attributes (file-attributes canonical-file))
+             (identity (magnus-trace--file-identity attributes))
+             (size (file-attribute-size attributes)))
+        (unless (and (equal canonical-file (magnus-trace-cursor-file cursor))
+                     (equal identity
+                            (magnus-trace-cursor-file-identity cursor)))
+          (magnus-trace--cursor-signal-stale
+           "The provider replaced the trace file"))
+        (when (< size (magnus-trace-cursor-offset cursor))
+          (magnus-trace--cursor-signal-stale
+           "The trace file was truncated"))
+        size))))
+
+(defun magnus-trace-cursor-read (cursor)
+  "Read newly completed assistant response strings from CURSOR.
+Advance CURSOR in place.  Partial and oversized records reuse the trace
+viewer's bounded scanner.  Signal `magnus-trace-cursor-stale' rather than
+silently following a replacement session, file, or truncated history."
+  (let* ((size (magnus-trace--cursor-validate cursor))
+         (start (magnus-trace-cursor-offset cursor))
+         (file (magnus-trace-cursor-file cursor))
+         texts)
+    (when (> size start)
+      (let ((state
+             (magnus-trace--scan-forward
+              file start size
+              (magnus-trace-cursor-pending cursor)
+              (magnus-trace-cursor-discarding cursor)
+              (lambda (_record-start line)
+                (when line
+                  (when-let ((decoded
+                              (magnus-trace--decode-line
+                               (magnus-trace-cursor-instance cursor) line)))
+                    (dolist (text
+                             (magnus-trace-entry-assistant-texts
+                              (cdr decoded)))
+                      (push text texts))))))))
+        (setf (magnus-trace-cursor-offset cursor) size
+              (magnus-trace-cursor-pending cursor)
+              (plist-get state :pending)
+              (magnus-trace-cursor-discarding cursor)
+              (plist-get state :discarding))))
+    (nreverse texts)))
+
+(defun magnus-trace--render-json-line (line)
+  "Parse and render one provider JSONL LINE.
+Return non-nil when LINE parsed, even when the provider ignores its record."
+  (when-let ((decoded
+              (magnus-trace--decode-line magnus-trace--instance line)))
+    (when (cdr decoded)
+      (magnus-trace--render-entry (cdr decoded)))
+    t))
+
 (defun magnus-trace--append-new-entries (jsonl-file)
   "Append new entries from JSONL-FILE to the current trace buffer.
-On initial load, reads the full file but only renders the last
-`magnus-trace-max-initial-entries' entries.  On subsequent refreshes,
-reads only new bytes from the file offset."
+On initial load, scans bounded byte chunks and retains only the last
+`magnus-trace-max-initial-entries' entries.  Subsequent refreshes likewise
+read new bytes in bounded chunks from the file offset."
   (let* ((file-size (file-attribute-size (file-attributes jsonl-file)))
          (at-end (eobp)))
     (when (and magnus-trace--jsonl-file
@@ -496,38 +797,63 @@ reads only new bytes from the file offset."
         (setq magnus-trace--session-id session-id)))
     (setq magnus-trace--jsonl-file jsonl-file)
     (cond
-     ;; Initial load: read full file, cap to last N entries
+     ;; Initial load: scan a stable EOF and retain only the last N records.
      ((zerop magnus-trace--file-offset)
-      (let* ((snapshot (magnus-trace--read-range
-                        jsonl-file 0 file-size))
-             (split (magnus-trace--split-complete-lines snapshot))
-             (all-lines (car split))
-             (total (length all-lines))
-             (skip (if (and magnus-trace-max-initial-entries
-                            (> total magnus-trace-max-initial-entries))
-                       (- total magnus-trace-max-initial-entries)
-                     0))
-             (lines-to-render (nthcdr skip all-lines)))
-        (when lines-to-render
-          (magnus-trace--render-lines lines-to-render skip))
-        (setq magnus-trace--file-offset file-size
-              magnus-trace--pending-text (cdr split)
-              magnus-trace--last-line-count total
-              magnus-trace--skip-count skip)))
+      (if magnus-trace-max-initial-entries
+          (let* ((snapshot
+                  (magnus-trace--tail-snapshot
+                   jsonl-file magnus-trace-max-initial-entries))
+                 (lines (plist-get snapshot :lines))
+                 (skip (plist-get snapshot :skip)))
+            (when lines
+              (magnus-trace--render-lines lines skip))
+            (setq magnus-trace--file-offset (plist-get snapshot :size)
+                  magnus-trace--pending-text
+                  (plist-get snapshot :pending)
+                  magnus-trace--discarding-incomplete-record-p
+                  (plist-get snapshot :discarding)
+                  magnus-trace--last-line-count
+                  (plist-get snapshot :total)
+                  magnus-trace--skip-count skip
+                  magnus-trace--page-start-offset
+                  (plist-get snapshot :start)))
+        ;; An explicit nil limit still renders every entry, but streams them
+        ;; instead of materializing the whole JSONL file as one Lisp string.
+        (let ((total 0)
+              state)
+          (setq state
+                (magnus-trace--scan-forward
+                 jsonl-file 0 file-size "" nil
+                 (lambda (_start line)
+                   (setq total (1+ total))
+                   (when line
+                     (magnus-trace--render-lines (list line) 0)))))
+          (setq magnus-trace--file-offset file-size
+                magnus-trace--pending-text (plist-get state :pending)
+                magnus-trace--discarding-incomplete-record-p
+                (plist-get state :discarding)
+                magnus-trace--last-line-count total
+                magnus-trace--skip-count 0
+                magnus-trace--page-start-offset 0))))
      ;; Incremental: read only new bytes
      ((> file-size magnus-trace--file-offset)
-      (let* ((new-text
-              (magnus-trace--read-range
-               jsonl-file magnus-trace--file-offset file-size))
-             (split (magnus-trace--split-complete-lines
-                     (concat magnus-trace--pending-text new-text)))
-             (new-lines (car split)))
-        (when new-lines
-          (magnus-trace--render-lines new-lines 0))
+      (let ((new-count 0)
+            state)
+        (setq state
+              (magnus-trace--scan-forward
+               jsonl-file magnus-trace--file-offset file-size
+               magnus-trace--pending-text
+               magnus-trace--discarding-incomplete-record-p
+               (lambda (_start line)
+                 (setq new-count (1+ new-count))
+                 (when line
+                   (magnus-trace--render-lines (list line) 0)))))
         (setq magnus-trace--file-offset file-size
-              magnus-trace--pending-text (cdr split)
+              magnus-trace--pending-text (plist-get state :pending)
+              magnus-trace--discarding-incomplete-record-p
+              (plist-get state :discarding)
               magnus-trace--last-line-count
-              (+ magnus-trace--last-line-count (length new-lines))))))
+              (+ magnus-trace--last-line-count new-count)))))
     ;; Trim buffer if it has grown too large (2x cap)
     (when (and magnus-trace-max-initial-entries
                (> magnus-trace--rendered-count
@@ -554,31 +880,31 @@ SKIP is the number of earlier entries omitted (for the header)."
                  'face 'magnus-trace-separator
                  'magnus-trace-header t)))
       (dolist (line lines)
-        (when (magnus-trace--render-json-line line)
+        (when (and line (magnus-trace--render-json-line line))
           (setq parsed-count (1+ parsed-count)))))
     (setq magnus-trace--rendered-count
           (+ magnus-trace--rendered-count parsed-count))))
 
 (defun magnus-trace--trim (jsonl-file)
   "Trim the current trace buffer to last N entries from JSONL-FILE."
-  (let* ((snapshot (magnus-trace--read-snapshot jsonl-file))
-         (all-lines (nth 0 snapshot))
-         (pending (nth 1 snapshot))
-         (snapshot-size (nth 2 snapshot))
-         (total (length all-lines))
-         (keep magnus-trace-max-initial-entries)
-         (skip (max 0 (- total keep)))
-         (lines-to-render (nthcdr skip all-lines))
+  (let* ((snapshot
+          (magnus-trace--tail-snapshot
+           jsonl-file magnus-trace-max-initial-entries))
+         (lines-to-render (plist-get snapshot :lines))
+         (skip (plist-get snapshot :skip))
          (inhibit-read-only t))
     (erase-buffer)
     (remove-overlays)
     (setq magnus-trace--rendered-count 0)
     (when lines-to-render
       (magnus-trace--render-lines lines-to-render skip))
-    (setq magnus-trace--last-line-count total
+    (setq magnus-trace--last-line-count (plist-get snapshot :total)
           magnus-trace--skip-count skip
-          magnus-trace--file-offset snapshot-size
-          magnus-trace--pending-text pending)))
+          magnus-trace--page-start-offset (plist-get snapshot :start)
+          magnus-trace--file-offset (plist-get snapshot :size)
+          magnus-trace--pending-text (plist-get snapshot :pending)
+          magnus-trace--discarding-incomplete-record-p
+          (plist-get snapshot :discarding))))
 
 (defun magnus-trace--render-entry (entry)
   "Render a JSONL ENTRY into the trace buffer."

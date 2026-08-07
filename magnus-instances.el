@@ -15,6 +15,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
 
 ;;; Instance structure
 
@@ -30,12 +31,21 @@
   (status 'stopped :documentation "Status: running, stopped, suspended, purged.")
   (session-id nil :documentation "Provider session ID for this instance.")
   (previous-session-id nil :documentation "Session ID before last directory change.")
-  (purged-at nil :documentation "Timestamp when instance was archived (purged)."))
+  (purged-at nil :documentation "Timestamp when instance was archived (purged).")
+  ;; Keep newly persisted slots at the end so existing accessor offsets remain
+  ;; stable when users reload Magnus in a long-lived Emacs.
+  (kind 'interactive :documentation "Instance kind: interactive or headless."))
 
 ;;; Registry
 
 (defvar magnus-instances nil
   "List of all Claude Code instances.")
+
+(defvar magnus-instances-name-reservation-functions nil
+  "Functions that return additional reserved names for a project.
+Each function receives a physical project directory and returns a list of
+names.  This lets adjacent durable registries, such as independent reviews,
+reserve identities without making the instance registry depend on them.")
 
 (defun magnus-instances-list ()
   "Return a copy of the instances list."
@@ -88,6 +98,84 @@
     (dotimes (_ length result)
       (setq result (concat result (string (aref chars (random 16))))))))
 
+(defun magnus-instances-valid-id-p (id)
+  "Return non-nil when ID is a bounded path-safe durable identity."
+  (and (stringp id)
+       (<= 1 (string-bytes id) 160)
+       (string-match-p "\\`[A-Za-z0-9_][A-Za-z0-9_.-]*\\'" id)))
+
+(defun magnus-instances-valid-name-p (name)
+  "Return non-nil when display NAME is safe as one agent-home segment.
+Spaces and non-ASCII display characters remain supported.  Directory
+separators, control characters, and dot-directory aliases are rejected."
+  (and (stringp name)
+       (<= 1 (string-bytes name) 256)
+       (not (member name '("." "..")))
+       (not
+        (cl-some
+         (lambda (character)
+           (or (< character 32) (= character 127)
+               (= character ?/) (= character ?\\)))
+         (string-to-list name)))))
+
+(defun magnus-instances-valid-kind-p (kind)
+  "Return non-nil when KIND is a supported instance interaction kind."
+  (memq kind '(interactive headless)))
+
+(defun magnus-instance-effective-kind (instance)
+  "Return INSTANCE's interaction kind, including hot-reload compatibility.
+Instances created before the durable kind slot existed are interactive.  The
+slot was appended to the struct, so every older accessor remains stable while
+this accessor alone can fall beyond the old vector boundary."
+  (unless (magnus-instance-p instance)
+    (signal 'wrong-type-argument (list 'magnus-instance-p instance)))
+  (condition-case nil
+      (or (magnus-instance-kind instance) 'interactive)
+    (args-out-of-range 'interactive)))
+
+(defun magnus-instance-interactive-p (instance)
+  "Return non-nil when INSTANCE owns an interactive terminal transport."
+  (eq (magnus-instance-effective-kind instance) 'interactive))
+
+(defun magnus-instances--validate-name (name)
+  "Return display NAME, or signal when it cannot name an agent safely."
+  (unless (magnus-instances-valid-name-p name)
+    (user-error "Unsafe Magnus agent name: %S" name))
+  name)
+
+(defun magnus-instances--canonical-directory (directory)
+  "Return DIRECTORY's physical identity without a trailing separator."
+  (directory-file-name (file-truename (expand-file-name directory))))
+
+(defun magnus-instances-name-conflict (directory name &optional except)
+  "Return an instance already using NAME, except EXCEPT.
+DIRECTORY is accepted for symmetry with adjacent project-scoped reservations.
+Instance display names stay globally unique because terminal buffers and
+legacy name-based compatibility entry points are workspace-global."
+  (ignore directory)
+  (cl-find-if
+   (lambda (instance)
+     (and (not (eq instance except))
+          (string= name (magnus-instance-name instance))))
+   magnus-instances))
+
+(defun magnus-instances-reserved-names (directory)
+  "Return names reserved by adjacent registries for DIRECTORY."
+  (let ((project (magnus-instances--canonical-directory directory)) names)
+    (dolist (function magnus-instances-name-reservation-functions)
+      (setq names (append (funcall function project) names)))
+    (delete-dups names)))
+
+(defun magnus-instances--ensure-name-available
+    (directory name &optional except)
+  "Reject NAME when another instance already owns it in DIRECTORY.
+EXCEPT is the instance being renamed, when any."
+  (when (magnus-instances-name-conflict directory name except)
+    (user-error "Magnus instance name %S is already in use" name))
+  (when (member name (magnus-instances-reserved-names directory))
+    (user-error "Agent name %S is reserved by active project work" name))
+  name)
+
 (defun magnus-instances-add (instance)
   "Add INSTANCE to the registry."
   (push instance magnus-instances)
@@ -111,7 +199,8 @@ PROPERTIES is a plist of slot names and values."
     (let ((slot (pop properties))
           (value (pop properties)))
       (cl-case slot
-        (:name (setf (magnus-instance-name instance) value))
+        (:name (setf (magnus-instance-name instance)
+                     (magnus-instances--validate-name value)))
         (:buffer (setf (magnus-instance-buffer instance) value))
         (:status (setf (magnus-instance-status instance) value))
         (:directory (setf (magnus-instance-directory instance) value))
@@ -122,9 +211,15 @@ PROPERTIES is a plist of slot names and values."
   (run-hooks 'magnus-instances-changed-hook)
   instance)
 
-(defun magnus-instances-create (directory name &optional provider)
-  "Create a new instance for DIRECTORY with NAME and optional PROVIDER.
+(defun magnus-instances-create (directory name &optional provider kind)
+  "Create a new instance for DIRECTORY with NAME, PROVIDER, and KIND.
+PROVIDER defaults to `claude' and KIND defaults to `interactive'.
 Returns the new instance (not yet added to registry)."
+  (magnus-instances--validate-name name)
+  (magnus-instances--ensure-name-available directory name)
+  (setq kind (or kind 'interactive))
+  (unless (magnus-instances-valid-kind-p kind)
+    (user-error "Unsupported Magnus instance kind: %S" kind))
   (magnus-instance--create
    :id (magnus-instances--generate-id)
    :name name
@@ -132,6 +227,7 @@ Returns the new instance (not yet added to registry)."
    :buffer nil
    :created-at (current-time)
    :provider (or provider 'claude)
+   :kind kind
    :status 'stopped))
 
 (defun magnus-instances-clear ()
@@ -153,6 +249,7 @@ Returns the new instance (not yet added to registry)."
         :directory (magnus-instance-directory instance)
         :created-at (magnus-instance-created-at instance)
         :provider (or (magnus-instance-provider instance) 'claude)
+        :kind (magnus-instance-effective-kind instance)
         :session-id (magnus-instance-session-id instance)
         :previous-session-id (magnus-instance-previous-session-id instance)
         :status (magnus-instance-status instance)
@@ -169,6 +266,11 @@ Returns the new instance (not yet added to registry)."
    ;; State written before provider support has no :provider key and must
    ;; retain Magnus's original Claude Code behavior.
    :provider (or (plist-get plist :provider) 'claude)
+   ;; State written before headless tasks has no :kind key.  Such instances
+   ;; were interactive agents, so preserve that lifecycle behavior.
+   :kind (if (plist-member plist :kind)
+             (plist-get plist :kind)
+           'interactive)
    :status (or (plist-get plist :status) 'stopped)
    :session-id (plist-get plist :session-id)
    :previous-session-id (plist-get plist :previous-session-id)
