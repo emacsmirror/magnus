@@ -15,10 +15,10 @@ and handle their permission requests one at a time.
 
 ## Screenshots
 
-**Two agents working side by side in their own `vterm` buffers, with Magnus
+**Three agents working side by side in their own `vterm` buffers, with Magnus
 keeping the team visible:**
 
-![Two Claude Code agents working in separate vterm buffers beside Magnus](site/assets/magnus-agents.webp)
+![Three Claude Code and Codex agents working in separate vterm buffers](site/assets/magnus-agents.webp)
 
 **Named agents, active work, attention, and coordination in one buffer:**
 
