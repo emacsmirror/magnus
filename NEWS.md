@@ -36,6 +36,9 @@ provider-neutral, resource-bounded agent workspace.
   `errored`.
 - `C` opens the shared coordination journal, and manual `g` polls watched
   projects for ordinary coordination messages.
+- Away/back lifecycle notices are coalesced per agent until its terminal can
+  accept them; contradictory undelivered transitions disappear without
+  affecting append-only peer messages.
 - AI-generated dashboard fortunes are now opt-in; static messages remain the
   default.
 

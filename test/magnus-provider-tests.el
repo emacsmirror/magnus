@@ -1050,6 +1050,29 @@ DATE defaults to the original deterministic test fixture date."
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+(ert-deftest magnus-codex-try-send-declines-without-prequeueing ()
+  "Codex exposes ephemeral delivery with its native readiness contract."
+  (let* ((instance (magnus-instances-create "/tmp" "codex-try" 'codex))
+         (terminal (magnus-test--codex-tui instance))
+         (process (cdr terminal))
+         submission)
+    (unwind-protect
+        (progn
+          (process-put process 'magnus-codex-ready t)
+          (cl-letf (((symbol-function 'magnus-terminal-try-submit)
+                     (lambda (&rest arguments)
+                       (setq submission arguments)
+                       nil)))
+            (should-not
+             (magnus-provider-call
+              instance 'try-send "ephemeral" #'ignore))
+            (should (eq (car submission) instance))
+            (should (equal (cadr submission) "ephemeral"))
+            (should (eq (plist-get (cddr submission) :ready-p)
+                        #'magnus-codex--delivery-ready-p))
+            (should (eq (plist-get (cddr submission) :accepted) #'ignore))))
+      (magnus-test--delete-terminal terminal))))
+
 (ert-deftest magnus-health-check-supports-codex-tui-buffers ()
   (let* ((magnus-health--state (make-hash-table :test #'equal))
          (instance (magnus-instances-create "/tmp" "healthy-codex" 'codex))
