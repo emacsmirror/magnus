@@ -35,12 +35,14 @@
 ;;; Vterm buffer activity tracking
 
 (defvar magnus-coord--buffer-ticks (make-hash-table :test 'equal)
-  "Hash: instance-id -> (TICK . FLOAT-TIME).
-TICK is the `buffer-modified-tick' last observed, FLOAT-TIME is when it changed.")
+  "Last observed terminal activity keyed by instance ID.
+Each value records the exact buffer, process, modified tick, and change time.
+Runtime identity prevents a replacement TUI from inheriting an old terminal's
+quiescent timestamp merely because both fresh buffers have the same tick.")
 
 (defcustom magnus-coord-quiescence-threshold 30
   "Seconds of vterm buffer inactivity before an agent is considered idle.
-Only idle agents receive periodic nudges."
+Only idle agents receive periodic nudges and presence changes."
   :type 'integer
   :group 'magnus)
 
@@ -50,15 +52,20 @@ Only idle agents receive periodic nudges."
     (when (eq (magnus-instance-status instance) 'running)
       (let* ((id (magnus-instance-id instance))
              (buffer (magnus-instance-buffer instance))
-             (prev (gethash id magnus-coord--buffer-ticks))
-             (prev-tick (car prev)))
+             (previous (gethash id magnus-coord--buffer-ticks))
+             (valid-previous (eq (car-safe previous) :buffer)))
         (when (and buffer (buffer-live-p buffer))
-          (let ((tick (buffer-modified-tick buffer)))
-            (if (and prev-tick (= tick prev-tick))
+          (let ((process (get-buffer-process buffer))
+                (tick (buffer-modified-tick buffer)))
+            (if (and valid-previous
+                     (eq buffer (plist-get previous :buffer))
+                     (eq process (plist-get previous :process))
+                     (= tick (plist-get previous :tick)))
                 ;; Tick unchanged — keep existing timestamp
                 nil
-              ;; Tick changed — record new tick + current time
-              (puthash id (cons tick (float-time))
+              ;; Activity or runtime changed — begin a fresh quiet interval.
+              (puthash id (list :buffer buffer :process process
+                                :tick tick :changed-at (float-time))
                        magnus-coord--buffer-ticks))))))))
 
 (defun magnus-coord-agent-quiescent-p (instance)
@@ -66,9 +73,11 @@ Only idle agents receive periodic nudges."
 Quiet means no output for `magnus-coord-quiescence-threshold' seconds."
   (let* ((id (magnus-instance-id instance))
          (entry (gethash id magnus-coord--buffer-ticks))
-         (last-change (cdr entry)))
-    (or (null last-change)
-        (> (- (float-time) last-change) magnus-coord-quiescence-threshold))))
+         (last-change (and (eq (car-safe entry) :buffer)
+                           (plist-get entry :changed-at))))
+    (and (numberp last-change)
+         (> (- (float-time) last-change)
+            magnus-coord-quiescence-threshold))))
 
 ;;; Customization
 
@@ -147,9 +156,9 @@ DIR's .dir-locals.el are invisible to them unless resolved explicitly."
 
 (defcustom magnus-coord-idle-threshold 300
   "Seconds of inactivity before telling agents to sleep.
-When the user is idle for this long, a sleep message is sent to
-all running agents and periodic nudges are suppressed.  When the
-user returns, a wake-up message is sent.  Set to nil to disable."
+When the user is idle for this long, Magnus asks each quiescent interactive
+agent to sleep and suppresses periodic nudges.  Contradictory away/back state
+is coalesced until its terminal can accept it.  Set to nil to disable."
   :type '(choice (integer :tag "Seconds")
                  (const :tag "Disabled" nil))
   :group 'magnus)
@@ -256,6 +265,18 @@ are debounced per `magnus-coord-nudge-debounce'."
 (defvar magnus-coord--reminder-timer nil
   "Timer for periodic coordination reminders.")
 
+(defvar magnus-coord--presence-states (make-hash-table :test 'equal)
+  "Latest-state delivery records keyed by interactive instance ID.
+Each record separates desired presence from receipt-confirmed presence and an
+optional exact in-flight attempt.  This contradiction/deduplication policy is
+only for replaceable lifecycle state; peer messages remain append-only.")
+
+(defvar magnus-coord--presence-retry-timer nil
+  "One-shot timer for retrying replaceable presence delivery.")
+
+(defvar magnus-coord--presence-attempt-sequence 0
+  "Monotonic sequence used to fence presence delivery receipts.")
+
 (defun magnus-coord-start-reminders ()
   "Start periodic coordination reminders and AFK detection."
   (magnus-coord-stop-reminders)
@@ -264,6 +285,8 @@ are debounced per `magnus-coord-nudge-debounce'."
           (run-with-timer magnus-coord-reminder-interval
                          magnus-coord-reminder-interval
                          #'magnus-coord--send-reminders)))
+  (add-hook 'magnus-instances-changed-hook
+            #'magnus-coord--on-presence-instances-changed)
   (magnus-coord--start-idle-watch))
 
 (defun magnus-coord-stop-reminders ()
@@ -271,7 +294,11 @@ are debounced per `magnus-coord-nudge-debounce'."
   (when magnus-coord--reminder-timer
     (cancel-timer magnus-coord--reminder-timer)
     (setq magnus-coord--reminder-timer nil))
-  (magnus-coord--stop-idle-watch))
+  (magnus-coord--stop-idle-watch)
+  (remove-hook 'magnus-instances-changed-hook
+               #'magnus-coord--on-presence-instances-changed)
+  (magnus-coord--stop-presence-retries)
+  (clrhash magnus-coord--presence-states))
 
 (defvar magnus-coord--reminder-templates
   '("Hey %s — take a quick look at %S. Share useful status or discoveries when needed."
@@ -578,6 +605,258 @@ sections.  Debounced to at most once per hour per directory."
 (defvar magnus-coord--idle-timer nil
   "Idle timer that fires after `magnus-coord-idle-threshold' seconds.")
 
+(defconst magnus-coord--presence-retry-delay 3
+  "Seconds between attempts to deliver a pending presence change.")
+
+(defun magnus-coord--presence-instances ()
+  "Return running interactive instances that can have presence state."
+  (cl-remove-if-not
+   (lambda (instance)
+     (and (eq (magnus-instance-status instance) 'running)
+          (magnus-instance-interactive-p instance)))
+   (magnus-instances-list)))
+
+(defun magnus-coord--prune-presence-states (instances)
+  "Forget presence state not owned by one of INSTANCES."
+  (let ((live-ids (make-hash-table :test 'equal))
+        stale-ids)
+    (dolist (instance instances)
+      (puthash (magnus-instance-id instance) t live-ids))
+    (maphash
+     (lambda (id _state)
+       (unless (gethash id live-ids)
+         (push id stale-ids)))
+     magnus-coord--presence-states)
+    (dolist (id stale-ids)
+      (remhash id magnus-coord--presence-states))))
+
+(defun magnus-coord--new-presence-record ()
+  "Return a presence record for an agent assumed to be awake."
+  (list :desired 'back :delivered 'back
+        :attempt nil :attempt-process nil :parked nil))
+
+(defun magnus-coord--presence-converged-p (record)
+  "Return non-nil when RECORD has no outstanding presence transition."
+  (and (null (plist-get record :attempt))
+       (eq (plist-get record :desired)
+           (plist-get record :delivered))))
+
+(defun magnus-coord--store-presence-record (id record)
+  "Store RECORD for ID, removing a fully awake converged record."
+  (if (and (magnus-coord--presence-converged-p record)
+           (eq (plist-get record :delivered) 'back))
+      (remhash id magnus-coord--presence-states)
+    (puthash id record magnus-coord--presence-states)))
+
+(defun magnus-coord--mark-user-away (instances)
+  "Set desired presence to away for INSTANCES without queuing input."
+  (dolist (instance instances)
+    (let* ((id (magnus-instance-id instance))
+           (record (or (gethash id magnus-coord--presence-states)
+                       (magnus-coord--new-presence-record)))
+           (previous (plist-get record :desired)))
+      (setq record (plist-put record :desired 'away))
+      (unless (eq previous 'away)
+        (setq record (plist-put record :parked nil)))
+      (magnus-coord--store-presence-record id record))))
+
+(defun magnus-coord--mark-user-back (instances)
+  "Set desired presence to back for INSTANCES without queuing input."
+  (dolist (instance instances)
+    (let* ((id (magnus-instance-id instance))
+           (record (gethash id magnus-coord--presence-states)))
+      (when record
+        (unless (eq (plist-get record :desired) 'back)
+          (setq record (plist-put record :parked nil)))
+        (setq record (plist-put record :desired 'back))
+        (magnus-coord--store-presence-record id record)))))
+
+(defun magnus-coord--presence-message (instance state)
+  "Return the lifecycle prompt for INSTANCE in presence STATE."
+  (pcase state
+    ('away
+     (let* ((name (magnus-instance-name instance))
+            (memory-rel (format ".claude/agents/%s/memory.md" name)))
+       (magnus-process--ensure-agent-dir instance)
+       (format
+        (concat
+         "The user is away. Before you sleep, update your memory file at %s "
+         "— write down what matters from this session: key decisions, things "
+         "you learned, gotchas, unfinished work, your relationships with other "
+         "agents. This file persists across restarts — it's how future-you "
+         "remembers. Then go to sleep and wait quietly.")
+        memory-rel)))
+    ('back
+     (format
+      "The user is back! Resume normal operation — check %S for updates."
+      (magnus-coord-display-file (magnus-instance-directory instance))))))
+
+(defun magnus-coord--try-presence-submit (instance text accepted)
+  "Try to submit ephemeral TEXT to INSTANCE and call ACCEPTED on receipt.
+Return `submitted', `queued', or nil.  Nil guarantees that the terminal owns
+no part of TEXT, so Magnus may replace the presence transition safely."
+  (let ((message (format "[From Magnus]: %s" text))
+        (external (magnus-provider-external-p instance)))
+    (if (and external
+             (magnus-provider-operation-p instance 'try-send))
+        (magnus-provider-call instance 'try-send message accepted)
+      ;; Interactive adapters have always owned a vterm buffer.  Falling back
+      ;; to the shared non-prequeueing substrate preserves lifecycle support
+      ;; for third-party adapters written before `try-send' was available.
+      (magnus-terminal-try-submit
+       instance message :settle-delay 0.1 :accepted accepted))))
+
+(defun magnus-coord--accept-presence (id token state)
+  "Accept exact presence attempt TOKEN for ID as delivered STATE."
+  (when-let ((record (gethash id magnus-coord--presence-states)))
+    (when (eq token (plist-get record :attempt))
+      (setq record (plist-put record :delivered state))
+      (setq record (plist-put record :attempt nil))
+      (setq record (plist-put record :attempt-process nil))
+      (setq record (plist-put record :parked nil))
+      (magnus-coord--store-presence-record id record)
+      ;; Desired state may have changed while a pasted message waited for its
+      ;; Return.  Keep one retry alive to deliver the compensating transition.
+      (magnus-coord--maintain-presence-retry))))
+
+(defun magnus-coord--clear-presence-attempt (id token)
+  "Clear ID's presence attempt when it still belongs to TOKEN."
+  (when-let ((record (gethash id magnus-coord--presence-states)))
+    (when (eq token (plist-get record :attempt))
+      (setq record (plist-put record :attempt nil))
+      (setq record (plist-put record :attempt-process nil))
+      (magnus-coord--store-presence-record id record))))
+
+(defun magnus-coord--park-presence-attempt (id token state)
+  "Park failed presence STATE for ID when its attempt still owns TOKEN."
+  (when-let ((record (gethash id magnus-coord--presence-states)))
+    (when (eq token (plist-get record :attempt))
+      (setq record (plist-put record :attempt nil))
+      (setq record (plist-put record :attempt-process nil))
+      (setq record (plist-put record :parked state))
+      (magnus-coord--store-presence-record id record))))
+
+(defun magnus-coord--discard-replaced-runtime-attempt (instance record)
+  "Clear RECORD's attempt if INSTANCE no longer owns its exact process."
+  (let* ((buffer (magnus-instance-buffer instance))
+         (current (and (buffer-live-p buffer) (get-buffer-process buffer)))
+         (owner (plist-get record :attempt-process)))
+    (if (and owner
+             (or (not (process-live-p owner))
+                 (not (eq owner current))))
+        (progn
+          (setq record (plist-put record :attempt nil))
+          (setq record (plist-put record :attempt-process nil)))
+      record)))
+
+(defun magnus-coord--stop-presence-retries ()
+  "Cancel the outstanding presence retry timer, if any."
+  (when magnus-coord--presence-retry-timer
+    (cancel-timer magnus-coord--presence-retry-timer)
+    (setq magnus-coord--presence-retry-timer nil)))
+
+(defun magnus-coord--presence-work-p ()
+  "Return non-nil when a presence record needs delivery or reconciliation."
+  (let (work)
+    (maphash
+     (lambda (_id record)
+       (when (or (plist-get record :attempt)
+                 (and (not (eq (plist-get record :desired)
+                               (plist-get record :delivered)))
+                      (not (eq (plist-get record :parked)
+                               (plist-get record :desired)))))
+         (setq work t)))
+     magnus-coord--presence-states)
+    work))
+
+(defun magnus-coord--maintain-presence-retry ()
+  "Keep exactly one retry timer while presence work remains."
+  (if (not (magnus-coord--presence-work-p))
+      (magnus-coord--stop-presence-retries)
+    (unless magnus-coord--presence-retry-timer
+      (setq magnus-coord--presence-retry-timer
+            (run-with-timer magnus-coord--presence-retry-delay nil
+                            #'magnus-coord--presence-retry)))))
+
+(defun magnus-coord--presence-retry ()
+  "Retry replaceable presence delivery after refreshing quiescence."
+  (setq magnus-coord--presence-retry-timer nil)
+  (magnus-coord--update-buffer-ticks)
+  (magnus-coord--flush-presence))
+
+(defun magnus-coord--flush-presence ()
+  "Deliver coalesced presence changes to agents that are safely quiescent."
+  (let ((instances (magnus-coord--presence-instances)))
+    (magnus-coord--prune-presence-states instances)
+    ;; An instance can be created after the idle timer fired.  Reconciliation
+    ;; here gives it the current state without needing another lifecycle hook.
+    (when magnus-coord--user-idle-p
+      (magnus-coord--mark-user-away instances))
+    (dolist (instance instances)
+      (let* ((id (magnus-instance-id instance))
+             (record (gethash id magnus-coord--presence-states)))
+        (when record
+          (setq record
+                (magnus-coord--discard-replaced-runtime-attempt
+                 instance record))
+          (magnus-coord--store-presence-record id record))
+        (when (and record
+                   (null (plist-get record :attempt))
+                   (not (eq (plist-get record :desired)
+                            (plist-get record :delivered)))
+                   (not (eq (plist-get record :parked)
+                            (plist-get record :desired)))
+                   (not (magnus-coord-agent-busy-p instance))
+                   (magnus-coord-agent-quiescent-p instance)
+                   (magnus-coord--instance-running-p instance))
+          (let* ((state (plist-get record :desired))
+                 (token (cons id (cl-incf magnus-coord--presence-attempt-sequence)))
+                 (buffer (magnus-instance-buffer instance))
+                 (process (and (buffer-live-p buffer)
+                               (get-buffer-process buffer))))
+            (setq record (plist-put record :attempt token))
+            (setq record (plist-put record :attempt-process process))
+            (puthash id record magnus-coord--presence-states)
+            (condition-case err
+                (unless
+                    (memq
+                     (magnus-coord--try-presence-submit
+                      instance
+                      (magnus-coord--presence-message instance state)
+                      (lambda ()
+                        (magnus-coord--accept-presence id token state)))
+                     '(submitted queued))
+                  ;; Nil is the crucial non-ownership receipt: no terminal
+                  ;; queue contains this message, so the next user transition
+                  ;; remains free to replace it.
+                  (magnus-coord--clear-presence-attempt id token))
+              (error
+               ;; Persistent local failures (for example an unwritable memory
+               ;; directory) must not emit an error every three seconds.  Park
+               ;; this desired state until the next lifecycle transition.
+               (magnus-coord--park-presence-attempt id token state)
+               (message "Magnus: presence update failed for %s: %s"
+                        (magnus-instance-name instance)
+                        (error-message-string err))))))))
+    (magnus-coord--maintain-presence-retry)))
+
+(defun magnus-coord--on-presence-instances-changed ()
+  "Reconcile presence ownership after the instance registry changes."
+  (let ((instances (magnus-coord--presence-instances)))
+    (magnus-coord--prune-presence-states instances)
+    ;; A replacement runtime may have repaired a provider- or filesystem-level
+    ;; failure, so give previously parked state one fresh attempt.
+    (dolist (instance instances)
+      (let* ((id (magnus-instance-id instance))
+             (record (gethash id magnus-coord--presence-states)))
+        (when (and record (plist-get record :parked))
+          (setq record (plist-put record :parked nil))
+          (magnus-coord--store-presence-record id record))))
+    (when magnus-coord--user-idle-p
+      (magnus-coord--update-buffer-ticks)
+      (magnus-coord--mark-user-away instances)))
+  (magnus-coord--maintain-presence-retry))
+
 (defun magnus-coord--start-idle-watch ()
   "Start watching for user idleness."
   (magnus-coord--stop-idle-watch)
@@ -602,35 +881,29 @@ sections.  Debounced to at most once per hour per directory."
 
 (defun magnus-coord--on-user-idle ()
   "Called when the user has been idle for `magnus-coord-idle-threshold'.
-Tells agents to consolidate their memory and go to sleep."
+Queues a coalesced sleep transition for each running interactive agent."
   (setq magnus-coord--user-idle-p t)
-  (dolist (instance (magnus-instances-list))
-    (when (and (eq (magnus-instance-status instance) 'running)
-               (not (magnus-coord-agent-busy-p instance)))
-      (let* ((name (magnus-instance-name instance))
-             (memory-rel (format ".claude/agents/%s/memory.md" name)))
-        (magnus-process--ensure-agent-dir instance)
-        (magnus-coord-nudge-agent
-         instance
-         (format "The user is away. Before you sleep, update your memory file at %s — write down what matters from this session: key decisions, things you learned, gotchas, unfinished work, your relationships with other agents. This file persists across restarts — it's how future-you remembers. Then go to sleep and wait quietly."
-                 memory-rel)
-         "Magnus"))))
+  ;; Seed current ticks before checking quiescence.  Without this first
+  ;; observation, an active terminal absent from the table looks idle.
+  (magnus-coord--update-buffer-ticks)
+  (let ((instances (magnus-coord--presence-instances)))
+    (magnus-coord--prune-presence-states instances)
+    (magnus-coord--mark-user-away instances))
+  (magnus-coord--flush-presence)
   (add-hook 'pre-command-hook #'magnus-coord--on-user-return))
 
 (defun magnus-coord--on-user-return ()
   "Called when the user presses a key after being idle.
-Sends a wake-up message to running agents and re-arms the idle timer."
+Coalesces pending lifecycle state and re-arms the idle timer."
   (remove-hook 'pre-command-hook #'magnus-coord--on-user-return)
   (setq magnus-coord--user-idle-p nil)
-  (dolist (instance (magnus-instances-list))
-    (when (and (eq (magnus-instance-status instance) 'running)
-               (not (magnus-coord-agent-busy-p instance)))
-      (magnus-coord-nudge-agent
-       instance
-       (format
-        "The user is back! Resume normal operation — check %S for updates."
-        (magnus-coord-display-file (magnus-instance-directory instance)))
-       "Magnus")))
+  (let ((instances (magnus-coord--presence-instances)))
+    (magnus-coord--prune-presence-states instances)
+    (magnus-coord--mark-user-back instances))
+  ;; Do not submit terminal input from `pre-command-hook'.  The presence retry
+  ;; will deliver any required wake-up after the user's command and after the
+  ;; agent's terminal becomes quiet.
+  (magnus-coord--maintain-presence-retry)
   ;; Re-arm the idle timer for the next AFK period
   (magnus-coord--start-idle-watch))
 

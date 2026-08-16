@@ -492,6 +492,22 @@ ownership."
      :idle #'magnus-codex--maybe-run-ready-hook
      :scope (or scope 'codex))))
 
+(defun magnus-codex-try-send (instance text &optional accepted)
+  "Try to submit ephemeral TEXT to INSTANCE without pre-queuing it.
+Call ACCEPTED only after bracketed paste and Return have both reached vterm.
+Return `submitted', `queued', or nil according to
+`magnus-terminal-try-submit'."
+  (let ((process (magnus-codex--tui-process instance)))
+    (unless process
+      (user-error "Codex instance `%s' is not running"
+                  (magnus-instance-name instance)))
+    (magnus-terminal-try-submit
+     instance text
+     :ready-p #'magnus-codex--delivery-ready-p
+     :settle-delay 0.1
+     :accepted accepted
+     :idle #'magnus-codex--maybe-run-ready-hook)))
+
 (defun magnus-codex--maybe-run-ready-hook (process)
   "Run PROCESS's deferred ready hook once earlier input has drained."
   (let ((instance (process-get process 'magnus-codex-instance)))
@@ -807,6 +823,7 @@ turn by the process-local decoder returned by
  '((start . magnus-codex-start)
    (resume . magnus-codex-start)
    (send . magnus-codex-send)
+   (try-send . magnus-codex-try-send)
    (interrupt . magnus-codex-interrupt)
    (stop . magnus-codex-stop)
    (running-p . magnus-codex-running-p)

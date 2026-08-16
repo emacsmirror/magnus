@@ -121,10 +121,13 @@
   (let* ((poll (run-at-time 3600 nil #'ignore))
          (reminder (run-at-time 3600 nil #'ignore))
          (idle (run-at-time 3600 nil #'ignore))
+         (presence-retry (run-at-time 3600 nil #'ignore))
          (save (run-at-time 3600 nil #'ignore))
          (magnus-coord--poll-timer poll)
          (magnus-coord--reminder-timer reminder)
          (magnus-coord--idle-timer idle)
+         (magnus-coord--presence-retry-timer presence-retry)
+         (magnus-coord--presence-states (make-hash-table :test 'equal))
          (magnus-coord--attention-save-timer save)
          (magnus-coord--watched-dirs '("/tmp/project"))
          (magnus-coord--file-mtimes '(("/tmp/project" . 1)))
@@ -133,9 +136,14 @@
          (magnus-coord--processed-summons '(("/tmp/project" . ("x"))))
          (window-buffer-change-functions nil)
          (pre-command-hook nil)
+         (magnus-instances-changed-hook nil)
          (saves 0))
+    (puthash "agent" (list :desired 'away :delivered 'back)
+             magnus-coord--presence-states)
     (add-hook 'window-buffer-change-functions #'magnus-coord--on-buffer-focus)
     (add-hook 'pre-command-hook #'magnus-coord--on-user-return)
+    (add-hook 'magnus-instances-changed-hook
+              #'magnus-coord--on-presence-instances-changed)
     (cl-letf (((symbol-function 'magnus-coord-attention-save)
                (lambda () (cl-incf saves))))
       (magnus-coord-shutdown))
@@ -143,6 +151,8 @@
     (should-not magnus-coord--poll-timer)
     (should-not magnus-coord--reminder-timer)
     (should-not magnus-coord--idle-timer)
+    (should-not magnus-coord--presence-retry-timer)
+    (should (zerop (hash-table-count magnus-coord--presence-states)))
     (should-not magnus-coord--attention-save-timer)
     (should-not magnus-coord--watched-dirs)
     (should-not magnus-coord--file-mtimes)
@@ -151,7 +161,10 @@
     (should-not magnus-coord--processed-summons)
     (should-not (memq #'magnus-coord--on-buffer-focus
                       window-buffer-change-functions))
-    (should-not (memq #'magnus-coord--on-user-return pre-command-hook))))
+    (should-not (memq #'magnus-coord--on-user-return pre-command-hook))
+    (should-not
+     (memq #'magnus-coord--on-presence-instances-changed
+           magnus-instances-changed-hook))))
 
 (provide 'magnus-lifecycle-tests)
 ;;; magnus-lifecycle-tests.el ends here
